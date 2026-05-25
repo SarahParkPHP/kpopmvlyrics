@@ -563,12 +563,27 @@ fn push_lyric_segments(
     let Some(line) = line else {
         return;
     };
+    if line.segments.is_empty() {
+        if let Some(color) = line.color.clone() {
+            output.push(LyricSegment {
+                language: language.to_string(),
+                text: line.text.clone(),
+                member: line
+                    .color
+                    .as_ref()
+                    .and_then(|value| color_to_member.get(value).cloned()),
+                color: Some(color),
+            });
+        }
+        return;
+    }
     if line.segments.len() <= 1
         && line
             .segments
             .first()
             .and_then(|segment| segment.color.as_ref())
             .is_none()
+        && line.color.is_none()
     {
         return;
     }

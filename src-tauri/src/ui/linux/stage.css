@@ -40,13 +40,11 @@
 
 .lyric-line label {
   font-size: 17px;
-  opacity: 0.42;
 }
 
 .lyric-line-active label {
   font-size: 30px;
   font-weight: 800;
-  opacity: 1;
 }
 
 .lyric-line-active {

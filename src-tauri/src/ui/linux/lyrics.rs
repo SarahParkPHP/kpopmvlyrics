@@ -4,7 +4,7 @@ use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, Orientation, ScrolledWindow};
 
 use crate::app::format_ms;
-use crate::models::{AlignmentLine, LyricLine, SongPackage};
+use crate::models::{AlignmentLine, LyricLine, MemberProfile, SongPackage};
 
 #[derive(Clone, Debug, Default)]
 pub struct LyricRowContent {
@@ -67,6 +67,7 @@ pub fn compute_lyric_stage_content(
         };
     };
 
+    let members = &song.members;
     let rows = song
         .lines
         .iter()
@@ -76,15 +77,15 @@ pub fn compute_lyric_stage_content(
                 line_index: line.index,
                 member: line.member.clone().unwrap_or_else(|| "All".to_string()),
                 original_markup: show_original
-                    .then(|| colored_markup(line, "original", &line.original)),
+                    .then(|| colored_markup(line, "original", &line.original, members)),
                 roman_markup: show_romanization
                     .then(|| line.romanization.as_ref())
                     .flatten()
-                    .map(|text| colored_markup(line, "romanization", text)),
+                    .map(|text| colored_markup(line, "romanization", text, members)),
                 english_markup: show_english
                     .then(|| line.english.as_ref())
                     .flatten()
-                    .map(|text| colored_markup(line, "english", text)),
+                    .map(|text| colored_markup(line, "english", text, members)),
                 time_text: timing
                     .map(|item| format_ms(item.start_ms))
                     .unwrap_or_else(|| "Unaligned".to_string()),
@@ -191,11 +192,14 @@ impl LyricStage {
         let mut active_row: Option<GtkBox> = None;
         for widget in &self.rows {
             let context = widget.row.style_context();
-            if active_index != usize::MAX && widget.line_index == active_index {
+            let is_active = active_index != usize::MAX && widget.line_index == active_index;
+            if is_active {
                 context.add_class("lyric-line-active");
+                widget.row.set_opacity(1.0);
                 active_row = Some(widget.row.clone());
             } else {
                 context.remove_class("lyric-line-active");
+                widget.row.set_opacity(0.34);
             }
         }
 
@@ -232,25 +236,83 @@ fn scroll_to_row(scroll: &ScrolledWindow, row: &GtkBox) {
     });
 }
 
-fn colored_markup(line: &LyricLine, language: &str, fallback: &str) -> String {
-    let segments: Vec<_> = line
+fn colored_markup(
+    line: &LyricLine,
+    language: &str,
+    fallback: &str,
+    members: &[MemberProfile],
+) -> String {
+    let member_color = member_color_for_line(line, members);
+    let segments = segments_for_display(line, language);
+    if segments.is_empty() {
+        return colorize_plain_text(fallback, member_color.as_deref());
+    }
+    segments
+        .iter()
+        .map(|segment| segment_span(segment, member_color.as_deref()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn segments_for_display<'a>(line: &'a LyricLine, language: &str) -> Vec<&'a crate::models::LyricSegment> {
+    let exact: Vec<_> = line
         .segments
         .iter()
         .filter(|segment| segment.language == language)
         .collect();
-    if segments.is_empty() {
-        return glib::markup_escape_text(fallback).to_string();
+    if !exact.is_empty() {
+        return exact;
     }
-    segments
-        .iter()
-        .map(|segment| {
-            let text = glib::markup_escape_text(&segment.text);
-            if let Some(color) = &segment.color {
-                format!("<span foreground='{color}'>{text}</span>")
-            } else {
-                text.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    for lang in ["romanization", "original", "english"] {
+        let fallback: Vec<_> = line
+            .segments
+            .iter()
+            .filter(|segment| segment.language == lang)
+            .collect();
+        if !fallback.is_empty() {
+            return fallback;
+        }
+    }
+    line.segments.iter().collect()
+}
+
+fn member_color_for_line(line: &LyricLine, members: &[MemberProfile]) -> Option<String> {
+    line.member.as_ref().and_then(|name| {
+        members
+            .iter()
+            .find(|member| member.stage_name.eq_ignore_ascii_case(name))
+            .map(|member| member.color.clone())
+    })
+}
+
+fn segment_span(segment: &crate::models::LyricSegment, member_color: Option<&str>) -> String {
+    let color = segment
+        .color
+        .as_deref()
+        .or(member_color)
+        .map(format_markup_color);
+    let text = glib::markup_escape_text(&segment.text);
+    if let Some(color) = color {
+        format!("<span foreground='{color}'>{text}</span>")
+    } else {
+        text.to_string()
+    }
+}
+
+fn colorize_plain_text(text: &str, color: Option<&str>) -> String {
+    let escaped = glib::markup_escape_text(text);
+    if let Some(color) = color.map(format_markup_color) {
+        format!("<span foreground='{color}'>{escaped}</span>")
+    } else {
+        escaped.to_string()
+    }
+}
+
+fn format_markup_color(color: &str) -> String {
+    let trimmed = color.trim();
+    if trimmed.starts_with('#') {
+        trimmed.to_string()
+    } else {
+        format!("#{trimmed}")
+    }
 }
