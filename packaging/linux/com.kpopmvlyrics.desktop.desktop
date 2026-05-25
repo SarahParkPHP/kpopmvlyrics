@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=K-Pop MV Lyrics
+Comment=Play YouTube MVs with synced member-colored lyrics
+Exec=kpopmvlyrics
+Icon=com.kpopmvlyrics.desktop
+Terminal=false
+Categories=AudioVideo;Player;
+StartupWMClass=kpopmvlyrics

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.kpopmvlyrics.desktop</id>
+  <name>K-Pop MV Lyrics</name>
+  <summary>Play YouTube MVs with synced member-colored lyrics</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>K-Pop MV Lyrics is a desktop app for loading a YouTube music video, importing or fetching lyric and caption timing data, and displaying synced member-colored lyrics during playback.</p>
+  </description>
+  <launchable type="desktop-id">com.kpopmvlyrics.desktop.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-05-25"/>
+  </releases>
+</component>
