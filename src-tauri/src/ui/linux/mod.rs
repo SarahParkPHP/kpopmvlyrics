@@ -12,10 +12,11 @@ use std::sync::Arc;
 
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, ComboBoxText, Entry,
-    Label, Orientation, Paned, Revealer, RevealerTransitionType, ScrolledWindow, Separator,
-    WindowPosition,
+    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, ComboBoxText, CssProvider,
+    Entry, Frame, Label, Orientation, Paned, Revealer, RevealerTransitionType, ScrolledWindow,
+    Separator, StyleContext, WindowPosition,
 };
+use gtk::gdk::Screen;
 
 use crate::align::is_synced_line;
 use crate::app::{format_ms, merge_members, AppContext};
@@ -96,7 +97,12 @@ struct UiModel {
 
 struct MemberButton {
     stage_name: String,
+    color: String,
     button: Button,
+    border_wrap: GtkBox,
+    portrait_frame: GtkBox,
+    image: gtk::Image,
+    name_label: Label,
 }
 
 struct MemberStage {
@@ -124,12 +130,17 @@ impl MemberStage {
             let is_active = active
                 .as_ref()
                 .is_some_and(|name| name.eq_ignore_ascii_case(&entry.stage_name));
-            let context = entry.button.style_context();
+            let context = entry.border_wrap.style_context();
             if is_active {
-                context.add_class(gtk::STYLE_CLASS_SUGGESTED_ACTION);
+                context.add_class("active");
             } else {
-                context.remove_class(gtk::STYLE_CLASS_SUGGESTED_ACTION);
+                context.remove_class("active");
             }
+            entry.portrait_frame.set_opacity(if is_active { 1.0 } else { 0.42 });
+            entry
+                .name_label
+                .set_opacity(if is_active { 1.0 } else { 0.55 });
+            apply_member_name_style(&entry.name_label, &entry.color, is_active);
         }
     }
 }
@@ -159,6 +170,7 @@ struct UiView {
 }
 
 fn build_main_window(app: &Application) -> Result<(), String> {
+    load_stage_css();
     let ctx = Arc::new(AppContext::open()?);
 
     let (position_tx, position_rx) = std::sync::mpsc::channel::<VideoPosition>();
@@ -201,8 +213,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("K-Pop MV Lyrics")
-        .default_width(1240)
-        .default_height(860)
+        .default_width(1280)
+        .default_height(920)
         .window_position(WindowPosition::Center)
         .build();
 
@@ -236,12 +248,21 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     toolbar.pack_start(&editor_button, false, false, 0);
 
     let member_scroll = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-    member_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
+    member_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
     member_scroll.set_hexpand(true);
-    let member_box = GtkBox::new(Orientation::Horizontal, 8);
+    member_scroll.set_min_content_height(MEMBER_STRIP_HEIGHT);
+    member_scroll.style_context().add_class("member-strip");
+    let member_box = GtkBox::new(Orientation::Horizontal, 10);
+    member_box.set_homogeneous(true);
+    member_box.set_margin_start(6);
+    member_box.set_margin_end(6);
     member_scroll.add(&member_box);
 
     let lang_box = GtkBox::new(Orientation::Horizontal, 6);
+    lang_box.set_margin_start(8);
+    lang_box.set_margin_end(8);
+    lang_box.set_margin_top(6);
+    lang_box.set_margin_bottom(4);
     let original_toggle = CheckButton::with_label("Original");
     original_toggle.set_active(true);
     let roman_toggle = CheckButton::with_label("Roman");
@@ -253,13 +274,29 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     let clock_label = Label::new(None);
     clock_label.set_halign(gtk::Align::End);
+    clock_label.set_valign(gtk::Align::Center);
+    clock_label.set_margin_end(8);
     clock_label.set_markup("<span size='large'><b>0:00.000</b></span>");
+
+    let stage_toolbar = GtkBox::new(Orientation::Horizontal, 8);
+    stage_toolbar.pack_start(&lang_box, false, false, 0);
+    stage_toolbar.pack_end(&clock_label, false, false, 0);
 
     let lyric_scroll = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     lyric_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     lyric_scroll.set_vexpand(true);
-    let lyric_box = GtkBox::new(Orientation::Vertical, 10);
+    lyric_scroll.set_margin_start(8);
+    lyric_scroll.set_margin_end(8);
+    lyric_scroll.set_margin_bottom(8);
+    let lyric_box = GtkBox::new(Orientation::Vertical, 4);
+    lyric_box.set_valign(gtk::Align::Start);
     lyric_scroll.add(&lyric_box);
+
+    let lyric_frame = Frame::new(None);
+    lyric_frame.set_shadow_type(gtk::ShadowType::None);
+    lyric_frame.style_context().add_class("lyric-stage-panel");
+    lyric_frame.set_vexpand(true);
+    lyric_frame.add(&lyric_scroll);
 
     let play_button = Button::with_label("Start Sync");
     let pause_button = Button::with_label("Pause Sync");
@@ -312,9 +349,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     top.pack_start(&toolbar, false, false, 0);
     top.pack_start(&member_scroll, false, false, 0);
-    top.pack_start(&lang_box, false, false, 0);
-    top.pack_start(&clock_label, false, false, 0);
-    top.pack_start(&lyric_scroll, true, true, 0);
+    top.pack_start(&stage_toolbar, false, false, 0);
+    top.pack_start(&lyric_frame, true, true, 0);
     top.pack_start(&controls, false, false, 0);
     top.pack_start(&Separator::new(Orientation::Horizontal), false, false, 0);
     top.pack_start(&status_label, false, false, 0);
@@ -330,7 +366,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     paned.add1(&top);
     paned.add2(&video_pane);
-    paned.set_position(320);
+    paned.set_position(420);
 
     window.add(&paned);
 
@@ -1189,42 +1225,85 @@ fn cache_member_image_from_url(url: &str) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
-const MEMBER_AVATAR_SIZE: i32 = 56;
+const MEMBER_PORTRAIT_WIDTH: i32 = 150;
+const MEMBER_PORTRAIT_HEIGHT: i32 = 210;
+const MEMBER_STRIP_HEIGHT: i32 = 280;
 
-fn scaled_avatar_pixbuf(pixbuf: &gtk::gdk_pixbuf::Pixbuf, size: i32) -> gtk::gdk_pixbuf::Pixbuf {
-    let width = pixbuf.width().max(1) as f64;
-    let height = pixbuf.height().max(1) as f64;
-    let scale = (size as f64 / width).min(size as f64 / height);
-    let target_w = (width * scale).round().max(1.0) as i32;
-    let target_h = (height * scale).round().max(1.0) as i32;
-    pixbuf
-        .scale_simple(
-            target_w,
-            target_h,
-            gtk::gdk_pixbuf::InterpType::Bilinear,
-        )
-        .unwrap_or_else(|| pixbuf.clone())
+fn load_stage_css() {
+    let provider = CssProvider::new();
+    if provider
+        .load_from_data(include_bytes!("stage.css"))
+        .is_err()
+    {
+        return;
+    }
+    if let Some(screen) = Screen::default() {
+        StyleContext::add_provider_for_screen(
+            &screen,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 }
 
-fn member_avatar_widget(member: &MemberProfile, image_cache: &HashMap<String, String>) -> gtk::Widget {
-    let frame = GtkBox::new(Orientation::Vertical, 0);
-    frame.set_size_request(MEMBER_AVATAR_SIZE, MEMBER_AVATAR_SIZE);
-    frame.set_halign(gtk::Align::Center);
+fn apply_member_name_style(label: &Label, color: &str, active: bool) {
+    let name = glib::markup_escape_text(label.text().as_str());
+    let color = glib::markup_escape_text(color);
+    let weight = if active { "800" } else { "600" };
+    label.set_markup(&format!(
+        "<span foreground='{color}' weight='{weight}'>{name}</span>"
+    ));
+}
 
-    if let Some(path) = member_image_path(member, image_cache) {
-        if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_file(&path) {
-            let scaled = scaled_avatar_pixbuf(&pixbuf, MEMBER_AVATAR_SIZE);
-            let image = gtk::Image::from_pixbuf(Some(&scaled));
-            image.set_size_request(MEMBER_AVATAR_SIZE, MEMBER_AVATAR_SIZE);
-            frame.pack_start(&image, true, true, 0);
-            return frame.upcast();
+fn scaled_portrait_pixbuf(
+    pixbuf: &gtk::gdk_pixbuf::Pixbuf,
+    width: i32,
+    height: i32,
+) -> gtk::gdk_pixbuf::Pixbuf {
+    let scale = (width as f64 / pixbuf.width() as f64).max(height as f64 / pixbuf.height() as f64);
+    let scaled_w = (pixbuf.width() as f64 * scale).round().max(1.0) as i32;
+    let scaled_h = (pixbuf.height() as f64 * scale).round().max(1.0) as i32;
+    let scaled = pixbuf
+        .scale_simple(scaled_w, scaled_h, gtk::gdk_pixbuf::InterpType::Bilinear)
+        .unwrap_or_else(|| pixbuf.clone());
+    let x = ((scaled_w - width) / 2).max(0);
+    let y = ((scaled_h - height) / 2).max(0);
+    if scaled_w > width && scaled_h > height {
+        if let Some(copy) = scaled.copy() {
+            return copy.new_subpixbuf(x, y, width.min(scaled_w), height.min(scaled_h));
         }
     }
+    scaled
+}
 
-    let placeholder = Label::new(Some(&initials(&member.stage_name)));
-    placeholder.set_size_request(MEMBER_AVATAR_SIZE, MEMBER_AVATAR_SIZE);
-    frame.pack_start(&placeholder, true, true, 0);
-    frame.upcast()
+fn member_portrait_pixbuf(
+    member: &MemberProfile,
+    image_cache: &HashMap<String, String>,
+) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    let path = member_image_path(member, image_cache)?;
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file(&path).ok()?;
+    Some(scaled_portrait_pixbuf(
+        &pixbuf,
+        MEMBER_PORTRAIT_WIDTH,
+        MEMBER_PORTRAIT_HEIGHT,
+    ))
+}
+
+fn attach_member_card_css(widget: &impl IsA<gtk::Widget>, stage_name: &str, color: &str) {
+    let slug = stage_name.to_lowercase().replace(' ', "-");
+    let css = format!(
+        "#member-card-{slug}.active {{
+            box-shadow: inset 0 0 0 4px {color};
+            border-radius: 8px;
+        }}"
+    );
+    let provider = CssProvider::new();
+    if provider.load_from_data(css.as_bytes()).is_ok() {
+        widget
+            .style_context()
+            .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+    }
+    widget.set_widget_name(&format!("member-card-{slug}"));
 }
 
 fn render_members(view: &UiView, model: &UiModel) {
@@ -1258,17 +1337,59 @@ fn render_members(view: &UiView, model: &UiModel) {
     let mut stage_buttons = Vec::new();
     for member in &song.members {
         let button = Button::new();
-        button.set_size_request(80, 96);
+        button.set_relief(gtk::ReliefStyle::None);
+        button.set_focus_on_click(false);
+        button.set_hexpand(true);
+        button.set_halign(gtk::Align::Fill);
         let stage_name = member.stage_name.clone();
+        let member_color = member.color.clone();
 
-        let inner = GtkBox::new(Orientation::Vertical, 4);
+        let border_wrap = GtkBox::new(Orientation::Vertical, 0);
+        border_wrap.style_context().add_class("member-card");
+        attach_member_card_css(&border_wrap, &stage_name, &member_color);
+        border_wrap.set_margin_start(4);
+        border_wrap.set_margin_end(4);
+        border_wrap.set_margin_top(2);
+        border_wrap.set_margin_bottom(2);
+
+        let inner = GtkBox::new(Orientation::Vertical, 6);
         inner.set_halign(gtk::Align::Center);
+        inner.set_margin_start(4);
+        inner.set_margin_end(4);
+        inner.set_margin_top(4);
+        inner.set_margin_bottom(4);
 
-        inner.pack_start(&member_avatar_widget(member, &image_cache), false, false, 0);
+        let portrait_pixbuf = member_portrait_pixbuf(member, &image_cache);
+
+        let portrait_frame = GtkBox::new(Orientation::Vertical, 0);
+        portrait_frame.set_size_request(MEMBER_PORTRAIT_WIDTH, MEMBER_PORTRAIT_HEIGHT);
+        portrait_frame.style_context().add_class("member-portrait");
+        portrait_frame.set_opacity(0.42);
+
+        let image = gtk::Image::new();
+        if let Some(pixbuf) = portrait_pixbuf.as_ref() {
+            image.set_from_pixbuf(Some(pixbuf));
+            image.set_size_request(MEMBER_PORTRAIT_WIDTH, MEMBER_PORTRAIT_HEIGHT);
+            portrait_frame.pack_start(&image, true, true, 0);
+        } else {
+            let placeholder = Label::new(None);
+            placeholder.set_size_request(MEMBER_PORTRAIT_WIDTH, MEMBER_PORTRAIT_HEIGHT);
+            placeholder.set_markup(&format!(
+                "<span size='xx-large' weight='bold'>{}</span>",
+                glib::markup_escape_text(&initials(&stage_name))
+            ));
+            placeholder.set_valign(gtk::Align::Center);
+            portrait_frame.pack_start(&placeholder, true, true, 0);
+        }
+        inner.pack_start(&portrait_frame, false, false, 0);
 
         let name = Label::new(Some(&stage_name));
+        name.style_context().add_class("member-name");
+        apply_member_name_style(&name, &member_color, false);
         inner.pack_start(&name, false, false, 0);
-        button.add(&inner);
+
+        border_wrap.pack_start(&inner, true, true, 0);
+        button.add(&border_wrap);
 
         let member = member.clone();
         let group_name = song
@@ -1287,10 +1408,15 @@ fn render_members(view: &UiView, model: &UiModel) {
             );
         });
 
-        container.pack_start(&button, false, false, 0);
+        container.pack_start(&button, true, true, 0);
         stage_buttons.push(MemberButton {
             stage_name,
+            color: member_color,
             button,
+            border_wrap,
+            portrait_frame,
+            image,
+            name_label: name,
         });
     }
     view.member_stage.borrow_mut().buttons = stage_buttons;

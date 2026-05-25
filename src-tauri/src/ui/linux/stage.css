@@ -1,0 +1,55 @@
+.lyric-stage-panel {
+  background-color: #f7f7f7;
+  border-radius: 8px;
+}
+
+.lyric-stage-panel scrollbar.vertical {
+  border: none;
+  background: transparent;
+}
+
+.member-strip {
+  background-color: #1a1a1a;
+  padding: 10px 8px 6px 8px;
+}
+
+.member-card {
+  background-color: transparent;
+  border-radius: 6px;
+  padding: 0;
+}
+
+.member-card.active {
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.member-portrait {
+  border-radius: 4px;
+}
+
+.member-name {
+  font-weight: 800;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+.lyric-line {
+  padding: 10px 24px;
+  transition: opacity 150ms ease;
+}
+
+.lyric-line label {
+  font-size: 17px;
+  opacity: 0.42;
+}
+
+.lyric-line-active label {
+  font-size: 30px;
+  font-weight: 800;
+  opacity: 1;
+}
+
+.lyric-line-active {
+  padding-top: 18px;
+  padding-bottom: 18px;
+}

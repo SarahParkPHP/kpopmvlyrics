@@ -140,21 +140,28 @@ impl LyricStage {
         self.content_key = content_key;
 
         if let Some(message) = content.empty_message {
-            let empty = Label::new(Some(&message));
+            let empty = Label::new(None);
+            empty.set_markup(&format!(
+                "<span size='large' foreground='#666666'>{message}</span>"
+            ));
             empty.set_line_wrap(true);
-            empty.set_xalign(0.0);
-            container.pack_start(&empty, false, false, 0);
+            empty.set_xalign(0.5);
+            empty.set_halign(gtk::Align::Center);
+            empty.set_margin_top(48);
+            empty.set_margin_bottom(48);
+            container.pack_start(&empty, true, true, 0);
             container.show_all();
             return;
         }
 
         for row_content in content.rows {
-            let row = GtkBox::new(Orientation::Horizontal, 12);
-            let member = Label::new(Some(&row_content.member));
-            member.set_width_chars(10);
-            member.set_xalign(0.0);
+            let row = GtkBox::new(Orientation::Vertical, 4);
+            row.set_halign(gtk::Align::Fill);
+            row.style_context().add_class("lyric-line");
 
-            let text_box = GtkBox::new(Orientation::Vertical, 2);
+            let text_box = GtkBox::new(Orientation::Vertical, 6);
+            text_box.set_halign(gtk::Align::Center);
+
             if let Some(markup) = &row_content.original_markup {
                 text_box.pack_start(&markup_label(markup), false, false, 0);
             }
@@ -165,10 +172,7 @@ impl LyricStage {
                 text_box.pack_start(&markup_label(markup), false, false, 0);
             }
 
-            let time = Label::new(Some(&row_content.time_text));
-            row.pack_start(&member, false, false, 0);
-            row.pack_start(&text_box, true, true, 0);
-            row.pack_start(&time, false, false, 0);
+            row.pack_start(&text_box, false, false, 0);
             container.pack_start(&row, false, false, 0);
             self.rows.push(LyricRowWidget {
                 line_index: row_content.line_index,
@@ -188,10 +192,10 @@ impl LyricStage {
         for widget in &self.rows {
             let context = widget.row.style_context();
             if active_index != usize::MAX && widget.line_index == active_index {
-                context.add_class(gtk::STYLE_CLASS_FRAME);
+                context.add_class("lyric-line-active");
                 active_row = Some(widget.row.clone());
             } else {
-                context.remove_class(gtk::STYLE_CLASS_FRAME);
+                context.remove_class("lyric-line-active");
             }
         }
 
@@ -204,8 +208,10 @@ impl LyricStage {
 fn markup_label(markup: &str) -> Label {
     let label = Label::new(None);
     label.set_markup(markup);
-    label.set_xalign(0.0);
+    label.set_xalign(0.5);
+    label.set_justify(gtk::Justification::Center);
     label.set_line_wrap(true);
+    label.set_max_width_chars(48);
     label
 }
 
@@ -220,7 +226,7 @@ fn scroll_to_row(scroll: &ScrolledWindow, row: &GtkBox) {
             let row_h = allocation.height() as f64;
             let page = scroll.allocation().height().max(1) as f64;
             let upper = adj.upper();
-            let target = (row_y - (page - row_h) * 0.35).clamp(0.0, (upper - page).max(0.0));
+            let target = (row_y - (page - row_h) * 0.42).clamp(0.0, (upper - page).max(0.0));
             adj.set_value(target);
         }
     });
