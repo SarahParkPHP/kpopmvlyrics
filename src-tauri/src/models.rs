@@ -11,6 +11,23 @@ pub struct VideoMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct VideoFormat {
+    pub format_id: String,
+    pub label: String,
+    pub height: Option<u32>,
+    pub ext: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoDownloadProgress {
+    pub percent: f32,
+    pub status: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct SongPackage {
     pub song: Song,
     pub lines: Vec<LyricLine>,

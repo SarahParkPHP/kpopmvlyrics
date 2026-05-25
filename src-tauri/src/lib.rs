@@ -2,24 +2,28 @@ mod align;
 mod captions;
 mod db;
 mod lyrics;
+mod media_server;
 mod members;
 mod models;
 mod video;
 
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use align::{align_lines, AlignmentInput};
 use captions::{parse_caption_text, CaptionProvider, YouTubeCaptionProvider};
 use db::Repository;
 use lyrics::{ColorCodedLyricsProvider, GeniusProvider, LyricsProvider};
+use media_server::MediaServer;
 use members::{KpopFandomProvider, KpoppingProvider, MemberProfileProvider};
 use models::*;
 use tauri::Manager;
-use video::resolve_video_metadata_inner;
+use video::{cleanup_incomplete_downloads, list_video_formats_inner, resolve_video_metadata_inner, resolve_video_stream_inner};
 
 struct AppState {
     repo: Mutex<Repository>,
+    video_cache_dir: PathBuf,
+    media_server: MediaServer,
 }
 
 #[tauri::command]
@@ -28,30 +32,31 @@ fn resolve_video_metadata(url: String) -> Result<VideoMetadata, String> {
 }
 
 #[tauri::command]
-fn resolve_video_stream(url: String) -> Result<String, String> {
-    let metadata = resolve_video_metadata_inner(&url).map_err(to_string)?;
-    let watch_url = format!("https://www.youtube.com/watch?v={}", metadata.video_id);
-    let output = Command::new("yt-dlp")
-        .args([
-            "--no-playlist",
-            "-f",
-            "best[protocol^=http][ext=mp4][vcodec^=avc1][acodec^=mp4a]/18/best[protocol^=http][ext=mp4][vcodec!=none][acodec!=none]",
-            "--get-url",
-            &watch_url,
-        ])
-        .output()
-        .map_err(|err| format!("Could not run yt-dlp: {err}. Install yt-dlp."))?;
+fn list_video_formats(url: String) -> Result<Vec<VideoFormat>, String> {
+    list_video_formats_inner(&url).map_err(to_string)
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("yt-dlp failed: {}", stderr.trim()));
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find(|line| line.starts_with("http://") || line.starts_with("https://"))
-        .map(str::to_string)
-        .ok_or_else(|| "yt-dlp did not return a playable stream URL".to_string())
+#[tauri::command]
+async fn resolve_video_stream(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    url: String,
+    format_id: Option<String>,
+) -> Result<String, String> {
+    let cache_dir = state.video_cache_dir.clone();
+    let media_server = state.media_server.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        resolve_video_stream_inner(
+            &url,
+            format_id.as_deref(),
+            &cache_dir,
+            &media_server,
+            Some(app),
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(to_string)
 }
 
 #[tauri::command]
@@ -189,14 +194,24 @@ pub fn run() {
                 .app_data_dir()
                 .unwrap_or_else(|_| std::env::current_dir().expect("current dir"));
             std::fs::create_dir_all(&app_dir)?;
+            let video_cache_dir = app_dir.join("video-cache");
+            std::fs::create_dir_all(&video_cache_dir)?;
+            cleanup_incomplete_downloads(&video_cache_dir).map_err(to_string)?;
+            app.asset_protocol_scope()
+                .allow_directory(&video_cache_dir, true)
+                .map_err(to_string)?;
+            let media_server = MediaServer::start(video_cache_dir.clone())?;
             let repo = Repository::open(app_dir.join("kpopmvlyrics.sqlite3"))?;
             app.manage(AppState {
                 repo: Mutex::new(repo),
+                video_cache_dir,
+                media_server,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             resolve_video_metadata,
+            list_video_formats,
             resolve_video_stream,
             fetch_lyrics,
             import_lyrics,
@@ -223,6 +238,10 @@ fn configure_linux_webview_backend() {
 
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
+    if std::env::var_os("WEBKIT_GST_ALLOWED_URI_PROTOCOLS").is_none() {
+        std::env::set_var("WEBKIT_GST_ALLOWED_URI_PROTOCOLS", "asset,file,http,https");
     }
 }
 

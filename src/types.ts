@@ -5,6 +5,19 @@ export interface VideoMetadata {
   originalUrl: string;
 }
 
+export interface VideoFormat {
+  formatId: string;
+  label: string;
+  height?: number | null;
+  ext?: string | null;
+}
+
+export interface VideoDownloadProgress {
+  percent: number;
+  status: string;
+  active: boolean;
+}
+
 export interface SongPackage {
   song: Song;
   lines: LyricLine[];

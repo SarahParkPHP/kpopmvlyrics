@@ -20,7 +20,15 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; img-src 'self' asset: http: https: data: file:; media-src 'self' asset: file: blob: http: https:; connect-src ipc: http: https:; style-src 'self' 'unsafe-inline'"
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/**",
+          "$APPLOCALDATA/**",
+          "$APPLOCALDATA/video-cache/**"
+        ]
+      },
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost http: https: data: file:; media-src 'self' asset: https://asset.localhost file: blob: http: https:; connect-src ipc: http: https:; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {

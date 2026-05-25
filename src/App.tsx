@@ -3,7 +3,9 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AlertCircle, Check, Clock, Download, FileVideo, Languages, Link, Loader2, Pause, Pencil, Play, RotateCcw, Save, Search, Settings, Upload } from "lucide-react";
 import { api } from "./tauri";
-import type { AlignmentLine, CaptionLine, LanguageKey, LyricLine, LyricSegment, MemberProfile, SongPackage, VideoMetadata } from "./types";
+import type { AlignmentLine, CaptionLine, LanguageKey, LyricLine, LyricSegment, MemberProfile, SongPackage, VideoDownloadProgress, VideoFormat, VideoMetadata } from "./types";
+
+const AUTO_QUALITY = "auto";
 
 const initialLyrics = "Nayeon: Tell me what you want\nMomo: Tell me what you need\nSana: A to Z da malhaebwa";
 const initialCaptions = "WEBVTT\n\n00:00:01.000 --> 00:00:02.400\nTell me what you want\n\n00:00:02.500 --> 00:00:03.900\nTell me what you need\n\n00:00:04.000 --> 00:00:05.600\nA to Z da malhaebwa";
@@ -24,9 +26,27 @@ export function App() {
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [videoStreamUrl, setVideoStreamUrl] = useState<string | null>(null);
+  const [availableFormats, setAvailableFormats] = useState<VideoFormat[]>([]);
+  const [selectedFormatId, setSelectedFormatId] = useState(AUTO_QUALITY);
+  const [downloadProgress, setDownloadProgress] = useState<VideoDownloadProgress | null>(null);
   const [syncRunning, setSyncRunning] = useState(false);
   const [currentMs, setCurrentMs] = useState(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const pendingSeekRef = useRef<{ time: number; playing: boolean } | null>(null);
+
+  const videoSrc = videoStreamUrl;
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void api.onVideoDownloadProgress((progress) => {
+      setDownloadProgress(progress.active ? progress : null);
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   const activeIndex = useMemo(() => {
     const found = alignment.find((line) => currentMs >= line.startMs && currentMs <= line.endMs);
@@ -43,6 +63,26 @@ export function App() {
     const line = songPackage?.lines.find((lyric) => lyric.index === activeIndex);
     return new Set(line?.member ? [line.member] : []);
   }, [songPackage?.lines, activeIndex]);
+
+  const activeQualityLabel = useMemo(() => {
+    if (selectedFormatId === AUTO_QUALITY) {
+      return "Auto";
+    }
+    return availableFormats.find((format) => format.formatId === selectedFormatId)?.label ?? selectedFormatId;
+  }, [availableFormats, selectedFormatId]);
+
+  async function fetchVideoStream(formatId = selectedFormatId): Promise<string | null> {
+    setError(null);
+    setDownloadProgress({ percent: 0, status: "Preparing video", active: true });
+    try {
+      return await api.resolveVideoStream(url, formatId === AUTO_QUALITY ? undefined : formatId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return null;
+    } finally {
+      setDownloadProgress(null);
+    }
+  }
 
   async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     setBusy(label);
@@ -73,10 +113,16 @@ export function App() {
       setAlignment([]);
       setSyncRunning(false);
       setCurrentMs(0);
+      setVideoStreamUrl(null);
+      setAvailableFormats([]);
+      setSelectedFormatId(AUTO_QUALITY);
+
+      setBusy("Video formats");
+      const formats = await api.listVideoFormats(url).catch(() => []);
+      setAvailableFormats(formats);
 
       if (lyricQuery) {
-        setBusy("Video stream");
-        const streamUrl = await api.resolveVideoStream(url);
+        const streamUrl = await fetchVideoStream();
         if (streamUrl) {
           setVideoStreamUrl(streamUrl);
         }
@@ -188,12 +234,52 @@ export function App() {
     }
   }
 
-  async function loadVideoStream() {
-    const streamUrl = await run("Video stream", () => api.resolveVideoStream(url));
+  async function loadVideoStream(formatId = selectedFormatId) {
+    if (!availableFormats.length && metadata) {
+      const formats = await api.listVideoFormats(url).catch(() => []);
+      setAvailableFormats(formats);
+    }
+
+    const streamUrl = await fetchVideoStream(formatId);
     if (streamUrl) {
       setVideoStreamUrl(streamUrl);
       setSyncRunning(false);
       setCurrentMs(0);
+    }
+  }
+
+  async function changeVideoQuality(formatId: string) {
+    setSelectedFormatId(formatId);
+    if (!videoStreamUrl) {
+      return;
+    }
+
+    const player = videoRef.current;
+    pendingSeekRef.current = {
+      time: player?.currentTime ?? 0,
+      playing: Boolean(player && !player.paused),
+    };
+
+    const streamUrl = await fetchVideoStream(formatId);
+    if (streamUrl) {
+      setVideoStreamUrl(streamUrl);
+    }
+  }
+
+  function handleVideoLoadedMetadata(event: React.SyntheticEvent<HTMLVideoElement>) {
+    const player = event.currentTarget;
+    setCurrentMs(Math.round(player.currentTime * 1000));
+
+    const pendingSeek = pendingSeekRef.current;
+    if (!pendingSeek) {
+      return;
+    }
+
+    pendingSeekRef.current = null;
+    player.currentTime = pendingSeek.time;
+    setCurrentMs(Math.round(pendingSeek.time * 1000));
+    if (pendingSeek.playing) {
+      void player.play();
     }
   }
 
@@ -239,10 +325,24 @@ export function App() {
             <Link size={16} />
             <input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="Paste a YouTube MV URL" />
           </div>
-          <button onClick={resolveVideo} disabled={busy !== null}>
+          <select
+            className="quality-select"
+            value={selectedFormatId}
+            onChange={(event) => void changeVideoQuality(event.target.value)}
+            disabled={busy !== null || downloadProgress !== null || !metadata}
+            aria-label="Video quality"
+          >
+            <option value={AUTO_QUALITY}>Auto</option>
+            {availableFormats.map((format) => (
+              <option key={format.formatId} value={format.formatId}>
+                {format.label}
+              </option>
+            ))}
+          </select>
+          <button onClick={resolveVideo} disabled={busy !== null || downloadProgress !== null}>
             <Search size={17} /> Open
           </button>
-          <button onClick={loadVideoStream} disabled={busy !== null}>
+          <button onClick={() => void loadVideoStream()} disabled={busy !== null || downloadProgress !== null}>
             <FileVideo size={17} /> Stream
           </button>
           <button onClick={() => setEditorOpen((value) => !value)} aria-pressed={editorOpen}>
@@ -254,18 +354,27 @@ export function App() {
         </div>
         <div className={`player-grid ${settingsOpen ? "settings-open" : ""}`}>
           <div className="video-frame">
-            {videoStreamUrl ? (
+            {videoSrc ? (
               <video
+                key={videoSrc}
                 ref={videoRef}
-                src={videoStreamUrl}
+                src={videoSrc}
                 controls
                 playsInline
                 preload="metadata"
                 onError={(event) => {
                   const mediaError = event.currentTarget.error;
-                  setError(mediaError ? `Video playback failed (${mediaError.code})` : "Video playback failed");
+                  const code = mediaError?.code;
+                  const labels: Record<number, string> = {
+                    1: "playback aborted",
+                    2: "network error",
+                    3: "decode error",
+                    4: "unsupported format",
+                  };
+                  const detail = code ? labels[code] ?? `code ${code}` : "unknown error";
+                  setError(`Video playback failed (${detail})`);
                 }}
-                onLoadedMetadata={(event) => setCurrentMs(Math.round(event.currentTarget.currentTime * 1000))}
+                onLoadedMetadata={handleVideoLoadedMetadata}
                 onTimeUpdate={(event) => setCurrentMs(Math.round(event.currentTarget.currentTime * 1000))}
                 onSeeking={(event) => setCurrentMs(Math.round(event.currentTarget.currentTime * 1000))}
                 onPlay={() => setSyncRunning(true)}
@@ -273,7 +382,7 @@ export function App() {
                 onEnded={() => setSyncRunning(false)}
               />
             ) : (
-              <button className="video-start" onClick={loadVideoStream} disabled={busy !== null} aria-label="Resolve video stream">
+              <button className="video-start" onClick={() => void loadVideoStream()} disabled={busy !== null} aria-label="Resolve video stream">
                 <FileVideo size={42} />
               </button>
             )}
@@ -312,7 +421,7 @@ export function App() {
               <span>{metadata ? metadata.videoId : "No video"}</span>
               <span>{songPackage ? `${songPackage.song.artist} - ${songPackage.song.title}` : "No song"}</span>
               <span>{captions.length} captions</span>
-            <span>{videoStreamUrl ? "stream ready" : "No stream"}</span>
+            <span>{videoStreamUrl ? `${activeQualityLabel} stream ready` : "No stream"}</span>
             <span>{alignment.filter((line) => line.needsReview).length} review</span>
             <span>{syncRunning ? "sync running" : "sync paused"}</span>
           </div>
@@ -358,7 +467,27 @@ export function App() {
           />
         </section>
       )}
+
+      {downloadProgress && <DownloadModal progress={downloadProgress} />}
     </main>
+  );
+}
+
+function DownloadModal({ progress }: { progress: VideoDownloadProgress }) {
+  const percent = Math.max(0, Math.min(100, Math.round(progress.percent)));
+
+  return (
+    <div className="download-modal-backdrop" role="presentation">
+      <div className="download-modal" role="dialog" aria-modal="true" aria-labelledby="download-modal-title">
+        <div className="download-modal-head">
+          <Loader2 className="spin" size={20} />
+          <h2 id="download-modal-title">Downloading video</h2>
+        </div>
+        <p className="download-modal-status">{progress.status}</p>
+        <progress className="download-progress" max={100} value={percent} />
+        <span className="download-modal-percent">{percent}%</span>
+      </div>
+    </div>
   );
 }
 
