@@ -12,10 +12,15 @@ export interface VideoFormat {
   ext?: string | null;
 }
 
-export interface VideoDownloadProgress {
-  percent: number;
-  status: string;
-  active: boolean;
+export type StreamSpec =
+  | { kind: "progressive"; uri: string }
+  | { kind: "adaptive"; videoUri: string; audioUri: string };
+
+export interface VideoPosition {
+  ms: number;
+  durationMs?: number | null;
+  playing: boolean;
+  buffering: boolean;
 }
 
 export interface SongPackage {

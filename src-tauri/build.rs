@@ -1,3 +1,4 @@
 fn main() {
-    tauri_build::build()
+    #[cfg(not(target_os = "linux"))]
+    tauri_build::build();
 }

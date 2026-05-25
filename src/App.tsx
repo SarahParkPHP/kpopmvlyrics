@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AlertCircle, Check, Clock, Download, FileVideo, Languages, Link, Loader2, Pause, Pencil, Play, RotateCcw, Save, Search, Settings, Upload } from "lucide-react";
 import { api } from "./tauri";
-import type { AlignmentLine, CaptionLine, LanguageKey, LyricLine, LyricSegment, MemberProfile, SongPackage, VideoDownloadProgress, VideoFormat, VideoMetadata } from "./types";
+import type { AlignmentLine, CaptionLine, LanguageKey, LyricLine, LyricSegment, MemberProfile, SongPackage, VideoFormat, VideoMetadata } from "./types";
 
 const AUTO_QUALITY = "auto";
 
@@ -25,26 +25,34 @@ export function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [videoStreamUrl, setVideoStreamUrl] = useState<string | null>(null);
+  const [playerLoaded, setPlayerLoaded] = useState(false);
   const [availableFormats, setAvailableFormats] = useState<VideoFormat[]>([]);
   const [selectedFormatId, setSelectedFormatId] = useState(AUTO_QUALITY);
-  const [downloadProgress, setDownloadProgress] = useState<VideoDownloadProgress | null>(null);
+  const [buffering, setBuffering] = useState(false);
   const [syncRunning, setSyncRunning] = useState(false);
   const [currentMs, setCurrentMs] = useState(0);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const pendingSeekRef = useRef<{ time: number; playing: boolean } | null>(null);
-
-  const videoSrc = videoStreamUrl;
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    void api.onVideoDownloadProgress((progress) => {
-      setDownloadProgress(progress.active ? progress : null);
+    let unlistenPosition: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+
+    void api.onVideoPosition((position) => {
+      setCurrentMs(position.ms);
+      setBuffering(position.buffering);
+      setSyncRunning(position.playing);
     }).then((dispose) => {
-      unlisten = dispose;
+      unlistenPosition = dispose;
     });
+
+    void api.onVideoPlayerError((message) => {
+      setError(message);
+    }).then((dispose) => {
+      unlistenError = dispose;
+    });
+
     return () => {
-      unlisten?.();
+      unlistenPosition?.();
+      unlistenError?.();
     };
   }, []);
 
@@ -71,16 +79,18 @@ export function App() {
     return availableFormats.find((format) => format.formatId === selectedFormatId)?.label ?? selectedFormatId;
   }, [availableFormats, selectedFormatId]);
 
-  async function fetchVideoStream(formatId = selectedFormatId): Promise<string | null> {
+  async function loadPlayer(formatId = selectedFormatId): Promise<boolean> {
     setError(null);
-    setDownloadProgress({ percent: 0, status: "Preparing video", active: true });
+    setBuffering(true);
     try {
-      return await api.resolveVideoStream(url, formatId === AUTO_QUALITY ? undefined : formatId);
+      await api.playerLoad(url, formatId === AUTO_QUALITY ? undefined : formatId);
+      setPlayerLoaded(true);
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      return null;
+      return false;
     } finally {
-      setDownloadProgress(null);
+      setBuffering(false);
     }
   }
 
@@ -113,7 +123,7 @@ export function App() {
       setAlignment([]);
       setSyncRunning(false);
       setCurrentMs(0);
-      setVideoStreamUrl(null);
+      setPlayerLoaded(false);
       setAvailableFormats([]);
       setSelectedFormatId(AUTO_QUALITY);
 
@@ -122,10 +132,7 @@ export function App() {
       setAvailableFormats(formats);
 
       if (lyricQuery) {
-        const streamUrl = await fetchVideoStream();
-        if (streamUrl) {
-          setVideoStreamUrl(streamUrl);
-        }
+        await loadPlayer();
 
         setBusy("Lyrics");
         const lyrics = await api.fetchLyrics(lyricQuery);
@@ -141,7 +148,6 @@ export function App() {
           setBusy("Alignment");
           const aligned = await api.alignLyrics(lyrics.song.id, result.videoId);
           setAlignment(aligned);
-          setCurrentMs(Math.round((videoRef.current?.currentTime ?? 0) * 1000));
           setMessage("Video, lyrics, captions, and alignment complete");
         }
       } else {
@@ -212,74 +218,32 @@ export function App() {
     const result = await run("Alignment", () => api.alignLyrics(songId, videoId));
     if (result) {
       setAlignment(result);
-      setCurrentMs(Math.round((videoRef.current?.currentTime ?? 0) * 1000));
     }
   }
 
   function startAlignedSync() {
-    const player = videoRef.current;
-    if (player) {
-      void player.play();
-    } else {
-      setSyncRunning(true);
-    }
+    void api.playerPlay();
   }
 
   function resetAlignedSync() {
+    void api.playerPause();
+    void api.playerSeek(0);
     setSyncRunning(false);
     setCurrentMs(0);
-    if (videoRef.current) {
-      videoRef.current.pause();
-      videoRef.current.currentTime = 0;
-    }
-  }
-
-  async function loadVideoStream(formatId = selectedFormatId) {
-    if (!availableFormats.length && metadata) {
-      const formats = await api.listVideoFormats(url).catch(() => []);
-      setAvailableFormats(formats);
-    }
-
-    const streamUrl = await fetchVideoStream(formatId);
-    if (streamUrl) {
-      setVideoStreamUrl(streamUrl);
-      setSyncRunning(false);
-      setCurrentMs(0);
-    }
   }
 
   async function changeVideoQuality(formatId: string) {
     setSelectedFormatId(formatId);
-    if (!videoStreamUrl) {
+    if (!playerLoaded) {
       return;
     }
-
-    const player = videoRef.current;
-    pendingSeekRef.current = {
-      time: player?.currentTime ?? 0,
-      playing: Boolean(player && !player.paused),
-    };
-
-    const streamUrl = await fetchVideoStream(formatId);
-    if (streamUrl) {
-      setVideoStreamUrl(streamUrl);
-    }
-  }
-
-  function handleVideoLoadedMetadata(event: React.SyntheticEvent<HTMLVideoElement>) {
-    const player = event.currentTarget;
-    setCurrentMs(Math.round(player.currentTime * 1000));
-
-    const pendingSeek = pendingSeekRef.current;
-    if (!pendingSeek) {
-      return;
-    }
-
-    pendingSeekRef.current = null;
-    player.currentTime = pendingSeek.time;
-    setCurrentMs(Math.round(pendingSeek.time * 1000));
-    if (pendingSeek.playing) {
-      void player.play();
+    setBuffering(true);
+    try {
+      await api.playerSetQuality(formatId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBuffering(false);
     }
   }
 
@@ -329,7 +293,7 @@ export function App() {
             className="quality-select"
             value={selectedFormatId}
             onChange={(event) => void changeVideoQuality(event.target.value)}
-            disabled={busy !== null || downloadProgress !== null || !metadata}
+            disabled={busy !== null || !metadata}
             aria-label="Video quality"
           >
             <option value={AUTO_QUALITY}>Auto</option>
@@ -339,10 +303,10 @@ export function App() {
               </option>
             ))}
           </select>
-          <button onClick={resolveVideo} disabled={busy !== null || downloadProgress !== null}>
+          <button onClick={resolveVideo} disabled={busy !== null}>
             <Search size={17} /> Open
           </button>
-          <button onClick={() => void loadVideoStream()} disabled={busy !== null || downloadProgress !== null}>
+          <button onClick={() => void loadPlayer()} disabled={busy !== null}>
             <FileVideo size={17} /> Stream
           </button>
           <button onClick={() => setEditorOpen((value) => !value)} aria-pressed={editorOpen}>
@@ -353,40 +317,6 @@ export function App() {
           </button>
         </div>
         <div className={`player-grid ${settingsOpen ? "settings-open" : ""}`}>
-          <div className="video-frame">
-            {videoSrc ? (
-              <video
-                key={videoSrc}
-                ref={videoRef}
-                src={videoSrc}
-                controls
-                playsInline
-                preload="metadata"
-                onError={(event) => {
-                  const mediaError = event.currentTarget.error;
-                  const code = mediaError?.code;
-                  const labels: Record<number, string> = {
-                    1: "playback aborted",
-                    2: "network error",
-                    3: "decode error",
-                    4: "unsupported format",
-                  };
-                  const detail = code ? labels[code] ?? `code ${code}` : "unknown error";
-                  setError(`Video playback failed (${detail})`);
-                }}
-                onLoadedMetadata={handleVideoLoadedMetadata}
-                onTimeUpdate={(event) => setCurrentMs(Math.round(event.currentTarget.currentTime * 1000))}
-                onSeeking={(event) => setCurrentMs(Math.round(event.currentTarget.currentTime * 1000))}
-                onPlay={() => setSyncRunning(true)}
-                onPause={() => setSyncRunning(false)}
-                onEnded={() => setSyncRunning(false)}
-              />
-            ) : (
-              <button className="video-start" onClick={() => void loadVideoStream()} disabled={busy !== null} aria-label="Resolve video stream">
-                <FileVideo size={42} />
-              </button>
-            )}
-          </div>
           {settingsOpen && <div className="load-panel">
             <div className="field">
               <Search size={16} />
@@ -405,23 +335,24 @@ export function App() {
               <button onClick={saveEdits} disabled={busy !== null || !alignment.length}>
                 <Save size={17} /> Save
               </button>
-              <button onClick={() => syncRunning ? videoRef.current?.pause() : startAlignedSync()} disabled={!alignment.length || !videoStreamUrl}>
+              <button onClick={() => syncRunning ? void api.playerPause() : startAlignedSync()} disabled={!alignment.length || !playerLoaded}>
                 {syncRunning ? <Pause size={17} /> : <Play size={17} />} {syncRunning ? "Pause Sync" : "Start Sync"}
               </button>
-              <button onClick={() => resetAlignedSync()} disabled={!alignment.length || !videoStreamUrl}>
+              <button onClick={() => resetAlignedSync()} disabled={!alignment.length || !playerLoaded}>
                 <RotateCcw size={17} /> Reset Sync
               </button>
             </div>
             <div className="status-line">
               {busy && <><Loader2 className="spin" size={16} /> {busy} running</>}
-              {!busy && message && <><Check size={16} /> {message}</>}
+              {!busy && buffering && <><Loader2 className="spin" size={16} /> Buffering video</>}
+              {!busy && !buffering && message && <><Check size={16} /> {message}</>}
               {error && <><AlertCircle size={16} /> {error}</>}
             </div>
             <div className="meta-grid">
               <span>{metadata ? metadata.videoId : "No video"}</span>
               <span>{songPackage ? `${songPackage.song.artist} - ${songPackage.song.title}` : "No song"}</span>
               <span>{captions.length} captions</span>
-            <span>{videoStreamUrl ? `${activeQualityLabel} stream ready` : "No stream"}</span>
+            <span>{playerLoaded ? `${activeQualityLabel} native player ready` : "No stream"}</span>
             <span>{alignment.filter((line) => line.needsReview).length} review</span>
             <span>{syncRunning ? "sync running" : "sync paused"}</span>
           </div>
@@ -468,26 +399,7 @@ export function App() {
         </section>
       )}
 
-      {downloadProgress && <DownloadModal progress={downloadProgress} />}
     </main>
-  );
-}
-
-function DownloadModal({ progress }: { progress: VideoDownloadProgress }) {
-  const percent = Math.max(0, Math.min(100, Math.round(progress.percent)));
-
-  return (
-    <div className="download-modal-backdrop" role="presentation">
-      <div className="download-modal" role="dialog" aria-modal="true" aria-labelledby="download-modal-title">
-        <div className="download-modal-head">
-          <Loader2 className="spin" size={20} />
-          <h2 id="download-modal-title">Downloading video</h2>
-        </div>
-        <p className="download-modal-status">{progress.status}</p>
-        <progress className="download-progress" max={100} value={percent} />
-        <span className="download-modal-percent">{percent}%</span>
-      </div>
-    </div>
   );
 }
 

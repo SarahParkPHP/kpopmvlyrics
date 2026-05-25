@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "K-Pop MV Lyrics",
         "width": 1240,
         "height": 860,
@@ -24,11 +25,10 @@
         "enable": true,
         "scope": [
           "$APPDATA/**",
-          "$APPLOCALDATA/**",
-          "$APPLOCALDATA/video-cache/**"
+          "$APPLOCALDATA/**"
         ]
       },
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost http: https: data: file:; media-src 'self' asset: https://asset.localhost file: blob: http: https:; connect-src ipc: http: https:; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost http: https: data: file:; connect-src ipc: http: https:; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {

@@ -9,8 +9,8 @@ ARCH="$(uname -m)"
 OUT_DIR="$ROOT/src-tauri/target/release/bundle/tar"
 STAGE="$OUT_DIR/$APP_ID-$VERSION-$ARCH"
 
-cd "$ROOT"
-CARGO_INCREMENTAL=0 npm run tauri -- build --no-bundle
+cd "$ROOT/src-tauri"
+CARGO_INCREMENTAL=0 cargo build --release
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/share/applications" "$STAGE/share/icons/hicolor/128x128/apps" "$STAGE/share/metainfo"

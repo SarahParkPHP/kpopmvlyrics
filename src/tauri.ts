@@ -1,8 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AlignmentLine, CaptionLine, MemberProfile, SongPackage, VideoDownloadProgress, VideoFormat, VideoMetadata } from "./types";
+import type { AlignmentLine, CaptionLine, MemberProfile, SongPackage, StreamSpec, VideoFormat, VideoMetadata, VideoPosition } from "./types";
 
 const inTauri = "__TAURI_INTERNALS__" in window;
+
+let mockPositionTimer: number | undefined;
+let mockPositionMs = 0;
+let mockPlaying = false;
 
 export async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   if (!inTauri) {
@@ -25,8 +29,28 @@ async function mockCommand<T>(name: string, args?: Record<string, unknown>): Pro
       { formatId: "18", label: "360p MP4", height: 360, ext: "mp4" },
     ] as T;
   }
-  if (name === "resolve_video_stream") {
-    return "" as T;
+  if (name === "resolve_stream") {
+    return { kind: "progressive", uri: "https://example.com/video.mp4" } as T;
+  }
+  if (name === "player_load") {
+    mockPositionMs = 0;
+    mockPlaying = false;
+    return undefined as T;
+  }
+  if (name === "player_play") {
+    mockPlaying = true;
+    return undefined as T;
+  }
+  if (name === "player_pause") {
+    mockPlaying = false;
+    return undefined as T;
+  }
+  if (name === "player_seek") {
+    mockPositionMs = Number(args?.ms ?? 0);
+    return undefined as T;
+  }
+  if (name === "player_set_quality") {
+    return undefined as T;
   }
   if (name === "import_lyrics" || name === "fetch_lyrics") {
     const raw = String(args?.rawText ?? "Nayeon: Tell me what you want\nMomo: Tell me what you need\nSana: A to Z da malhaebwa");
@@ -66,7 +90,7 @@ async function mockCommand<T>(name: string, args?: Record<string, unknown>): Pro
       { lyricIndex: 2, captionIndex: 2, startMs: 4000, endMs: 5600, confidence: 0.86, needsReview: false },
     ] as T;
   }
-  if (name === "save_alignment_edits" || name === "save_member_override" || name === "show_video_browser" || name === "position_video_browser") {
+  if (name === "save_alignment_edits" || name === "save_member_override") {
     return undefined as T;
   }
   if (name === "search_member_profiles") {
@@ -75,15 +99,49 @@ async function mockCommand<T>(name: string, args?: Record<string, unknown>): Pro
   throw new Error(`Mock command not implemented: ${name}`);
 }
 
+function startMockPositionTimer(handler: (position: VideoPosition) => void) {
+  if (mockPositionTimer) {
+    window.clearInterval(mockPositionTimer);
+  }
+  mockPositionTimer = window.setInterval(() => {
+    if (mockPlaying) {
+      mockPositionMs += 33;
+    }
+    handler({
+      ms: mockPositionMs,
+      durationMs: 240_000,
+      playing: mockPlaying,
+      buffering: false,
+    });
+  }, 33);
+}
+
 export const api = {
   resolveVideoMetadata: (url: string) => command<VideoMetadata>("resolve_video_metadata", { url }),
   listVideoFormats: (url: string) => command<VideoFormat[]>("list_video_formats", { url }),
-  resolveVideoStream: (url: string, formatId?: string) => command<string>("resolve_video_stream", { url, formatId: formatId ?? null }),
-  onVideoDownloadProgress: (handler: (progress: VideoDownloadProgress) => void) => {
+  resolveStream: (url: string, formatId?: string) => command<StreamSpec>("resolve_stream", { url, formatId: formatId ?? null }),
+  playerLoad: (url: string, formatId?: string) => command<void>("player_load", { url, formatId: formatId ?? null }),
+  playerPlay: () => command<void>("player_play"),
+  playerPause: () => command<void>("player_pause"),
+  playerSeek: (ms: number) => command<void>("player_seek", { ms }),
+  playerSetQuality: (formatId: string) => command<void>("player_set_quality", { formatId }),
+  onVideoPosition: (handler: (position: VideoPosition) => void) => {
+    if (!inTauri) {
+      startMockPositionTimer(handler);
+      return Promise.resolve(() => {
+        if (mockPositionTimer) {
+          window.clearInterval(mockPositionTimer);
+          mockPositionTimer = undefined;
+        }
+      });
+    }
+    return listen<VideoPosition>("video-position", (event) => handler(event.payload));
+  },
+  onVideoPlayerError: (handler: (message: string) => void) => {
     if (!inTauri) {
       return Promise.resolve(() => undefined);
     }
-    return listen<VideoDownloadProgress>("video-download-progress", (event) => handler(event.payload));
+    return listen<string>("video-player-error", (event) => handler(event.payload));
   },
   fetchLyrics: (query: string) => command<SongPackage>("fetch_lyrics", { query }),
   importLyrics: (rawText: string, title: string, artist: string) => command<SongPackage>("import_lyrics", { rawText, title, artist }),

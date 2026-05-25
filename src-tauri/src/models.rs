@@ -19,11 +19,22 @@ pub struct VideoFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum StreamSpec {
+    Progressive { uri: String },
+    Adaptive {
+        video_uri: String,
+        audio_uri: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct VideoDownloadProgress {
-    pub percent: f32,
-    pub status: String,
-    pub active: bool,
+pub struct VideoPosition {
+    pub ms: u64,
+    pub duration_ms: Option<u64>,
+    pub playing: bool,
+    pub buffering: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

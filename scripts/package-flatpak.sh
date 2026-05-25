@@ -19,8 +19,8 @@ if ! flatpak remotes --user --columns=name | grep -qx "flathub"; then
   flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 fi
 
-cd "$ROOT"
-CARGO_INCREMENTAL=0 npm run tauri -- build --no-bundle
+cd "$ROOT/src-tauri"
+CARGO_INCREMENTAL=0 cargo build --release
 
 rm -rf "$STAGE" "$BUILD_DIR" "$REPO_DIR"
 mkdir -p "$STAGE/bin" "$STAGE/share/applications" "$STAGE/share/icons/hicolor/128x128/apps" "$STAGE/share/metainfo" "$FLATPAK_DIR"
@@ -44,6 +44,7 @@ finish-args:
   - --device=dri
   - --filesystem=xdg-download
   - --talk-name=org.freedesktop.portal.Desktop
+  - --env=GST_PLUGIN_SYSTEM_PATH=/usr/lib/gstreamer-1.0
 modules:
   - name: kpopmvlyrics
     buildsystem: simple

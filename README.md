@@ -1,15 +1,44 @@
 # K-Pop MV Lyrics
 
-Cross-platform Tauri v2 desktop app for playing a YouTube MV while showing synced, member-colored lyrics.
+Desktop app for playing a YouTube MV while showing synced, member-colored lyrics.
 
 ## Run
+
+### Linux (native GTK + GStreamer)
+
+Linux builds use a **native GTK UI** and GStreamer video pane — no WebKit, no npm frontend, native Wayland support.
+
+Install dependencies:
+
+```bash
+# Arch / CachyOS
+sudo pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav gst-plugin-gtk gtk3
+
+# Debian / Ubuntu
+sudo apt install gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-gl libgtk-3-dev
+```
+
+YouTube stream resolution requires **yt-dlp** on your PATH.
+
+Build and run:
+
+```bash
+cd src-tauri
+cargo build --release
+./target/release/kpopmvlyrics
+```
+
+### Windows / macOS (Tauri + React)
 
 ```bash
 npm install
 npm run tauri dev
 ```
 
-For frontend-only iteration:
+Install [GStreamer runtime](https://gstreamer.freedesktop.org/download/) for native video playback.
+
+For frontend-only iteration on Windows/macOS:
 
 ```bash
 npm run dev
@@ -24,27 +53,27 @@ cd src-tauri && cargo test
 
 ## Package
 
+Linux tarball and Flatpak:
+
+```bash
+npm run package:tar
+npm run package:flatpak
+```
+
+Windows/macOS `.deb` / `.rpm` (via Tauri):
+
 ```bash
 npm run package:linux
 ```
 
-This builds:
-
-- `.deb` in `src-tauri/target/release/bundle/deb/`
-- `.rpm` in `src-tauri/target/release/bundle/rpm/`
-- portable `.tar.gz` in `src-tauri/target/release/bundle/tar/`
-- `.flatpak` in `src-tauri/target/release/bundle/flatpak/`
-
-The tarball is intended for Arch/Cachy-style installs and includes an `install.sh` that respects `PREFIX`.
-
 ## Current Capabilities
 
-- YouTube URL resolution and embedded IFrame Player API playback.
-- Rust commands for lyric fetching/import, caption fetching/import, alignment, member profile search, and override persistence.
-- SQLite cache for songs, lyric lines, captions, alignments, members, provider metadata, and user overrides.
-- ColorCodedLyrics-first provider with Genius fallback, plus manual lyric import.
-- Best-effort public YouTube caption discovery, plus VTT/SRT/YouTube JSON manual import.
-- Fuzzy caption-to-lyric alignment with interpolation and review flags for low confidence lines.
-- React lyric stage with original/romanization/English toggles, active member highlighting, timing editor, global shift controls, member assignment, and local image picker.
+- YouTube URL resolution via yt-dlp with native GStreamer playback (progressive 360p or adaptive HD streams).
+- Split-pane layout: lyrics, member strip, and controls (top), native video surface (bottom).
+- Rust backend for lyric fetching/import, caption fetching/import, alignment, member profile search, and SQLite persistence.
+- ColorCodedLyrics-first provider with Genius fallback.
+- Best-effort YouTube caption discovery.
+- Fuzzy caption-to-lyric alignment with review flags.
+- Member-colored lyric lines with original / romanization / English toggles and sync playback.
 
-Live scrapers are intentionally best-effort because provider markup and access rules can change. Manual import and local edits are part of the normal workflow.
+Live scrapers are intentionally best-effort because provider markup and access rules can change.
