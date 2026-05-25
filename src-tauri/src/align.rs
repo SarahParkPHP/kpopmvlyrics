@@ -1,7 +1,11 @@
+use std::collections::HashSet;
+
 use regex::Regex;
 use strsim::jaro_winkler;
 
 use crate::models::{AlignmentLine, CaptionLine, LyricLine};
+
+const MATCH_THRESHOLD: f64 = 0.72;
 
 pub struct AlignmentInput {
     pub lyrics: Vec<LyricLine>,
@@ -13,57 +17,272 @@ pub fn align_lines(input: AlignmentInput) -> Vec<AlignmentLine> {
         return Vec::new();
     }
     if input.captions.is_empty() {
-        return interpolate_all(&input.lyrics);
+        return unmatched_all(&input.lyrics);
     }
 
-    let mut result = Vec::with_capacity(input.lyrics.len());
-    let mut caption_cursor = 0usize;
+    let captions: Vec<CaptionLine> = input
+        .captions
+        .into_iter()
+        .filter(|caption| is_usable_caption(caption))
+        .collect();
+    if captions.is_empty() {
+        return unmatched_all(&input.lyrics);
+    }
 
-    for lyric in &input.lyrics {
-        let search_end = (caption_cursor + 8).min(input.captions.len());
-        let mut best: Option<(usize, f64)> = None;
-
-        for caption_index in caption_cursor..search_end {
-            let caption = &input.captions[caption_index];
-            let caption_text = normalize_text(&caption.text);
-            let score = lyric_text_candidates(lyric)
-                .into_iter()
-                .map(normalize_text)
-                .filter(|text| !text.is_empty() && !caption_text.is_empty())
-                .map(|text| jaro_winkler(&text, &caption_text))
-                .fold(0.0, f64::max);
-            if best
-                .map(|(_, best_score)| score > best_score)
-                .unwrap_or(true)
-            {
-                best = Some((caption_index, score));
+    let pairs = align_sequence(&input.lyrics, &captions);
+    input
+        .lyrics
+        .iter()
+        .map(|lyric| {
+            if let Some(caption_index) = pairs.get(&lyric.index).copied() {
+                let caption = &captions[caption_index];
+                let score = match_score(lyric, caption);
+                AlignmentLine {
+                    lyric_index: lyric.index,
+                    caption_index: Some(caption.index),
+                    start_ms: caption.start_ms,
+                    end_ms: caption.end_ms,
+                    confidence: score as f32,
+                    needs_review: score < 0.84,
+                }
+            } else {
+                AlignmentLine {
+                    lyric_index: lyric.index,
+                    caption_index: None,
+                    start_ms: -1,
+                    end_ms: -1,
+                    confidence: 0.0,
+                    needs_review: true,
+                }
             }
-        }
+        })
+        .collect()
+}
 
-        if let Some((caption_index, score)) = best.filter(|(_, score)| *score >= 0.72) {
-            let caption = &input.captions[caption_index];
-            caption_cursor = caption_index.saturating_add(1);
-            result.push(AlignmentLine {
-                lyric_index: lyric.index,
-                caption_index: Some(caption.index),
-                start_ms: caption.start_ms,
-                end_ms: caption.end_ms,
-                confidence: score as f32,
-                needs_review: score < 0.84,
-            });
-        } else {
-            result.push(AlignmentLine {
-                lyric_index: lyric.index,
-                caption_index: None,
-                start_ms: -1,
-                end_ms: -1,
-                confidence: 0.0,
-                needs_review: true,
-            });
+fn is_usable_caption(caption: &CaptionLine) -> bool {
+    !normalize_text(&caption.text).is_empty()
+}
+
+fn unmatched_all(lyrics: &[LyricLine]) -> Vec<AlignmentLine> {
+    lyrics
+        .iter()
+        .map(|line| AlignmentLine {
+            lyric_index: line.index,
+            caption_index: None,
+            start_ms: -1,
+            end_ms: -1,
+            confidence: 0.0,
+            needs_review: true,
+        })
+        .collect()
+}
+
+fn align_sequence(
+    lyrics: &[LyricLine],
+    captions: &[CaptionLine],
+) -> std::collections::HashMap<usize, usize> {
+    let n = lyrics.len();
+    let m = captions.len();
+    let scores: Vec<Vec<f64>> = lyrics
+        .iter()
+        .map(|lyric| {
+            captions
+                .iter()
+                .map(|caption| match_score(lyric, caption))
+                .collect()
+        })
+        .collect();
+
+    let mut dp = vec![vec![f64::NEG_INFINITY; m + 1]; n + 1];
+    let mut choice = vec![vec![0u8; m + 1]; n + 1];
+    dp[0][0] = 0.0;
+
+    for j in 1..=m {
+        dp[0][j] = 0.0;
+        choice[0][j] = 2;
+    }
+    for i in 1..=n {
+        dp[i][0] = 0.0;
+        choice[i][0] = 1;
+    }
+
+    for i in 1..=n {
+        for j in 1..=m {
+            let mut best = dp[i - 1][j];
+            let mut best_choice = 1u8;
+
+            if dp[i][j - 1] > best {
+                best = dp[i][j - 1];
+                best_choice = 2;
+            }
+
+            let pair_score = scores[i - 1][j - 1];
+            if pair_score >= MATCH_THRESHOLD {
+                let matched = dp[i - 1][j - 1] + pair_score;
+                if matched > best {
+                    best = matched;
+                    best_choice = 0;
+                }
+            }
+
+            dp[i][j] = best;
+            choice[i][j] = best_choice;
         }
     }
 
-    interpolate_missing(result)
+    let mut pairs = std::collections::HashMap::new();
+    let mut i = n;
+    let mut j = m;
+    while i > 0 || j > 0 {
+        match choice[i][j] {
+            0 => {
+                pairs.insert(lyrics[i - 1].index, j - 1);
+                i -= 1;
+                j -= 1;
+            }
+            1 => i -= 1,
+            _ => j -= 1,
+        }
+    }
+
+    pairs
+}
+
+fn match_score(lyric: &LyricLine, caption: &CaptionLine) -> f64 {
+    let caption_text = normalize_text(&caption.text);
+    if caption_text.is_empty() {
+        return 0.0;
+    }
+
+    lyric_text_candidates(lyric)
+        .into_iter()
+        .map(normalize_text)
+        .filter(|text| !text.is_empty())
+        .map(|lyric_text| combined_similarity(&lyric_text, &caption_text))
+        .fold(0.0, f64::max)
+}
+
+fn combined_similarity(lyric_text: &str, caption_text: &str) -> f64 {
+    let significant_lyric = significant_tokens(lyric_text);
+    let significant_caption = significant_tokens(caption_text);
+    if significant_lyric.is_empty() || significant_caption.is_empty() {
+        return 0.0;
+    }
+
+    let jw = jaro_winkler(lyric_text, caption_text);
+    let token = significant_token_match_score(&significant_lyric, &significant_caption);
+    let contain = containment_score(lyric_text, caption_text);
+
+    let mut best = jw.max(contain);
+    if token >= 0.6 {
+        best = best.max(token);
+    }
+    if token >= 0.55 && jw >= 0.55 {
+        best = best.max((token * 0.55) + (jw * 0.45));
+    }
+
+    // Reject matches where the important words do not line up at all.
+    if token < 0.45 {
+        return 0.0;
+    }
+
+    best
+}
+
+fn significant_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|token| !is_filler_token(token))
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_filler_token(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "the"
+            | "and"
+            | "or"
+            | "to"
+            | "in"
+            | "on"
+            | "at"
+            | "of"
+            | "yeah"
+            | "oh"
+            | "uh"
+            | "ah"
+            | "hey"
+            | "woo"
+            | "la"
+            | "na"
+            | "eh"
+            | "oom"
+            | "baby"
+    )
+}
+
+fn significant_token_match_score(lyric_tokens: &[String], caption_tokens: &[String]) -> f64 {
+    if lyric_tokens.is_empty() || caption_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let mut matched = 0usize;
+    for lyric_token in lyric_tokens {
+        let best = caption_tokens
+            .iter()
+            .map(|caption_token| {
+                if lyric_token == caption_token {
+                    1.0
+                } else if lyric_token.contains(caption_token.as_str())
+                    || caption_token.contains(lyric_token.as_str())
+                {
+                    0.9
+                } else {
+                    jaro_winkler(lyric_token, caption_token)
+                }
+            })
+            .fold(0.0, f64::max);
+        if best >= 0.78 {
+            matched += 1;
+        }
+    }
+
+    matched as f64 / lyric_tokens.len() as f64
+}
+
+fn token_overlap_score(a: &str, b: &str) -> f64 {
+    let ta: HashSet<&str> = a.split_whitespace().collect();
+    let tb: HashSet<&str> = b.split_whitespace().collect();
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+
+    let shared = ta.intersection(&tb).count();
+    if shared == 0 {
+        return 0.0;
+    }
+
+    let min_len = ta.len().min(tb.len());
+    let max_len = ta.len().max(tb.len());
+    let overlap = shared as f64 / min_len as f64;
+    let coverage = shared as f64 / max_len as f64;
+    overlap * 0.75 + coverage * 0.25
+}
+
+fn containment_score(lyric_text: &str, caption_text: &str) -> f64 {
+    let (longer, shorter) = if lyric_text.len() >= caption_text.len() {
+        (lyric_text, caption_text)
+    } else {
+        (caption_text, lyric_text)
+    };
+
+    if shorter.len() < 3 || !longer.contains(shorter) {
+        return 0.0;
+    }
+
+    let ratio = shorter.len() as f64 / longer.len() as f64;
+    0.78 + (ratio * 0.2)
 }
 
 pub fn normalize_text(value: &str) -> String {
@@ -76,6 +295,18 @@ pub fn normalize_text(value: &str) -> String {
     let value = punctuation.replace_all(&value, " ");
     let value = romanization_noise.replace_all(&value, " ");
     whitespace.replace_all(value.trim(), " ").to_string()
+}
+
+pub fn is_synced_line(line: &AlignmentLine) -> bool {
+    line.caption_index.is_some() && line.start_ms >= 0
+}
+
+pub fn alignment_quality(lines: &[AlignmentLine]) -> f64 {
+    lines
+        .iter()
+        .filter(|line| is_synced_line(line))
+        .map(|line| 1.0 + f64::from(line.confidence))
+        .sum()
 }
 
 fn lyric_text_candidates(line: &LyricLine) -> Vec<&str> {
@@ -98,63 +329,6 @@ fn lyric_text_candidates(line: &LyricLine) -> Vec<&str> {
         values.push(&line.original);
     }
     values
-}
-
-fn interpolate_missing(mut lines: Vec<AlignmentLine>) -> Vec<AlignmentLine> {
-    let len = lines.len();
-    for index in 0..len {
-        if lines[index].start_ms >= 0 {
-            continue;
-        }
-        let prev = (0..index).rev().find(|i| lines[*i].start_ms >= 0);
-        let next = (index + 1..len).find(|i| lines[*i].start_ms >= 0);
-        match (prev, next) {
-            (Some(prev), Some(next)) if next > prev + 1 => {
-                let gap = (lines[next].start_ms - lines[prev].end_ms).max(250);
-                let slots = (next - prev) as i64;
-                let slot = gap / slots;
-                let offset = (index - prev) as i64;
-                lines[index].start_ms = lines[prev].end_ms + slot * offset;
-                lines[index].end_ms =
-                    (lines[index].start_ms + slot.max(700)).min(lines[next].start_ms);
-            }
-            (Some(prev), Some(next)) => {
-                let start = lines[prev].end_ms;
-                lines[index].start_ms = start;
-                lines[index].end_ms = start.max(lines[next].start_ms);
-            }
-            (Some(prev), None) => {
-                let start = lines[prev].end_ms + 1200 * (index - prev) as i64;
-                lines[index].start_ms = start;
-                lines[index].end_ms = start + 1100;
-            }
-            (None, Some(next)) => {
-                let start = (lines[next].start_ms - 1200 * (next - index) as i64).max(0);
-                lines[index].start_ms = start;
-                lines[index].end_ms = (start + 1100).min(lines[next].start_ms);
-            }
-            (None, None) => {
-                lines[index].start_ms = index as i64 * 1400;
-                lines[index].end_ms = lines[index].start_ms + 1200;
-            }
-        }
-        lines[index].needs_review = true;
-    }
-    lines
-}
-
-fn interpolate_all(lyrics: &[LyricLine]) -> Vec<AlignmentLine> {
-    lyrics
-        .iter()
-        .map(|line| AlignmentLine {
-            lyric_index: line.index,
-            caption_index: None,
-            start_ms: line.index as i64 * 1500,
-            end_ms: line.index as i64 * 1500 + 1300,
-            confidence: 0.0,
-            needs_review: true,
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -201,14 +375,82 @@ mod tests {
     }
 
     #[test]
-    fn interpolates_missing_lines_for_review() {
+    fn missing_lyric_lines_stay_unsynced_without_timeline_slots() {
         let output = align_lines(AlignmentInput {
             lyrics: vec![lyric(0, "first"), lyric(1, "missing"), lyric(2, "last")],
             captions: vec![caption(0, "first", 1000), caption(1, "last", 5000)],
         });
         assert_eq!(output[1].caption_index, None);
-        assert!(output[1].start_ms > output[0].end_ms);
+        assert_eq!(output[1].start_ms, -1);
+        assert_eq!(output[1].end_ms, -1);
         assert!(output[1].needs_review);
+    }
+
+    #[test]
+    fn missing_opening_lyric_does_not_shift_later_caption_matches() {
+        let output = align_lines(AlignmentInput {
+            lyrics: vec![
+                lyric(0, "SSERAFIM baby"),
+                lyric(1, "Boompala boom boom"),
+                lyric(2, "next line here"),
+            ],
+            captions: vec![
+                caption(0, "Boompala boom boom", 5000),
+                caption(1, "next line here", 7000),
+            ],
+        });
+        assert_eq!(output[0].caption_index, None);
+        assert_eq!(output[0].start_ms, -1);
+        assert_eq!(output[1].caption_index, Some(0));
+        assert_eq!(output[1].start_ms, 5000);
+        assert_eq!(output[2].caption_index, Some(1));
+        assert_eq!(output[2].start_ms, 7000);
+    }
+
+    #[test]
+    fn multiple_missing_lyrics_do_not_shift_the_rest() {
+        let output = align_lines(AlignmentInput {
+            lyrics: vec![
+                lyric(0, "missing intro"),
+                lyric(1, "also missing"),
+                lyric(2, "first synced"),
+                lyric(3, "second synced"),
+            ],
+            captions: vec![
+                caption(0, "first synced", 10000),
+                caption(1, "second synced", 12000),
+            ],
+        });
+        assert_eq!(output[0].caption_index, None);
+        assert_eq!(output[1].caption_index, None);
+        assert_eq!(output[2].caption_index, Some(0));
+        assert_eq!(output[2].start_ms, 10000);
+        assert_eq!(output[3].caption_index, Some(1));
+        assert_eq!(output[3].start_ms, 12000);
+    }
+
+    #[test]
+    fn garbled_caption_does_not_count_as_missing_lyric() {
+        let output = align_lines(AlignmentInput {
+            lyrics: vec![
+                lyric(0, "SSERAFIM baby"),
+                lyric(1, "Oom bala oom bala"),
+            ],
+            captions: vec![
+                caption(0, "Surfing, baby.", 33680),
+                caption(1, "Oom bala. A oom bala oom bala", 37760),
+            ],
+        });
+        assert_eq!(output[0].caption_index, None);
+        assert_eq!(output[0].start_ms, -1);
+        assert_eq!(output[1].caption_index, Some(1));
+        assert_eq!(output[1].start_ms, 37760);
+    }
+
+    #[test]
+    fn does_not_match_unrelated_caption_with_only_shared_noise() {
+        let score = combined_similarity("sserafim baby", "surfing baby");
+        assert!(score < MATCH_THRESHOLD);
     }
 
     #[test]
@@ -232,5 +474,45 @@ mod tests {
         });
         assert_eq!(output[0].caption_index, Some(0));
         assert!(output[0].confidence > 0.95);
+    }
+
+    #[test]
+    fn matches_similar_but_not_identical_caption_text() {
+        let output = align_lines(AlignmentInput {
+            lyrics: vec![lyric(0, "boompala boom boom")],
+            captions: vec![caption(0, "boompala boom boom yeah", 1200)],
+        });
+        assert_eq!(output[0].caption_index, Some(0));
+        assert!(output[0].confidence >= MATCH_THRESHOLD as f32);
+    }
+
+    #[test]
+    fn picks_english_manual_captions_over_korean_for_english_lyrics() {
+        let lyrics = vec![
+            lyric(0, "Boompala boompala boompala yeah"),
+            lyric(1, "You can't hold on to the clouds in the air"),
+            lyric(2, "Wake up saying hi to the mirror"),
+        ];
+        let english = vec![
+            caption(0, "Boompala boompala boompala yeah", 38815),
+            caption(1, "You can't hold on to the clouds in the air", 43330),
+            caption(2, "Wake up saying hi to the mirror", 48259),
+        ];
+        let korean = vec![
+            caption(0, "Boompala boompala boompala yeah", 38815),
+            caption(1, "허공의 구름에 매달릴 수 없어", 43330),
+            caption(2, "일어나 거울 속 나에게 인사해", 48259),
+        ];
+
+        let english_score = alignment_quality(&align_lines(AlignmentInput {
+            lyrics: lyrics.clone(),
+            captions: english,
+        }));
+        let korean_score = alignment_quality(&align_lines(AlignmentInput {
+            lyrics,
+            captions: korean,
+        }));
+
+        assert!(english_score > korean_score);
     }
 }

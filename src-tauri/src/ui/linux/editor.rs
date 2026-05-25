@@ -490,11 +490,14 @@ pub fn resolve_video_chain(
             }
         }
         let video_id = metadata.video_id.clone();
-        captions = snapshot.ctx.fetch_captions(&video_id)?;
         if let Some(song_id) = package.song.id {
-            if !captions.is_empty() {
-                alignment = snapshot.ctx.align_lyrics(song_id, &video_id)?;
-            }
+            alignment = snapshot
+                .ctx
+                .align_lyrics(song_id, &video_id)
+                .map(|result| {
+                    captions = result.captions;
+                    result.alignment
+                })?;
         }
         song = Some(package);
     }

@@ -1,13 +1,19 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::align::{align_lines, AlignmentInput};
+use crate::align::{align_lines, alignment_quality, AlignmentInput};
 use crate::captions::{parse_caption_text, CaptionProvider, YouTubeCaptionProvider};
 use crate::db::Repository;
 use crate::lyrics::{ColorCodedLyricsProvider, GeniusProvider, LyricsProvider};
 use crate::members::{KpopFandomProvider, KpoppingProvider, MemberProfileProvider};
 use crate::models::*;
 use crate::video;
+
+#[derive(Debug, Clone)]
+pub struct AlignResult {
+    pub alignment: Vec<AlignmentLine>,
+    pub captions: Vec<CaptionLine>,
+}
 
 pub struct AppContext {
     repo: Mutex<Repository>,
@@ -94,14 +100,59 @@ impl AppContext {
         &self,
         song_id: i64,
         video_id: &str,
-    ) -> Result<Vec<AlignmentLine>, String> {
+    ) -> Result<AlignResult, String> {
+        let lyrics = {
+            let repo = self.repo.lock().map_err(to_string)?;
+            repo.lyric_lines(song_id).map_err(to_string)?
+        };
+
+        let provider = YouTubeCaptionProvider::default();
+        let track_sets = match provider.fetch_all(video_id) {
+            Ok(tracks) => tracks,
+            Err(err) => {
+                let repo = self.repo.lock().map_err(to_string)?;
+                let cached = repo.caption_lines(video_id).map_err(to_string)?;
+                if cached.is_empty() {
+                    return Err(err.to_string());
+                }
+                vec![crate::captions::CaptionTrackSet {
+                    language_code: String::new(),
+                    auto_generated: false,
+                    label: "imported".into(),
+                    lines: cached,
+                }]
+            }
+        };
+        let mut best_alignment = Vec::new();
+        let mut best_captions = Vec::new();
+        let mut best_score = f64::NEG_INFINITY;
+
+        for track in &track_sets {
+            let aligned = align_lines(AlignmentInput {
+                lyrics: lyrics.clone(),
+                captions: track.lines.clone(),
+            });
+            let score = alignment_quality(&aligned);
+            if score > best_score {
+                best_score = score;
+                best_alignment = aligned;
+                best_captions = track.lines.clone();
+            }
+        }
+
+        if best_alignment.is_empty() {
+            return Err("No caption tracks available for alignment".into());
+        }
+
         let mut repo = self.repo.lock().map_err(to_string)?;
-        let lyrics = repo.lyric_lines(song_id).map_err(to_string)?;
-        let captions = repo.caption_lines(video_id).map_err(to_string)?;
-        let aligned = align_lines(AlignmentInput { lyrics, captions });
-        repo.upsert_alignment(song_id, video_id, &aligned)
+        repo.upsert_caption_lines(video_id, &best_captions)
             .map_err(to_string)?;
-        Ok(aligned)
+        repo.upsert_alignment(song_id, video_id, &best_alignment)
+            .map_err(to_string)?;
+        Ok(AlignResult {
+            alignment: best_alignment,
+            captions: best_captions,
+        })
     }
 
     pub fn save_alignment_edits(

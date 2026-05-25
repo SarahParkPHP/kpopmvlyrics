@@ -17,6 +17,7 @@ use gtk::{
     WindowPosition,
 };
 
+use crate::align::is_synced_line;
 use crate::app::{format_ms, merge_members, AppContext};
 use crate::models::{
     AlignmentLine, CaptionLine, MemberProfile, SongPackage, StreamSpec, VideoFormat,
@@ -805,9 +806,10 @@ fn connect_view_handlers(
                     .as_ref()
                     .map(|meta| meta.video_id.clone())
                     .ok_or_else(|| "Resolve a YouTube URL first".to_string())?;
-                let alignment = snapshot.ctx.align_lyrics(song_id, &video_id)?;
+                let result = snapshot.ctx.align_lyrics(song_id, &video_id)?;
                 Ok(Box::new(move |model: &mut UiModel| {
-                    model.alignment = alignment;
+                    model.captions = result.captions;
+                    model.alignment = result.alignment;
                     model.editor_table_dirty = true;
                 }) as Box<dyn FnOnce(&mut UiModel) + Send>)
             });
@@ -963,19 +965,31 @@ fn clear_children(container: &GtkBox) {
     }
 }
 
+const NO_ACTIVE_LYRIC: usize = usize::MAX;
+
 fn active_lyric_index(alignment: &[AlignmentLine], current_ms: i64) -> usize {
-    if let Some(found) = alignment
+    let synced: Vec<&AlignmentLine> = alignment.iter().filter(|line| is_synced_line(line)).collect();
+
+    if synced.is_empty() {
+        return NO_ACTIVE_LYRIC;
+    }
+
+    if let Some(active) = synced
         .iter()
         .find(|line| current_ms >= line.start_ms && current_ms <= line.end_ms)
     {
-        return found.lyric_index;
+        return active.lyric_index;
     }
-    alignment
+
+    if let Some(active) = synced
         .iter()
         .filter(|line| current_ms >= line.start_ms)
         .max_by_key(|line| line.start_ms)
-        .map(|line| line.lyric_index)
-        .unwrap_or(0)
+    {
+        return active.lyric_index;
+    }
+
+    NO_ACTIVE_LYRIC
 }
 
 fn render_status(label: &Label, model: &UiModel) {

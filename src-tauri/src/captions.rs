@@ -3,13 +3,25 @@ use html_escape::decode_html_entities;
 use regex::Regex;
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::Value;
+use std::process::Command;
 use url::Url;
 
 use crate::models::CaptionLine;
 
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const CAPTION_LANGUAGE_ALLOWLIST: &[&str] = &["en", "ko", "ja", "zh", "es"];
+
 pub trait CaptionProvider {
     fn fetch(&self, video_id: &str) -> Result<Vec<CaptionLine>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct CaptionTrackSet {
+    pub language_code: String,
+    pub auto_generated: bool,
+    pub label: String,
+    pub lines: Vec<CaptionLine>,
 }
 
 pub struct YouTubeCaptionProvider {
@@ -20,7 +32,7 @@ impl Default for YouTubeCaptionProvider {
     fn default() -> Self {
         Self {
             client: Client::builder()
-                .user_agent("Mozilla/5.0 (compatible; kpopmvlyrics/0.1)")
+                .user_agent(BROWSER_USER_AGENT)
                 .build()
                 .expect("client"),
         }
@@ -29,91 +41,211 @@ impl Default for YouTubeCaptionProvider {
 
 impl CaptionProvider for YouTubeCaptionProvider {
     fn fetch(&self, video_id: &str) -> Result<Vec<CaptionLine>> {
+        let tracks = self.fetch_all(video_id)?;
+        pick_default_caption_track(&tracks)
+            .map(|track| track.lines.clone())
+            .ok_or_else(|| anyhow!("No usable caption tracks found; import VTT/SRT manually"))
+    }
+}
+
+impl YouTubeCaptionProvider {
+    pub fn fetch_all(&self, video_id: &str) -> Result<Vec<CaptionTrackSet>> {
+        let mut results = self.fetch_all_via_ytdlp(video_id).unwrap_or_default();
+        if results.is_empty() {
+            results = self.fetch_all_via_watch_page(video_id)?;
+        }
+        if results.is_empty() {
+            return Err(anyhow!(
+                "No usable caption tracks found; install yt-dlp or import VTT/SRT manually"
+            ));
+        }
+        results.sort_by_key(|track| default_track_priority(track));
+        Ok(results)
+    }
+
+    fn fetch_all_via_ytdlp(&self, video_id: &str) -> Result<Vec<CaptionTrackSet>> {
+        let info = fetch_ytdlp_json(video_id)?;
+        let mut results = Vec::new();
+        let mut manual_languages = std::collections::HashSet::new();
+
+        for (auto_generated, key) in [(false, "subtitles"), (true, "automatic_captions")] {
+            let Some(languages) = info.get(key).and_then(Value::as_object) else {
+                continue;
+            };
+            for (language_code, formats) in languages {
+                if !is_wanted_language(language_code) {
+                    continue;
+                }
+                if auto_generated && manual_languages.contains(language_code) {
+                    continue;
+                }
+                let Some(url) = pick_subtitle_url(formats) else {
+                    continue;
+                };
+                match self.download_caption_url(video_id, &url) {
+                    Ok(Some(lines)) => {
+                        if !auto_generated {
+                            manual_languages.insert(language_code.clone());
+                        }
+                        results.push(CaptionTrackSet {
+                            language_code: language_code.clone(),
+                            auto_generated,
+                            label: track_label(language_code, auto_generated),
+                            lines,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(err) => eprintln!(
+                        "Caption track {} skipped: {err}",
+                        track_label(language_code, auto_generated)
+                    ),
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn fetch_all_via_watch_page(&self, video_id: &str) -> Result<Vec<CaptionTrackSet>> {
+        let tracks = self.discover_tracks(video_id)?;
+        let mut results = Vec::new();
+        for track in tracks {
+            if let Some(lines) = self.download_track(video_id, &track)? {
+                results.push(CaptionTrackSet {
+                    language_code: track.language_code.clone().unwrap_or_default(),
+                    auto_generated: track.kind.as_deref() == Some("asr"),
+                    label: track.label(),
+                    lines,
+                });
+            }
+        }
+        Ok(results)
+    }
+
+    fn download_caption_url(
+        &self,
+        video_id: &str,
+        url: &str,
+    ) -> Result<Option<Vec<CaptionLine>>> {
+        let body = self
+            .client
+            .get(url)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .and_then(|response| response.text())?;
+        let body = resolve_timedtext_body(&self.client, &body)?;
+        if body.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut captions = parse_caption_text(&body)?;
+        if captions.is_empty() {
+            return Ok(None);
+        }
+        for caption in &mut captions {
+            caption.video_id = video_id.to_string();
+        }
+        Ok(Some(captions))
+    }
+
+    fn discover_tracks(&self, video_id: &str) -> Result<Vec<CaptionTrack>> {
         let watch = self
             .client
             .get(format!("https://www.youtube.com/watch?v={video_id}"))
             .send()?
             .text()?;
-        let mut tracks = Vec::new();
-        if let Some(api_key) = innertube_api_key(&watch) {
-            if let Ok(mut player_tracks) = self.fetch_innertube_caption_tracks(video_id, &api_key) {
-                tracks.append(&mut player_tracks);
+        Ok(prioritize_tracks(discover_caption_tracks(&watch)))
+    }
+
+    fn download_track(
+        &self,
+        video_id: &str,
+        track: &CaptionTrack,
+    ) -> Result<Option<Vec<CaptionLine>>> {
+        for url in track.urls() {
+            if let Ok(Some(lines)) = self.download_caption_url(video_id, &url) {
+                return Ok(Some(lines));
             }
         }
-        tracks.extend(discover_caption_tracks(&watch));
-        dedupe_tracks(&mut tracks);
-        let tracks = prioritize_tracks(tracks);
-        if tracks.is_empty() {
-            return Err(anyhow!(
-                "No public caption tracks found; import VTT/SRT manually"
-            ));
-        }
-
-        let mut errors = Vec::new();
-        for track in &tracks {
-            for url in track.urls() {
-                match self
-                    .client
-                    .get(&url)
-                    .send()
-                    .and_then(|response| response.text())
-                {
-                    Ok(body) if !body.trim().is_empty() => match parse_caption_text(&body) {
-                        Ok(mut captions) if !captions.is_empty() => {
-                            for caption in &mut captions {
-                                caption.video_id = video_id.to_string();
-                            }
-                            return Ok(captions);
-                        }
-                        Ok(_) => {
-                            errors.push(format!("{} returned no caption lines", track.label()))
-                        }
-                        Err(err) => errors.push(format!("{}: {err}", track.label())),
-                    },
-                    Ok(_) => errors.push(format!("{} returned an empty response", track.label())),
-                    Err(err) => errors.push(format!("{} request failed: {err}", track.label())),
-                }
-            }
-        }
-
-        Err(anyhow!(
-            "{}; import VTT/SRT manually if YouTube blocks timedtext download",
-            errors.into_iter().take(4).collect::<Vec<_>>().join("; ")
-        ))
+        Ok(None)
     }
 }
 
-impl YouTubeCaptionProvider {
-    fn fetch_innertube_caption_tracks(
-        &self,
-        video_id: &str,
-        api_key: &str,
-    ) -> Result<Vec<CaptionTrack>> {
-        let response: serde_json::Value = self
-            .client
-            .post(format!(
-                "https://www.youtube.com/youtubei/v1/player?key={api_key}"
-            ))
-            .json(&json!({
-                "context": {
-                    "client": {
-                        "clientName": "ANDROID",
-                        "clientVersion": "20.10.38",
-                        "hl": "en",
-                        "gl": "US"
-                    }
-                },
-                "videoId": video_id
-            }))
-            .send()?
-            .json()?;
-        let tracks = response
-            .get("captions")
-            .and_then(|captions| captions.get("playerCaptionsTracklistRenderer"))
-            .and_then(|renderer| renderer.get("captionTracks"))
-            .cloned()
-            .ok_or_else(|| anyhow!("Innertube player response did not include caption tracks"))?;
-        Ok(serde_json::from_value(tracks)?)
+fn track_label(language_code: &str, auto_generated: bool) -> String {
+    if auto_generated {
+        format!("{language_code} (auto-generated)")
+    } else {
+        language_code.to_string()
+    }
+}
+
+fn is_wanted_language(language_code: &str) -> bool {
+    CAPTION_LANGUAGE_ALLOWLIST.contains(&language_code)
+}
+
+fn pick_subtitle_url(formats: &Value) -> Option<String> {
+    let entries = formats.as_array()?;
+    for ext in ["json3", "vtt", "srv1"] {
+        if let Some(url) = entries.iter().find_map(|entry| {
+            (entry.get("ext").and_then(Value::as_str) == Some(ext))
+                .then(|| entry.get("url").and_then(Value::as_str))
+                .flatten()
+        }) {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+fn fetch_ytdlp_json(video_id: &str) -> Result<Value> {
+    let watch_url = format!("https://www.youtube.com/watch?v={video_id}");
+    let output = Command::new("yt-dlp")
+        .args(["--no-playlist", "-J", "--skip-download", &watch_url])
+        .output()
+        .map_err(|err| anyhow!("Could not run yt-dlp: {err}. Install yt-dlp."))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("yt-dlp failed: {}", stderr.trim()));
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| anyhow!("Could not parse yt-dlp output: {err}"))
+}
+
+fn resolve_timedtext_body(client: &Client, body: &str) -> Result<String> {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with("#EXTM3U") {
+        for line in trimmed.lines() {
+            if line.starts_with("http://") || line.starts_with("https://") {
+                return client
+                    .get(line)
+                    .send()
+                    .and_then(|response| response.error_for_status())
+                    .and_then(|response| response.text())
+                    .map_err(Into::into);
+            }
+        }
+        return Err(anyhow!("Caption playlist did not include a timedtext URL"));
+    }
+    Ok(body.to_string())
+}
+
+pub fn pick_default_caption_track<'a>(
+    tracks: &'a [CaptionTrackSet],
+) -> Option<&'a CaptionTrackSet> {
+    tracks
+        .iter()
+        .min_by_key(|track| default_track_priority(track))
+}
+
+fn default_track_priority(track: &CaptionTrackSet) -> u8 {
+    match (track.language_code.as_str(), track.auto_generated) {
+        ("en", false) => 0,
+        ("en", true) => 1,
+        ("ko", false) => 2,
+        ("ko", true) => 3,
+        (_, false) => 4,
+        (_, true) => 5,
     }
 }
 
@@ -183,28 +315,15 @@ fn prioritize_tracks(mut tracks: Vec<CaptionTrack>) -> Vec<CaptionTrack> {
         let language = track.language_code.as_deref().unwrap_or_default();
         let auto_generated = track.kind.as_deref() == Some("asr");
         match (language, auto_generated) {
-            ("ko", false) => 0,
-            ("en", false) => 1,
-            ("ko", true) => 2,
-            ("en", true) => 3,
+            ("en", false) => 0,
+            ("en", true) => 1,
+            ("ko", false) => 2,
+            ("ko", true) => 3,
             (_, false) => 4,
             (_, true) => 5,
         }
     });
     tracks
-}
-
-fn dedupe_tracks(tracks: &mut Vec<CaptionTrack>) {
-    let mut seen = std::collections::HashSet::new();
-    tracks.retain(|track| {
-        let key = format!(
-            "{}:{}:{}",
-            track.language_code.as_deref().unwrap_or_default(),
-            track.kind.as_deref().unwrap_or_default(),
-            track.base_url
-        );
-        seen.insert(key)
-    });
 }
 
 fn innertube_api_key(html: &str) -> Option<String> {
@@ -396,8 +515,9 @@ fn strip_tags(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_caption_tracks, innertube_api_key, parse_caption_text, prioritize_tracks,
-        CaptionProvider, YouTubeCaptionProvider,
+        discover_caption_tracks, innertube_api_key, is_wanted_language, parse_caption_text,
+        pick_default_caption_track, pick_subtitle_url, prioritize_tracks, CaptionProvider,
+        CaptionTrackSet, YouTubeCaptionProvider,
     };
 
     #[test]
@@ -430,8 +550,50 @@ mod tests {
     fn discovers_and_prioritizes_caption_tracks() {
         let html = r#""captionTracks":[{"baseUrl":"https://www.youtube.com/api/timedtext?v=x\u0026lang=en","languageCode":"en","name":{"simpleText":"English"}},{"baseUrl":"https://www.youtube.com/api/timedtext?v=x\u0026lang=ko","languageCode":"ko","name":{"simpleText":"Korean"}}],"audioTracks""#;
         let tracks = prioritize_tracks(discover_caption_tracks(html));
-        assert_eq!(tracks[0].language_code.as_deref(), Some("ko"));
+        assert_eq!(tracks[0].language_code.as_deref(), Some("en"));
         assert!(tracks[0].urls()[0].contains("fmt=json3"));
+    }
+
+    #[test]
+    fn prefers_english_manual_track_by_default() {
+        let tracks = vec![
+            CaptionTrackSet {
+                language_code: "ko".into(),
+                auto_generated: false,
+                label: "Korean".into(),
+                lines: vec![],
+            },
+            CaptionTrackSet {
+                language_code: "en".into(),
+                auto_generated: false,
+                label: "English".into(),
+                lines: vec![],
+            },
+        ];
+        assert_eq!(
+            pick_default_caption_track(&tracks).map(|track| track.label.as_str()),
+            Some("English")
+        );
+    }
+
+    #[test]
+    fn prefers_json3_subtitle_url_from_ytdlp_formats() {
+        let formats = serde_json::json!([
+            {"ext": "vtt", "url": "https://example.test/vtt"},
+            {"ext": "json3", "url": "https://example.test/json3"}
+        ]);
+        assert_eq!(
+            pick_subtitle_url(&formats).as_deref(),
+            Some("https://example.test/json3")
+        );
+    }
+
+    #[test]
+    fn ignores_unwanted_subtitle_languages() {
+        assert!(is_wanted_language("en"));
+        assert!(is_wanted_language("ko"));
+        assert!(!is_wanted_language("ta"));
+        assert!(!is_wanted_language("en-zh"));
     }
 
     #[test]
@@ -447,5 +609,10 @@ mod tests {
             .fetch("V1Lr-_AxeR8")
             .unwrap();
         assert!(!captions.is_empty());
+        assert!(captions.iter().any(|line| {
+            line.text
+                .to_ascii_lowercase()
+                .contains("wake up saying hi to the mirror")
+        }));
     }
 }

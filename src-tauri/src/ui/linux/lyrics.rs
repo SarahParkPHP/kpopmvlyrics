@@ -187,7 +187,7 @@ impl LyricStage {
         let mut active_row: Option<GtkBox> = None;
         for widget in &self.rows {
             let context = widget.row.style_context();
-            if widget.line_index == active_index {
+            if active_index != usize::MAX && widget.line_index == active_index {
                 context.add_class(gtk::STYLE_CLASS_FRAME);
                 active_row = Some(widget.row.clone());
             } else {

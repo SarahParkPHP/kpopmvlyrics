@@ -115,7 +115,10 @@ fn align_lyrics(
     video_id: String,
     state: tauri::State<'_, TauriAppState>,
 ) -> Result<Vec<AlignmentLine>, String> {
-    state.ctx.align_lyrics(song_id, &video_id)
+    state
+        .ctx
+        .align_lyrics(song_id, &video_id)
+        .map(|result| result.alignment)
 }
 
 #[cfg(not(target_os = "linux"))]
