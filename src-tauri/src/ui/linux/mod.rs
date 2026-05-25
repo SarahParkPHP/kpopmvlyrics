@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 mod editor;
+mod lyrics;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -18,13 +19,16 @@ use gtk::{
 
 use crate::app::{format_ms, merge_members, AppContext};
 use crate::models::{
-    AlignmentLine, CaptionLine, LyricLine, MemberProfile, SongPackage, StreamSpec, VideoFormat,
+    AlignmentLine, CaptionLine, MemberProfile, SongPackage, StreamSpec, VideoFormat,
     VideoMetadata, VideoPosition,
 };
 use crate::player::PlaybackEvents;
 use crate::player::NativeLinuxPlayer;
 
 use editor::{build_editor_panel, connect_editor_handlers, pick_member_image, resolve_video_chain, EditorWidgets};
+use lyrics::{
+    compute_lyric_stage_content, lyric_content_key, LyricStage, LyricStageContent,
+};
 
 const APP_ID: &str = "com.kpopmvlyrics.desktop";
 
@@ -89,24 +93,68 @@ struct UiModel {
     editor_table_dirty: bool,
 }
 
+struct MemberButton {
+    stage_name: String,
+    button: Button,
+}
+
+struct MemberStage {
+    content_key: String,
+    buttons: Vec<MemberButton>,
+    last_active: RefCell<Option<String>>,
+}
+
+impl MemberStage {
+    fn new() -> Self {
+        Self {
+            content_key: String::new(),
+            buttons: Vec::new(),
+            last_active: RefCell::new(None),
+        }
+    }
+
+    fn set_active(&self, active_member: Option<&str>) {
+        let active = active_member.map(str::to_lowercase);
+        if *self.last_active.borrow() == active {
+            return;
+        }
+        *self.last_active.borrow_mut() = active.clone();
+        for entry in &self.buttons {
+            let is_active = active
+                .as_ref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&entry.stage_name));
+            let context = entry.button.style_context();
+            if is_active {
+                context.add_class(gtk::STYLE_CLASS_SUGGESTED_ACTION);
+            } else {
+                context.remove_class(gtk::STYLE_CLASS_SUGGESTED_ACTION);
+            }
+        }
+    }
+}
+
 struct UiView {
     this: Rc<RefCell<Option<Rc<UiView>>>>,
     model: Rc<RefCell<UiModel>>,
     window: ApplicationWindow,
     status_label: Label,
     clock_label: Label,
+    lyric_scroll: ScrolledWindow,
     lyric_box: GtkBox,
     member_box: GtkBox,
     quality_combo: ComboBoxText,
     settings_revealer: Revealer,
     query_entry: Entry,
     editor: EditorWidgets,
+    lyric_stage: Rc<RefCell<LyricStage>>,
+    member_stage: Rc<RefCell<MemberStage>>,
     member_render_key: Rc<RefCell<String>>,
-    lyric_render_key: Rc<RefCell<String>>,
+    lyric_build_key: Rc<RefCell<String>>,
     format_render_key: Rc<RefCell<String>>,
     member_image_cache: Rc<RefCell<HashMap<String, String>>>,
     member_image_pending: Rc<RefCell<HashSet<String>>>,
     member_image_tx: std::sync::mpsc::Sender<(String, Option<String>)>,
+    lyric_build_tx: std::sync::mpsc::Sender<(String, LyricStageContent)>,
 }
 
 fn build_main_window(app: &Application) -> Result<(), String> {
@@ -288,6 +336,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let (work_tx, work_rx) = std::sync::mpsc::channel::<BackgroundUpdate>();
     let (member_image_tx, member_image_rx) =
         std::sync::mpsc::channel::<(String, Option<String>)>();
+    let (lyric_build_tx, lyric_build_rx) =
+        std::sync::mpsc::channel::<(String, LyricStageContent)>();
 
     let view = Rc::new(UiView {
         this: Rc::new(RefCell::new(None)),
@@ -295,6 +345,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         window: window.clone(),
         status_label: status_label.clone(),
         clock_label: clock_label.clone(),
+        lyric_scroll: lyric_scroll.clone(),
         lyric_box: lyric_box.clone(),
         member_box: member_box.clone(),
         quality_combo: quality_combo.clone(),
@@ -305,18 +356,22 @@ fn build_main_window(app: &Application) -> Result<(), String> {
             table_box: editor_build.widgets.table_box.clone(),
             render_key: Rc::new(RefCell::new(String::new())),
         },
+        lyric_stage: Rc::new(RefCell::new(LyricStage::new())),
+        member_stage: Rc::new(RefCell::new(MemberStage::new())),
         member_render_key: Rc::new(RefCell::new(String::new())),
-        lyric_render_key: Rc::new(RefCell::new(String::new())),
+        lyric_build_key: Rc::new(RefCell::new(String::new())),
         format_render_key: Rc::new(RefCell::new(String::new())),
         member_image_cache: Rc::new(RefCell::new(HashMap::new())),
         member_image_pending: Rc::new(RefCell::new(HashSet::new())),
         member_image_tx,
+        lyric_build_tx,
     });
     *view.this.borrow_mut() = Some(Rc::clone(&view));
 
     let view_for_tick = Rc::clone(&view);
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
         if catch_unwind(AssertUnwindSafe(|| {
+            let mut needs_full_refresh = false;
             while let Ok(position) = position_rx.try_recv() {
                 if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
                     model.apply_position(position.ms as i64, position.playing, position.buffering);
@@ -339,6 +394,15 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                         .insert(url, path);
                 }
                 *view_for_tick.member_render_key.borrow_mut() = String::new();
+                needs_full_refresh = true;
+            }
+            while let Ok((content_key, content)) = lyric_build_rx.try_recv() {
+                view_for_tick.lyric_stage.borrow_mut().apply_content(
+                    &view_for_tick.lyric_box,
+                    content_key,
+                    content,
+                );
+                needs_full_refresh = true;
             }
             while let Ok(update) = work_rx.try_recv() {
                 if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
@@ -354,11 +418,13 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                                 format!("{} complete", update.label)
                             });
                         }
+                        needs_full_refresh = true;
                     }
                     Err(err) => {
                         if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
                             model.error = Some(err);
                         }
+                        needs_full_refresh = true;
                     }
                 }
                 let pending_spec = view_for_tick
@@ -374,7 +440,11 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                 }
                 view_for_tick.render_editor_table();
             }
-            view_for_tick.refresh();
+            if needs_full_refresh {
+                view_for_tick.refresh();
+            } else {
+                view_for_tick.refresh_playback();
+            }
         }))
         .is_err()
         {
@@ -463,17 +533,75 @@ impl UiView {
         ));
         self.query_entry.set_text(&model.query);
         render_status(&self.status_label, &model);
+        self.schedule_lyric_build(&model);
         drop(model);
 
         if let Ok(model) = self.model.try_borrow() {
             render_members(self, &model);
-        }
-        if let Ok(model) = self.model.try_borrow() {
-            render_lyrics(self, &model);
-        }
-        if let Ok(model) = self.model.try_borrow() {
             render_formats(self, &model);
+            self.sync_active_line(&model);
         }
+    }
+
+    fn refresh_playback(&self) {
+        let Ok(model) = self.model.try_borrow() else {
+            return;
+        };
+        self.clock_label.set_markup(&format!(
+            "<span size='large'><b>{}</b></span>",
+            format_ms(model.current_ms)
+        ));
+        render_status(&self.status_label, &model);
+        self.sync_active_line(&model);
+    }
+
+    fn sync_active_line(&self, model: &UiModel) {
+        self.lyric_stage
+            .borrow()
+            .set_active(model.active_index, &self.lyric_scroll);
+        let active_member = model
+            .song
+            .as_ref()
+            .and_then(|song| {
+                song.lines
+                    .iter()
+                    .find(|line| line.index == model.active_index)
+                    .and_then(|line| line.member.as_deref())
+            });
+        self.member_stage.borrow().set_active(active_member);
+    }
+
+    fn schedule_lyric_build(&self, model: &UiModel) {
+        let content_key = lyric_content_key(
+            model.song.as_ref(),
+            &model.alignment,
+            model.show_original,
+            model.show_romanization,
+            model.show_english,
+        );
+        if content_key == *self.lyric_build_key.borrow()
+            || content_key == self.lyric_stage.borrow().content_key()
+        {
+            return;
+        }
+        *self.lyric_build_key.borrow_mut() = content_key.clone();
+
+        let song = model.song.clone();
+        let alignment = model.alignment.clone();
+        let show_original = model.show_original;
+        let show_romanization = model.show_romanization;
+        let show_english = model.show_english;
+        let tx = self.lyric_build_tx.clone();
+        std::thread::spawn(move || {
+            let content = compute_lyric_stage_content(
+                song,
+                &alignment,
+                show_original,
+                show_romanization,
+                show_english,
+            );
+            let _ = tx.send((content_key, content));
+        });
     }
 
     fn refresh_mut<F>(&self, update: F)
@@ -953,8 +1081,8 @@ fn icon_media_button(icon_name: &str, label: &str) -> Button {
     button
 }
 
-fn member_render_key(model: &UiModel, image_cache: &HashMap<String, String>) -> String {
-    let members = model
+fn member_content_key(model: &UiModel, image_cache: &HashMap<String, String>) -> String {
+    model
         .song
         .as_ref()
         .map(|song| {
@@ -970,8 +1098,7 @@ fn member_render_key(model: &UiModel, image_cache: &HashMap<String, String>) -> 
                 .collect::<Vec<_>>()
                 .join("|")
         })
-        .unwrap_or_default();
-    format!("{}::{}", model.active_index, members)
+        .unwrap_or_default()
 }
 
 fn member_image_path(member: &MemberProfile, image_cache: &HashMap<String, String>) -> Option<String> {
@@ -1088,14 +1215,17 @@ fn member_avatar_widget(member: &MemberProfile, image_cache: &HashMap<String, St
 
 fn render_members(view: &UiView, model: &UiModel) {
     let image_cache = view.member_image_cache.borrow().clone();
-    let key = member_render_key(model, &image_cache);
+    let key = member_content_key(model, &image_cache);
     if *view.member_render_key.borrow() == key {
         return;
     }
-    *view.member_render_key.borrow_mut() = key;
+    *view.member_render_key.borrow_mut() = key.clone();
 
     let container = &view.member_box;
     clear_children(container);
+    view.member_stage.borrow_mut().content_key = key;
+    view.member_stage.borrow_mut().buttons.clear();
+    view.member_stage.borrow_mut().last_active.replace(None);
 
     let Some(song) = &model.song else {
         let empty = Label::new(Some("Members appear after lyrics are loaded"));
@@ -1107,34 +1237,22 @@ fn render_members(view: &UiView, model: &UiModel) {
 
     prefetch_member_images(view, &song.members);
 
-    let active_member = song
-        .lines
-        .iter()
-        .find(|line| line.index == model.active_index)
-        .and_then(|line| line.member.clone());
-
     let Some(view_rc) = view.this.try_borrow().ok().and_then(|this| this.clone()) else {
         return;
     };
 
+    let mut stage_buttons = Vec::new();
     for member in &song.members {
-        let active = active_member
-            .as_ref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(&member.stage_name));
         let button = Button::new();
         button.set_size_request(80, 96);
-        if active {
-            button
-                .style_context()
-                .add_class(gtk::STYLE_CLASS_SUGGESTED_ACTION);
-        }
+        let stage_name = member.stage_name.clone();
 
         let inner = GtkBox::new(Orientation::Vertical, 4);
         inner.set_halign(gtk::Align::Center);
 
         inner.pack_start(&member_avatar_widget(member, &image_cache), false, false, 0);
 
-        let name = Label::new(Some(&member.stage_name));
+        let name = Label::new(Some(&stage_name));
         inner.pack_start(&name, false, false, 0);
         button.add(&inner);
 
@@ -1156,137 +1274,13 @@ fn render_members(view: &UiView, model: &UiModel) {
         });
 
         container.pack_start(&button, false, false, 0);
+        stage_buttons.push(MemberButton {
+            stage_name,
+            button,
+        });
     }
+    view.member_stage.borrow_mut().buttons = stage_buttons;
     container.show_all();
-}
-
-fn lyric_render_key(model: &UiModel) -> String {
-    let window_lines = model
-        .song
-        .as_ref()
-        .map(|song| {
-            song.lines
-                .iter()
-                .filter(|line| (line.index as i64 - model.active_index as i64).abs() <= 2)
-                .map(|line| {
-                    let time = model
-                        .alignment
-                        .iter()
-                        .find(|item| item.lyric_index == line.index)
-                        .map(|item| item.start_ms)
-                        .unwrap_or(-1);
-                    format!("{}:{}", line.index, time)
-                })
-                .collect::<Vec<_>>()
-                .join("|")
-        })
-        .unwrap_or_default();
-    format!(
-        "{window_lines}::{}:{}:{}",
-        model.show_original, model.show_romanization, model.show_english
-    )
-}
-
-fn render_lyrics(view: &UiView, model: &UiModel) {
-    let key = lyric_render_key(model);
-    if *view.lyric_render_key.borrow() == key {
-        return;
-    }
-    *view.lyric_render_key.borrow_mut() = key;
-
-    let container = &view.lyric_box;
-    clear_children(container);
-
-    let Some(song) = &model.song else {
-        let empty = Label::new(Some(
-            "Load or import lyrics, then align captions to start synced playback.",
-        ));
-        empty.set_line_wrap(true);
-        empty.set_xalign(0.0);
-        container.pack_start(&empty, false, false, 0);
-        container.show_all();
-        return;
-    };
-
-    let visible: Vec<&LyricLine> = song
-        .lines
-        .iter()
-        .filter(|line| (line.index as i64 - model.active_index as i64).abs() <= 2)
-        .collect();
-
-    for line in visible {
-        let row = GtkBox::new(Orientation::Horizontal, 12);
-        let member = Label::new(line.member.as_deref().or(Some("All")));
-        member.set_width_chars(10);
-        member.set_xalign(0.0);
-
-        let text_box = GtkBox::new(Orientation::Vertical, 2);
-        if model.show_original {
-            text_box.pack_start(&lyric_label(line, "original", &line.original), false, false, 0);
-        }
-        if model.show_romanization {
-            if let Some(text) = &line.romanization {
-                text_box.pack_start(
-                    &lyric_label(line, "romanization", text),
-                    false,
-                    false,
-                    0,
-                );
-            }
-        }
-        if model.show_english {
-            if let Some(text) = &line.english {
-                text_box.pack_start(&lyric_label(line, "english", text), false, false, 0);
-            }
-        }
-
-        let timing = model.alignment.iter().find(|item| item.lyric_index == line.index);
-        let time_text = timing
-            .map(|item| format_ms(item.start_ms))
-            .unwrap_or_else(|| "Unaligned".to_string());
-        let time = Label::new(Some(&time_text));
-        if line.index == model.active_index {
-            row.style_context().add_class(gtk::STYLE_CLASS_FRAME);
-        }
-
-        row.pack_start(&member, false, false, 0);
-        row.pack_start(&text_box, true, true, 0);
-        row.pack_start(&time, false, false, 0);
-        container.pack_start(&row, false, false, 0);
-    }
-    container.show_all();
-}
-
-fn lyric_label(line: &LyricLine, language: &str, fallback: &str) -> Label {
-    let markup = colored_markup(line, language, fallback);
-    let label = Label::new(None);
-    label.set_markup(&markup);
-    label.set_xalign(0.0);
-    label.set_line_wrap(true);
-    label
-}
-
-fn colored_markup(line: &LyricLine, language: &str, fallback: &str) -> String {
-    let segments: Vec<_> = line
-        .segments
-        .iter()
-        .filter(|segment| segment.language == language)
-        .collect();
-    if segments.is_empty() {
-        return glib::markup_escape_text(fallback).to_string();
-    }
-    segments
-        .iter()
-        .map(|segment| {
-            let text = glib::markup_escape_text(&segment.text);
-            if let Some(color) = &segment.color {
-                format!("<span foreground='{color}'>{text}</span>")
-            } else {
-                text.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn initials(name: &str) -> String {
