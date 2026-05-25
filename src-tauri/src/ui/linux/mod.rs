@@ -2,8 +2,9 @@
 
 mod editor;
 mod lyrics;
+mod video_overlay;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -14,8 +15,9 @@ use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, ComboBoxText, CssProvider,
     Entry, Frame, Label, Orientation, Paned, Revealer, RevealerTransitionType, ScrolledWindow,
-    Separator, StyleContext, WindowPosition,
+    StyleContext, WindowPosition,
 };
+use gtk::gdk::keys::constants as keys;
 use gtk::gdk::Screen;
 
 use crate::align::is_synced_line;
@@ -31,6 +33,7 @@ use editor::{build_editor_panel, connect_editor_handlers, pick_member_image, res
 use lyrics::{
     compute_lyric_stage_content, lyric_content_key, LyricStage, LyricStageContent,
 };
+use video_overlay::{build_video_overlay, VideoOverlay};
 
 const APP_ID: &str = "com.kpopmvlyrics.desktop";
 
@@ -84,6 +87,8 @@ struct UiModel {
     selected_format: Option<String>,
     player_loaded: bool,
     current_ms: i64,
+    duration_ms: Option<u64>,
+    volume: f64,
     active_index: usize,
     show_original: bool,
     show_romanization: bool,
@@ -92,6 +97,8 @@ struct UiModel {
     message: Option<String>,
     error: Option<String>,
     pending_stream: Option<StreamSpec>,
+    pending_seek_ms: Option<u64>,
+    pending_autoplay: bool,
     editor_table_dirty: bool,
 }
 
@@ -163,6 +170,8 @@ struct UiView {
     member_render_key: Rc<RefCell<String>>,
     lyric_build_key: Rc<RefCell<String>>,
     format_render_key: Rc<RefCell<String>>,
+    suppress_quality_reload: Rc<Cell<bool>>,
+    video_overlay: Rc<VideoOverlay>,
     member_image_cache: Rc<RefCell<HashMap<String, String>>>,
     member_image_pending: Rc<RefCell<HashSet<String>>>,
     member_image_tx: std::sync::mpsc::Sender<(String, Option<String>)>,
@@ -199,6 +208,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         selected_format: None,
         player_loaded: false,
         current_ms: 0,
+        duration_ms: None,
+        volume: 1.0,
         active_index: 0,
         show_original: true,
         show_romanization: false,
@@ -207,6 +218,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         message: None,
         error: None,
         pending_stream: None,
+        pending_seek_ms: None,
+        pending_autoplay: false,
         editor_table_dirty: false,
     }));
 
@@ -243,9 +256,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     toolbar.pack_start(&url_entry, true, true, 0);
     toolbar.pack_start(&quality_combo, false, false, 0);
     toolbar.pack_start(&open_button, false, false, 0);
-    toolbar.pack_start(&stream_button, false, false, 0);
     toolbar.pack_start(&settings_button, false, false, 0);
-    toolbar.pack_start(&editor_button, false, false, 0);
 
     let member_scroll = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     member_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
@@ -301,24 +312,6 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let play_button = Button::with_label("Start Sync");
     let pause_button = Button::with_label("Pause Sync");
     let reset_button = Button::with_label("Reset Sync");
-    let controls = GtkBox::new(Orientation::Horizontal, 6);
-    controls.pack_start(&play_button, false, false, 0);
-    controls.pack_start(&pause_button, false, false, 0);
-    controls.pack_start(&reset_button, false, false, 0);
-
-    let video_play_button = icon_media_button("media-playback-start", "Play");
-    let video_pause_button = icon_media_button("media-playback-pause", "Pause");
-    let video_stop_button = icon_media_button("media-playback-stop", "Stop");
-    let video_replay_button = icon_media_button("media-seek-backward", "Replay");
-    let video_controls = GtkBox::new(Orientation::Horizontal, 6);
-    video_controls.set_margin_top(4);
-    video_controls.set_margin_bottom(4);
-    video_controls.set_margin_start(6);
-    video_controls.set_margin_end(6);
-    video_controls.pack_start(&video_play_button, false, false, 0);
-    video_controls.pack_start(&video_pause_button, false, false, 0);
-    video_controls.pack_start(&video_stop_button, false, false, 0);
-    video_controls.pack_start(&video_replay_button, false, false, 0);
 
     let status_label = Label::new(None);
     status_label.set_halign(gtk::Align::Start);
@@ -340,6 +333,18 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     settings_actions.pack_start(&save_button, false, false, 0);
     settings_panel.pack_start(&settings_actions, false, false, 0);
 
+    let settings_tools = GtkBox::new(Orientation::Horizontal, 6);
+    settings_tools.pack_start(&stream_button, false, false, 0);
+    settings_tools.pack_start(&editor_button, false, false, 0);
+    settings_panel.pack_start(&settings_tools, false, false, 0);
+
+    let sync_controls = GtkBox::new(Orientation::Horizontal, 6);
+    sync_controls.pack_start(&play_button, false, false, 0);
+    sync_controls.pack_start(&pause_button, false, false, 0);
+    sync_controls.pack_start(&reset_button, false, false, 0);
+    settings_panel.pack_start(&sync_controls, false, false, 0);
+    settings_panel.pack_start(&status_label, false, false, 0);
+
     let editor_build = build_editor_panel();
     let editor_revealer = editor_build.revealer.clone();
     let settings_revealer = Revealer::new();
@@ -351,18 +356,15 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     top.pack_start(&member_scroll, false, false, 0);
     top.pack_start(&stage_toolbar, false, false, 0);
     top.pack_start(&lyric_frame, true, true, 0);
-    top.pack_start(&controls, false, false, 0);
-    top.pack_start(&Separator::new(Orientation::Horizontal), false, false, 0);
-    top.pack_start(&status_label, false, false, 0);
     top.pack_start(&settings_revealer, false, false, 0);
     top.pack_start(&editor_revealer, false, false, 0);
 
     let video_box = player.borrow().video_widget().clone();
     video_box.set_vexpand(true);
+    let video_overlay = Rc::new(build_video_overlay(video_box.upcast_ref()));
 
     let video_pane = GtkBox::new(Orientation::Vertical, 0);
-    video_pane.pack_start(&video_controls, false, false, 0);
-    video_pane.pack_start(&video_box, true, true, 0);
+    video_pane.pack_start(&video_overlay.overlay, true, true, 0);
 
     paned.add1(&top);
     paned.add2(&video_pane);
@@ -398,6 +400,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         member_render_key: Rc::new(RefCell::new(String::new())),
         lyric_build_key: Rc::new(RefCell::new(String::new())),
         format_render_key: Rc::new(RefCell::new(String::new())),
+        suppress_quality_reload: Rc::new(Cell::new(false)),
+        video_overlay: Rc::clone(&video_overlay),
         member_image_cache: Rc::new(RefCell::new(HashMap::new())),
         member_image_pending: Rc::new(RefCell::new(HashSet::new())),
         member_image_tx,
@@ -411,7 +415,12 @@ fn build_main_window(app: &Application) -> Result<(), String> {
             let mut needs_full_refresh = false;
             while let Ok(position) = position_rx.try_recv() {
                 if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
-                    model.apply_position(position.ms as i64, position.playing, position.buffering);
+                    model.apply_position(
+                        position.ms as i64,
+                        position.duration_ms,
+                        position.playing,
+                        position.buffering,
+                    );
                 }
             }
             while let Ok(message) = error_rx.try_recv() {
@@ -510,13 +519,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         &save_button,
     );
 
-    connect_video_handlers(
-        &view,
-        &video_play_button,
-        &video_pause_button,
-        &video_stop_button,
-        &video_replay_button,
-    );
+    video_overlay.connect_handlers(&view);
 
     connect_editor_handlers(
         &view,
@@ -526,14 +529,37 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         &editor_button,
     );
 
+    {
+        let view = Rc::clone(&view);
+        window.connect_key_press_event(move |window, event| {
+            if event.keyval() != keys::space {
+                return gtk::glib::Propagation::Proceed;
+            }
+            if focus_is_text_widget(window) {
+                return gtk::glib::Propagation::Proceed;
+            }
+            spawn_toggle_play_pause(Rc::clone(&view));
+            gtk::glib::Propagation::Stop
+        });
+    }
+
     view.refresh();
     window.show_all();
     Ok(())
 }
 
 impl UiModel {
-    fn apply_position(&mut self, current_ms: i64, playing: bool, buffering: bool) {
+    fn apply_position(
+        &mut self,
+        current_ms: i64,
+        duration_ms: Option<u64>,
+        playing: bool,
+        buffering: bool,
+    ) {
         self.current_ms = current_ms;
+        if duration_ms.is_some() {
+            self.duration_ms = duration_ms;
+        }
         self.active_index = active_lyric_index(&self.alignment, current_ms);
         if buffering {
             self.message = Some("Buffering video".to_string());
@@ -589,6 +615,8 @@ impl UiView {
             format_ms(model.current_ms)
         ));
         render_status(&self.status_label, &model);
+        self.video_overlay
+            .update_seek_bar(model.current_ms, model.duration_ms);
         self.sync_active_line(&model);
     }
 
@@ -721,6 +749,31 @@ fn connect_view_handlers(
         settings_button.connect_clicked(move |_| {
             let revealed = view.settings_revealer.reveals_child();
             view.settings_revealer.set_reveal_child(!revealed);
+        });
+    }
+
+    {
+        let view = Rc::clone(view);
+        let url_entry = url_entry.clone();
+        let quality_combo = quality_combo.clone();
+        let work_tx = work_tx.clone();
+        let suppress = view.suppress_quality_reload.clone();
+        quality_combo.clone().connect_changed(move |combo| {
+            if suppress.get() {
+                return;
+            }
+            let format_id = selected_format_id(combo);
+            view.refresh_mut(|model| {
+                model.selected_format = format_id;
+            });
+            let has_video = view
+                .model
+                .try_borrow()
+                .ok()
+                .is_some_and(|model| model.metadata.is_some());
+            if has_video {
+                spawn_stream_reload(Rc::clone(&view), work_tx.clone(), url_entry.clone(), quality_combo.clone());
+            }
         });
     }
 
@@ -903,33 +956,103 @@ where
     });
 }
 
-fn spawn_player_load(view: Rc<UiView>, spec: StreamSpec) {
-    let player = match view.model.try_borrow() {
-        Ok(model) => Rc::clone(&model.player),
-        Err(_) => {
-            if let Ok(mut model) = view.model.try_borrow_mut() {
-                model.pending_stream = Some(spec);
-            }
-            return;
+fn spawn_stream_reload(
+    view: Rc<UiView>,
+    work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
+    url_entry: Entry,
+    quality_combo: ComboBoxText,
+) {
+    let (position_ms, was_playing, volume) = view
+        .model
+        .try_borrow()
+        .map(|model| {
+            let snapshot = model.player.borrow().snapshot();
+            (snapshot.ms, snapshot.playing, model.volume)
+        })
+        .unwrap_or((0, false, 1.0));
+
+    let format_id = selected_format_id(&quality_combo);
+    view.refresh_mut(|model| {
+        model.url = url_entry.text().to_string();
+        model.selected_format = format_id;
+        model.pending_seek_ms = Some(position_ms);
+        model.pending_autoplay = was_playing;
+        model.volume = volume;
+    });
+
+    spawn_work(work_tx, view, "Stream", move |snapshot| {
+        let spec = snapshot.ctx.resolve_stream(
+            &snapshot.url,
+            snapshot.selected_format.as_deref(),
+        )?;
+        Ok(Box::new(move |model: &mut UiModel| {
+            model.pending_stream = Some(spec);
+        }) as Box<dyn FnOnce(&mut UiModel) + Send>)
+    });
+}
+
+fn spawn_toggle_play_pause(view: Rc<UiView>) {
+    spawn_player_work(view, |player| {
+        let snapshot = player.snapshot();
+        if snapshot.playing {
+            player.pause()
+        } else {
+            player.play()
         }
+    });
+}
+
+fn focus_is_text_widget(window: &ApplicationWindow) -> bool {
+    window.focused_widget().is_some_and(|widget| {
+        widget.downcast_ref::<Entry>().is_some() || widget.downcast_ref::<gtk::TextView>().is_some()
+    })
+}
+
+fn spawn_player_load(view: Rc<UiView>, spec: StreamSpec) {
+    let pending = view.model.try_borrow_mut().ok().map(|mut model| {
+        (
+            model.pending_seek_ms.take(),
+            model.pending_autoplay,
+            model.volume,
+            Rc::clone(&model.player),
+        )
+    });
+
+    let Some((pending_seek_ms, pending_autoplay, volume, player)) = pending else {
+        if let Ok(mut model) = view.model.try_borrow_mut() {
+            model.pending_stream = Some(spec);
+        }
+        return;
     };
 
     let load_result = catch_unwind(AssertUnwindSafe(|| {
         player
             .try_borrow_mut()
             .map_err(|_| "Video player is busy".to_string())
-            .and_then(|mut player| player.load(spec))
+            .and_then(|mut player| {
+                player.load(spec)?;
+                let _ = player.set_volume(volume);
+                if let Some(ms) = pending_seek_ms {
+                    player.seek(ms)?;
+                }
+                if pending_autoplay {
+                    player.play()?;
+                }
+                Ok(())
+            })
     }));
 
     match load_result {
         Ok(Ok(())) => {
             if let Ok(mut model) = view.model.try_borrow_mut() {
                 model.player_loaded = true;
+                model.pending_autoplay = false;
                 model.error = None;
             }
         }
         Ok(Err(err)) => {
             if let Ok(mut model) = view.model.try_borrow_mut() {
+                model.pending_autoplay = false;
                 model.error = Some(err);
             }
         }
@@ -937,6 +1060,7 @@ fn spawn_player_load(view: Rc<UiView>, spec: StreamSpec) {
             let message = panic_payload_message(payload);
             eprintln!("kpopmvlyrics: video load panicked: {message}");
             if let Ok(mut model) = view.model.try_borrow_mut() {
+                model.pending_autoplay = false;
                 model.error = Some(format!("Video player failed: {message}"));
             }
         }
@@ -1063,6 +1187,7 @@ fn render_formats(view: &UiView, model: &UiModel) {
     }
     *view.format_render_key.borrow_mut() = key;
 
+    view.suppress_quality_reload.set(true);
     let combo = &view.quality_combo;
     combo.remove_all();
     combo.append(None, "Auto");
@@ -1074,46 +1199,7 @@ fn render_formats(view: &UiView, model: &UiModel) {
     } else {
         combo.set_active(Some(0));
     }
-}
-
-fn connect_video_handlers(
-    view: &Rc<UiView>,
-    play_button: &Button,
-    pause_button: &Button,
-    stop_button: &Button,
-    replay_button: &Button,
-) {
-    {
-        let view = Rc::clone(view);
-        play_button.connect_clicked(move |_| {
-            spawn_player_work(Rc::clone(&view), |player| player.play());
-        });
-    }
-    {
-        let view = Rc::clone(view);
-        pause_button.connect_clicked(move |_| {
-            spawn_player_work(Rc::clone(&view), |player| player.pause());
-        });
-    }
-    {
-        let view = Rc::clone(view);
-        stop_button.connect_clicked(move |_| {
-            spawn_player_work(Rc::clone(&view), |player| {
-                player.pause()?;
-                let _ = player.seek(0);
-                Ok(())
-            });
-        });
-    }
-    {
-        let view = Rc::clone(view);
-        replay_button.connect_clicked(move |_| {
-            spawn_player_work(Rc::clone(&view), |player| {
-                let _ = player.seek(0);
-                player.play()
-            });
-        });
-    }
+    view.suppress_quality_reload.set(false);
 }
 
 fn icon_media_button(icon_name: &str, label: &str) -> Button {

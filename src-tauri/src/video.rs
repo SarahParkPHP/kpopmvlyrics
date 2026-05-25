@@ -9,12 +9,14 @@ use url::Url;
 
 use crate::models::{StreamSpec, VideoFormat, VideoMetadata};
 
-const DEFAULT_STREAM_FORMAT: &str = "18/best[protocol=https][ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=1080]/bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[protocol=https][ext=mp4][vcodec^=mp4a]";
+const DEFAULT_STREAM_FORMAT: &str =
+    "bestvideo[protocol=https]+bestaudio[protocol=https]/bestvideo+bestaudio/best[protocol=https]/best";
 
 const AUTO_STREAM_FORMAT_FALLBACKS: &[&str] = &[
     DEFAULT_STREAM_FORMAT,
-    "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/18",
-    "18",
+    "bestvideo+bestaudio/best[protocol=https]",
+    "bestvideo+bestaudio/best",
+    "22/best/bestvideo+bestaudio",
 ];
 
 pub fn resolve_video_metadata_inner(input: &str) -> Result<VideoMetadata> {
@@ -50,7 +52,7 @@ pub fn list_video_formats_inner(input: &str) -> Result<Vec<VideoFormat>> {
                     ext: format.ext.clone(),
                 },
             ))
-        } else if is_http_h264_video(format) {
+        } else if is_http_video_only(format) {
             Some((
                 format_score(format),
                 VideoFormat {
@@ -282,7 +284,7 @@ fn is_http_combined(format: &YtDlpFormat) -> bool {
     vcodec != "none" && acodec != "none"
 }
 
-fn is_http_h264_video(format: &YtDlpFormat) -> bool {
+fn is_http_video_only(format: &YtDlpFormat) -> bool {
     let protocol = format.protocol.as_deref().unwrap_or("");
     if !protocol.starts_with("http") {
         return false;
@@ -290,7 +292,7 @@ fn is_http_h264_video(format: &YtDlpFormat) -> bool {
 
     let vcodec = format.vcodec.as_deref().unwrap_or("none");
     let acodec = format.acodec.as_deref().unwrap_or("none");
-    vcodec.starts_with("avc1") && acodec == "none" && format.ext.as_deref() == Some("mp4")
+    vcodec != "none" && acodec == "none"
 }
 
 fn best_audio_format_id(formats: &[YtDlpFormat]) -> Option<String> {
@@ -303,7 +305,7 @@ fn best_audio_format_id(formats: &[YtDlpFormat]) -> Option<String> {
                 && format
                     .acodec
                     .as_deref()
-                    .is_some_and(|codec| codec.starts_with("mp4a"))
+                    .is_some_and(|codec| codec != "none")
         })
         .max_by_key(|format| audio_format_score(format))
         .map(|format| format.format_id.clone())
@@ -321,25 +323,14 @@ fn format_score(format: &YtDlpFormat) -> i32 {
     let mut score = format.height.unwrap_or(0) as i32 * 100;
     if is_http_combined(format) {
         score += 10_000;
-    } else if is_http_h264_video(format) {
+    } else if is_http_video_only(format) {
         score += 9_000;
     }
     if format.ext.as_deref() == Some("mp4") {
-        score += 1000;
-    }
-    if format
-        .vcodec
-        .as_deref()
-        .is_some_and(|codec| codec.starts_with("avc1"))
-    {
         score += 500;
     }
-    if format
-        .acodec
-        .as_deref()
-        .is_some_and(|codec| codec.starts_with("mp4a"))
-    {
-        score += 250;
+    if format.ext.as_deref() == Some("webm") {
+        score += 400;
     }
     score
 }
@@ -412,9 +403,10 @@ mod tests {
     }
 
     #[test]
-    fn default_stream_format_prefers_progressive_or_adaptive() {
-        assert!(DEFAULT_STREAM_FORMAT.starts_with("18/"));
-        assert!(DEFAULT_STREAM_FORMAT.contains("protocol=https"));
+    fn default_stream_format_prefers_best_quality() {
+        assert!(DEFAULT_STREAM_FORMAT.starts_with("bestvideo"));
+        assert!(!DEFAULT_STREAM_FORMAT.contains("height<="));
+        assert!(!DEFAULT_STREAM_FORMAT.contains("avc1"));
     }
 
     #[test]

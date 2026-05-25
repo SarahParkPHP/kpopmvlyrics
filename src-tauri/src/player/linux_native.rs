@@ -44,6 +44,14 @@ impl NativeLinuxPlayer {
         self.engine.pause()
     }
 
+    pub fn replay(&mut self) -> Result<(), String> {
+        self.engine.replay()
+    }
+
+    pub fn set_volume(&mut self, level: f64) -> Result<(), String> {
+        self.engine.set_volume(level)
+    }
+
     pub fn seek(&mut self, ms: u64) -> Result<(), String> {
         self.engine.seek(ms)
     }

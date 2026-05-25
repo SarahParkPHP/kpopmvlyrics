@@ -16,6 +16,7 @@ use crate::player::events::PlaybackEvents;
 
 pub struct PlaybackEngine {
     pipeline: Option<gst::Pipeline>,
+    volume_element: Option<gst::Element>,
     events: PlaybackEvents,
     playing: bool,
     buffering: bool,
@@ -38,6 +39,7 @@ impl PlaybackEngine {
     pub fn new(events: PlaybackEvents) -> Self {
         Self {
             pipeline: None,
+            volume_element: None,
             events,
             playing: false,
             buffering: false,
@@ -114,7 +116,10 @@ impl PlaybackEngine {
             .set_state(gst::State::Ready)
             .map_err(|err| format_state_error(&pipeline, &self.last_error, err))?;
 
-        self.pipeline = Some(pipeline);
+        self.pipeline = Some(pipeline.clone());
+        self.volume_element = pipeline
+            .by_name("playbin")
+            .or_else(|| pipeline.by_name("audio-volume"));
         self.bus_watch = Some(bus_watch);
         self.suppress_errors.set(false);
         self.playing = false;
@@ -153,20 +158,54 @@ impl PlaybackEngine {
         };
 
         let _ = pipeline.state(Some(gst::ClockTime::from_seconds(2)));
-        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT;
+        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE;
         let position = gst::ClockTime::from_mseconds(ms);
         let target = seek_target(pipeline);
 
         if target.seek_simple(flags, position).is_ok() {
+            if let Ok(mut snapshot) = self.shared.lock() {
+                snapshot.position_ms = ms;
+            }
             self.sync_snapshot(self.playing, self.buffering);
             return Ok(());
         }
 
-        if ms == 0 {
-            return Ok(());
-        }
-
         Err("Failed to seek".to_string())
+    }
+
+    pub fn replay(&mut self) -> Result<(), String> {
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return Err("No video loaded".into());
+        };
+
+        let _ = pipeline.set_state(gst::State::Paused);
+        let target = seek_target(pipeline);
+        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE;
+        target
+            .seek_simple(flags, gst::ClockTime::ZERO)
+            .map_err(|_| "Failed to seek to start".to_string())?;
+
+        if let Ok(mut snapshot) = self.shared.lock() {
+            snapshot.position_ms = 0;
+            snapshot.playing = false;
+        }
+        self.playing = false;
+        self.sync_snapshot(false, self.buffering);
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|err| format_state_error(pipeline, &self.last_error, err))?;
+        self.playing = true;
+        self.sync_snapshot(true, self.buffering);
+        Ok(())
+    }
+
+    pub fn set_volume(&mut self, level: f64) -> Result<(), String> {
+        let volume = level.clamp(0.0, 1.0);
+        if let Some(element) = self.volume_element.as_ref() {
+            element.set_property("volume", volume);
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self) -> VideoPosition {
@@ -229,6 +268,7 @@ impl PlaybackEngine {
             source.remove();
         }
         self.bus_watch.take();
+        self.volume_element = None;
         self.suppress_errors.set(true);
         if let Some(pipeline) = self.pipeline.take() {
             let _ = pipeline.set_state(gst::State::Null);
@@ -464,6 +504,10 @@ fn build_adaptive_pipeline(
     let audio_resample = gst::ElementFactory::make("audioresample")
         .build()
         .map_err(|err| err.to_string())?;
+    let volume = gst::ElementFactory::make("volume")
+        .name("audio-volume")
+        .build()
+        .map_err(|err| err.to_string())?;
     let audio_sink = gst::ElementFactory::make("autoaudiosink")
         .build()
         .map_err(|err| err.to_string())?;
@@ -477,6 +521,7 @@ fn build_adaptive_pipeline(
         (&audio_queue, "audio queue"),
         (&audio_convert, "audio convert"),
         (&audio_resample, "audio resample"),
+        (&volume, "audio volume"),
         (&audio_sink, "audio sink"),
     ] {
         add_to_pipeline(&pipeline, element, label)?;
@@ -495,6 +540,9 @@ fn build_adaptive_pipeline(
         .link(&audio_resample)
         .map_err(|err| err.to_string())?;
     audio_resample
+        .link(&volume)
+        .map_err(|err| err.to_string())?;
+    volume
         .link(&audio_sink)
         .map_err(|err| err.to_string())?;
 

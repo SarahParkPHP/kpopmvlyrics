@@ -47,7 +47,31 @@
   font-weight: 800;
 }
 
-.lyric-line-active {
-  padding-top: 18px;
-  padding-bottom: 18px;
+.video-controls-card {
+  background-color: rgba(0, 0, 0, 0.72);
+  border-radius: 8px;
+  padding: 10px 12px;
 }
+
+.video-controls-card scale {
+  min-height: 24px;
+}
+
+.video-controls-label {
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.video-controls-card button {
+  background-color: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+
+.video-controls-card button:hover {
+  background-color: rgba(255, 255, 255, 0.22);
+}
+
