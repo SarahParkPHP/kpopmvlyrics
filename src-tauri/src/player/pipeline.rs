@@ -244,7 +244,7 @@ impl PlaybackEngine {
             .as_ref()
             .map(|pipeline| pipeline.downgrade());
 
-        let source = gst::glib::timeout_add_local(Duration::from_millis(33), move || {
+        let source = gst::glib::timeout_add_local(Duration::from_millis(100), move || {
             if catch_unwind(AssertUnwindSafe(|| {
                 emit_position_update(
                     pipeline_weak.as_ref(),
@@ -623,6 +623,35 @@ fn find_video_overlay(element: &gst::Element) -> Option<gst_video::VideoOverlay>
 pub(crate) fn ensure_gstreamer() -> Result<(), String> {
     static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
     GST_INIT
-        .get_or_init(|| gst::init().map_err(|err| err.to_string()))
+        .get_or_init(|| {
+            gst::init().map_err(|err| err.to_string())?;
+            configure_hardware_decoders();
+            Ok(())
+        })
         .clone()
+}
+
+fn configure_hardware_decoders() {
+    let boost_rank = gst::Rank::PRIMARY + 100;
+
+    const HARDWARE_DECODERS: &[&str] = &[
+        "vah264dec",
+        "vah265dec",
+        "vavp9dec",
+        "vaav1dec",
+        "nvh264dec",
+        "nvh265dec",
+        "nvvp9dec",
+        "nvav1dec",
+        "nvvp8dec",
+        "vaapih264dec",
+        "vaapivp9dec",
+        "vaapih265dec",
+    ];
+
+    for name in HARDWARE_DECODERS {
+        if let Some(factory) = gst::ElementFactory::find(name) {
+            factory.set_rank(boost_rank);
+        }
+    }
 }

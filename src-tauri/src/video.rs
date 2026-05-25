@@ -36,63 +36,95 @@ pub fn list_video_formats_inner(input: &str) -> Result<Vec<VideoFormat>> {
     let metadata = resolve_video_metadata_inner(input)?;
     let watch_url = format!("https://www.youtube.com/watch?v={}", metadata.video_id);
     let payload = fetch_ytdlp_json(&watch_url)?;
-    let audio_format_id = best_audio_format_id(&payload.formats)
-        .ok_or_else(|| anyhow!("No HTTP audio stream found for this video"))?;
+    if payload.formats.is_empty() {
+        return Err(anyhow!("yt-dlp returned no formats for this video"));
+    }
 
-    let mut best_by_height: Vec<(i32, VideoFormat)> = Vec::new();
+    let mut entries: Vec<FormatEntry> = Vec::new();
 
     for format in &payload.formats {
-        let entry = if is_http_combined(format) {
-            Some((
-                format_score(format),
-                VideoFormat {
-                    format_id: format.format_id.clone(),
-                    label: format_label(format),
-                    height: format.height,
-                    ext: format.ext.clone(),
-                },
-            ))
-        } else if is_http_video_only(format) {
-            Some((
-                format_score(format),
-                VideoFormat {
-                    format_id: format!("{}+{}", format.format_id, audio_format_id),
-                    label: format_label(format),
-                    height: format.height,
-                    ext: Some("mp4".to_string()),
-                },
-            ))
-        } else {
-            None
-        };
-
-        let Some((score, video_format)) = entry else {
+        let Some((score, video_format, codec)) = build_video_format_entry(format, &payload.formats)
+        else {
             continue;
         };
 
-        if let Some(existing) = best_by_height
+        if let Some(existing) = entries
             .iter_mut()
-            .find(|(_, item)| item.height == video_format.height)
+            .find(|entry| entry.height == video_format.height && entry.codec == codec)
         {
-            if score > existing.0 {
-                *existing = (score, video_format);
+            if score > existing.score {
+                *existing = FormatEntry {
+                    score,
+                    height: video_format.height,
+                    codec,
+                    format: video_format,
+                };
             }
             continue;
         }
 
-        best_by_height.push((score, video_format));
+        entries.push(FormatEntry {
+            score,
+            height: video_format.height,
+            codec,
+            format: video_format,
+        });
     }
 
-    best_by_height.sort_by(|left, right| {
+    entries.sort_by(|left, right| {
         right
-            .1
+            .format
             .height
             .unwrap_or(0)
-            .cmp(&left.1.height.unwrap_or(0))
-            .then_with(|| right.0.cmp(&left.0))
+            .cmp(&left.format.height.unwrap_or(0))
+            .then_with(|| codec_sort_order(left.codec).cmp(&codec_sort_order(right.codec)))
+            .then_with(|| right.score.cmp(&left.score))
     });
 
-    Ok(best_by_height.into_iter().map(|(_, format)| format).collect())
+    Ok(entries.into_iter().map(|entry| entry.format).collect())
+}
+
+struct FormatEntry {
+    score: i32,
+    height: Option<u32>,
+    codec: &'static str,
+    format: VideoFormat,
+}
+
+fn build_video_format_entry(
+    format: &YtDlpFormat,
+    formats: &[YtDlpFormat],
+) -> Option<(i32, VideoFormat, &'static str)> {
+    if is_http_combined(format) {
+        let codec = video_codec_family(format.vcodec.as_deref().unwrap_or("none"));
+        return Some((
+            format_score(format),
+            VideoFormat {
+                format_id: format.format_id.clone(),
+                label: format_label(format),
+                height: format.height,
+                ext: format.ext.clone(),
+            },
+            codec,
+        ));
+    }
+
+    if !is_http_video_only(format) {
+        return None;
+    }
+
+    let codec = video_codec_family(format.vcodec.as_deref().unwrap_or("none"));
+    let audio_format_id = best_audio_for_video(formats, format)?;
+    Some((
+        format_score(format),
+        VideoFormat {
+            format_id: format!("{}+{}", format.format_id, audio_format_id),
+            label: format_label(format),
+            height: format.height,
+            ext: format.ext.clone(),
+        },
+        codec,
+    ))
 }
 
 pub fn resolve_stream_spec_inner(input: &str, format_id: Option<&str>) -> Result<StreamSpec> {
@@ -295,6 +327,46 @@ fn is_http_video_only(format: &YtDlpFormat) -> bool {
     vcodec != "none" && acodec == "none"
 }
 
+fn best_audio_for_video(formats: &[YtDlpFormat], video: &YtDlpFormat) -> Option<String> {
+    let prefer_opus = video.ext.as_deref() == Some("webm")
+        || video
+            .vcodec
+            .as_deref()
+            .is_some_and(|codec| codec.starts_with("vp9"));
+
+    formats
+        .iter()
+        .filter(|format| is_http_audio_only(format))
+        .filter(|format| {
+            if prefer_opus {
+                format
+                    .acodec
+                    .as_deref()
+                    .is_some_and(|codec| codec.starts_with("opus"))
+                    || format.ext.as_deref() == Some("webm")
+            } else {
+                format
+                    .acodec
+                    .as_deref()
+                    .is_some_and(|codec| codec.starts_with("mp4a"))
+                    || format.ext.as_deref() == Some("m4a")
+            }
+        })
+        .max_by_key(|format| audio_format_score(format))
+        .map(|format| format.format_id.clone())
+        .or_else(|| best_audio_format_id(formats))
+}
+
+fn is_http_audio_only(format: &YtDlpFormat) -> bool {
+    let protocol = format.protocol.as_deref().unwrap_or("");
+    protocol.starts_with("http")
+        && format.vcodec.as_deref() == Some("none")
+        && format
+            .acodec
+            .as_deref()
+            .is_some_and(|codec| codec != "none")
+}
+
 fn best_audio_format_id(formats: &[YtDlpFormat]) -> Option<String> {
     formats
         .iter()
@@ -326,27 +398,78 @@ fn format_score(format: &YtDlpFormat) -> i32 {
     } else if is_http_video_only(format) {
         score += 9_000;
     }
-    if format.ext.as_deref() == Some("mp4") {
-        score += 500;
-    }
-    if format.ext.as_deref() == Some("webm") {
-        score += 400;
-    }
     score
 }
 
+fn video_codec_family(vcodec: &str) -> &'static str {
+    if vcodec.starts_with("avc1") || vcodec.starts_with("avc3") {
+        "h264"
+    } else if vcodec.starts_with("hvc1") || vcodec.starts_with("hev1") {
+        "hevc"
+    } else if vcodec.starts_with("vp9") {
+        "vp9"
+    } else if vcodec.starts_with("av01") {
+        "av1"
+    } else {
+        "other"
+    }
+}
+
+fn codec_display_name(vcodec: &str) -> &'static str {
+    match video_codec_family(vcodec) {
+        "h264" => "H.264",
+        "hevc" => "HEVC",
+        "vp9" => "VP9",
+        "av1" => "AV1",
+        _ => "Video",
+    }
+}
+
+fn codec_sort_order(codec: &str) -> i32 {
+    match codec {
+        "h264" => 0,
+        "hevc" => 1,
+        "vp9" => 2,
+        "av1" => 3,
+        _ => 4,
+    }
+}
+
 fn format_label(format: &YtDlpFormat) -> String {
-    let ext = format.ext.as_deref().unwrap_or("mp4").to_uppercase();
+    let vcodec = format.vcodec.as_deref().unwrap_or("none");
+    let ext = format.ext.as_deref().unwrap_or("").to_uppercase();
     if let Some(height) = format.height {
-        return format!("{height}p {ext}");
+        if vcodec != "none" {
+            return format!("{height}p {}", codec_display_name(vcodec));
+        }
+        if !ext.is_empty() {
+            return format!("{height}p {ext}");
+        }
+        return format!("{height}p");
     }
 
     format
         .format_note
         .as_deref()
         .filter(|note| !note.is_empty())
-        .map(|note| format!("{note} {ext}"))
-        .unwrap_or_else(|| format!("Format {ext}"))
+        .map(|note| {
+            if vcodec != "none" {
+                format!("{note} {}", codec_display_name(vcodec))
+            } else if !ext.is_empty() {
+                format!("{note} {ext}")
+            } else {
+                note.to_string()
+            }
+        })
+        .unwrap_or_else(|| {
+            if vcodec != "none" {
+                codec_display_name(vcodec).to_string()
+            } else if !ext.is_empty() {
+                format!("Format {ext}")
+            } else {
+                "Format".to_string()
+            }
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,8 +492,9 @@ struct YtDlpFormat {
 #[cfg(test)]
 mod tests {
     use super::{
-        artist_hint_from_title, clean_youtube_title, extract_video_id, is_hls_url,
-        stream_spec_from_urls, DEFAULT_STREAM_FORMAT,
+        artist_hint_from_title, build_video_format_entry, clean_youtube_title, codec_display_name,
+        extract_video_id, is_hls_url, stream_spec_from_urls, video_codec_family, YtDlpFormat,
+        DEFAULT_STREAM_FORMAT,
     };
     use crate::models::StreamSpec;
 
@@ -400,6 +524,82 @@ mod tests {
             artist_hint_from_title("LE SSERAFIM (르세라핌) 'BOOMPALA' OFFICIAL MV").as_deref(),
             Some("LE SSERAFIM (르세라핌)")
         );
+    }
+
+    #[test]
+    fn maps_codec_families_for_labels() {
+        assert_eq!(video_codec_family("avc1.640028"), "h264");
+        assert_eq!(video_codec_family("vp9"), "vp9");
+        assert_eq!(video_codec_family("av01.0.08M.08"), "av1");
+        assert_eq!(video_codec_family("hvc1.1.6.L120.90"), "hevc");
+        assert_eq!(codec_display_name("vp9"), "VP9");
+    }
+
+    #[test]
+    fn keeps_each_codec_at_the_same_height() {
+        let formats = vec![
+            YtDlpFormat {
+                format_id: "137".into(),
+                ext: Some("mp4".into()),
+                height: Some(1080),
+                vcodec: Some("avc1.640028".into()),
+                acodec: Some("none".into()),
+                protocol: Some("https".into()),
+                format_note: None,
+                abr: None,
+            },
+            YtDlpFormat {
+                format_id: "248".into(),
+                ext: Some("webm".into()),
+                height: Some(1080),
+                vcodec: Some("vp9".into()),
+                acodec: Some("none".into()),
+                protocol: Some("https".into()),
+                format_note: None,
+                abr: None,
+            },
+            YtDlpFormat {
+                format_id: "399".into(),
+                ext: Some("mp4".into()),
+                height: Some(1080),
+                vcodec: Some("av01.0.08M.08".into()),
+                acodec: Some("none".into()),
+                protocol: Some("https".into()),
+                format_note: None,
+                abr: None,
+            },
+            YtDlpFormat {
+                format_id: "251".into(),
+                ext: Some("webm".into()),
+                height: None,
+                vcodec: Some("none".into()),
+                acodec: Some("opus".into()),
+                protocol: Some("https".into()),
+                format_note: None,
+                abr: Some(160.0),
+            },
+            YtDlpFormat {
+                format_id: "140".into(),
+                ext: Some("m4a".into()),
+                height: None,
+                vcodec: Some("none".into()),
+                acodec: Some("mp4a.40.2".into()),
+                protocol: Some("https".into()),
+                format_note: None,
+                abr: Some(128.0),
+            },
+        ];
+
+        let h264 = build_video_format_entry(&formats[0], &formats).expect("h264");
+        let vp9 = build_video_format_entry(&formats[1], &formats).expect("vp9");
+        let av1 = build_video_format_entry(&formats[2], &formats).expect("av1");
+
+        assert_eq!(h264.1.label, "1080p H.264");
+        assert_eq!(vp9.1.label, "1080p VP9");
+        assert_eq!(av1.1.label, "1080p AV1");
+        assert!(h264.1.format_id.contains("140"));
+        assert!(vp9.1.format_id.contains("251"));
+        assert!(av1.1.format_id.contains("140"));
     }
 
     #[test]

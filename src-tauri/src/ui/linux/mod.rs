@@ -410,7 +410,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     *view.this.borrow_mut() = Some(Rc::clone(&view));
 
     let view_for_tick = Rc::clone(&view);
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
+    gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         if catch_unwind(AssertUnwindSafe(|| {
             let mut needs_full_refresh = false;
             while let Ok(position) = position_rx.try_recv() {
