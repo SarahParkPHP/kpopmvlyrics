@@ -3,8 +3,8 @@ use std::sync::Mutex;
 
 use crate::align::{
     align_lines, align_lyrics_from_line_timings, align_lyrics_to_forced_words,
-    align_lyrics_to_timed_words, alignment_playback_quality, build_lyrics_forced_alignment_bundle,
-    forced_line_timing_quality, lyric_whisper_alignment_text, AlignmentInput,
+    align_lyrics_to_timed_words, alignment_playback_quality, forced_line_timing_quality,
+    AlignmentInput,
 };
 use crate::asr::{
     asr_available, asr_caption_lines, asr_setup_hint, effective_asr_model, forced_align_language,
@@ -182,7 +182,7 @@ impl AppContext {
             has_original || (has_english && !has_original && !has_romanization);
         let asr_use_original = has_original;
         let asr_language = if has_original {
-            Some("ko")
+            Some(detect_original_language(&lyrics).unwrap_or("ko"))
         } else if has_english && !has_original && !has_romanization {
             Some("en")
         } else {
@@ -242,67 +242,24 @@ impl AppContext {
             if asr_ok {
                 let model_size = self.effective_asr_model();
                 verbose(format!("align asr model={}", model_size.model_filename()));
-                // CCL "original" lines often mix Korean and English; English lyrics align more reliably.
-                let align_with_english = has_english;
-                let (lyrics_text, forced_lines, primary_align_language, asr_language_for_run) =
-                    if align_with_english {
-                        let (text, lines) =
-                            build_lyrics_forced_alignment_bundle(&lyrics, false);
-                        (text, lines, "English", Some("en"))
-                    } else {
-                        let lang = forced_align_language(asr_use_original, asr_language);
-                        let (text, lines) =
-                            build_lyrics_forced_alignment_bundle(&lyrics, asr_use_original);
-                        (text, lines, lang, asr_language)
-                    };
+                let primary_align_language =
+                    forced_align_language(asr_use_original, asr_language);
+                let (lyrics_text, forced_lines) =
+                    crate::align::build_lyrics_forced_alignment_bundle_with_hints(
+                        &lyrics,
+                        asr_use_original,
+                        &best_alignment,
+                    );
                 let transcript = {
                     let _phase = PhaseGuard::begin("align transcribe_video");
                     transcribe_video(
                         video_id,
-                        asr_language_for_run,
+                        asr_language,
                         model_size,
                         Some(&lyrics_text),
                         Some(&forced_lines),
                         Some(primary_align_language),
                     )
-                };
-                let transcript = match transcript {
-                    Ok(mut primary) => {
-                        let primary_alignment = alignment_from_transcript(
-                            &lyrics,
-                            &primary,
-                            !align_with_english && asr_use_original,
-                        );
-                        if forced_line_timing_quality(&primary_alignment) == 0.0
-                            && has_english
-                            && !align_with_english
-                        {
-                            verbose("align asr retrying forced alignment with English lyrics");
-                            let (english_text, english_lines) =
-                                build_lyrics_forced_alignment_bundle(&lyrics, false);
-                            if let Ok(english_transcript) = transcribe_video(
-                                video_id,
-                                Some("en"),
-                                model_size,
-                                Some(&english_text),
-                                Some(&english_lines),
-                                Some("English"),
-                            ) {
-                                let english_alignment = alignment_from_transcript(
-                                    &lyrics,
-                                    &english_transcript,
-                                    false,
-                                );
-                                if forced_line_timing_quality(&english_alignment)
-                                    > forced_line_timing_quality(&primary_alignment)
-                                {
-                                    primary = english_transcript;
-                                }
-                            }
-                        }
-                        Ok(primary)
-                    }
-                    Err(err) => Err(err),
                 };
                 match transcript {
                     Ok(transcript) if !transcript.words.is_empty() => {
@@ -313,17 +270,18 @@ impl AppContext {
                             transcript.line_timings.len()
                         ));
                         let asr_captions = asr_caption_lines(video_id, &transcript);
-                        let asr_alignment = alignment_from_transcript(
+                        let mut asr_alignment = alignment_from_transcript(
                             &lyrics,
                             &transcript,
-                            !align_with_english && asr_use_original,
+                            asr_use_original,
                         );
+                        merge_caption_baseline(&mut asr_alignment, &best_alignment);
                         let asr_score = alignment_playback_quality(&asr_alignment);
                         let timing_quality = forced_line_timing_quality(&asr_alignment);
                         verbose(format!(
                             "align asr score={asr_score:.3} timing_quality={timing_quality:.3} caption_score={best_score:.3}"
                         ));
-                        if timing_quality > 0.0 {
+                        if timing_quality > 0.0 && asr_score >= best_score {
                             best_alignment = asr_alignment;
                             best_captions = asr_captions;
                             let backend = transcript
@@ -339,7 +297,8 @@ impl AppContext {
                             eprintln!("kpopmvlyrics: {summary}");
                         } else {
                             summary = format!(
-                                "Qwen3 ASR timings looked unreliable (quality={timing_quality:.2}); kept caption alignment"
+                                "Qwen3 ASR alignment quality={timing_quality:.2} score={asr_score:.2} \
+                                 was not better than captions (score={best_score:.2}); kept caption alignment"
                             );
                             eprintln!("kpopmvlyrics: {summary}");
                         }
@@ -445,6 +404,31 @@ impl AppContext {
     }
 }
 
+/// Fill in caption-based timings for any lyric line that ASR left unsynced.
+/// FA can fail on individual chunks (degenerate model output); the caption
+/// baseline keeps those lines highlighted at approximately the right time.
+fn merge_caption_baseline(asr: &mut [AlignmentLine], baseline: &[AlignmentLine]) {
+    use std::collections::HashMap;
+    let baseline_by_index: HashMap<usize, &AlignmentLine> =
+        baseline.iter().map(|line| (line.lyric_index, line)).collect();
+    for line in asr.iter_mut() {
+        if crate::align::is_synced_line(line) {
+            continue;
+        }
+        let Some(fallback) = baseline_by_index.get(&line.lyric_index) else {
+            continue;
+        };
+        if !crate::align::is_synced_line(fallback) {
+            continue;
+        }
+        line.caption_index = fallback.caption_index;
+        line.start_ms = fallback.start_ms;
+        line.end_ms = fallback.end_ms;
+        line.confidence = (fallback.confidence * 0.6).max(0.1);
+        line.needs_review = true;
+    }
+}
+
 fn alignment_from_transcript(
     lyrics: &[LyricLine],
     transcript: &AsrTranscript,
@@ -456,6 +440,36 @@ fn alignment_from_transcript(
         align_lyrics_to_forced_words(lyrics, &transcript.words, use_original)
     } else {
         align_lyrics_to_timed_words(lyrics, &transcript.words, use_original)
+    }
+}
+
+/// Pick a BCP-47 language code based on the dominant script of the original lyrics.
+/// Returns None for Latin-only originals (caller falls back to a configured default).
+fn detect_original_language(lyrics: &[LyricLine]) -> Option<&'static str> {
+    let mut hangul = 0usize;
+    let mut kana = 0usize;
+    let mut han = 0usize;
+    for line in lyrics {
+        for ch in line.original.chars() {
+            let cp = ch as u32;
+            match cp {
+                0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => hangul += 1,
+                0x3040..=0x309F | 0x30A0..=0x30FF => kana += 1,
+                0x4E00..=0x9FFF | 0x3400..=0x4DBF => han += 1,
+                _ => {}
+            }
+        }
+    }
+    let max = hangul.max(kana).max(han);
+    if max == 0 {
+        return None;
+    }
+    if max == hangul {
+        Some("ko")
+    } else if max == kana {
+        Some("ja")
+    } else {
+        Some("zh")
     }
 }
 
@@ -616,8 +630,45 @@ fn to_string<E: std::fmt::Display>(err: E) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_member_profiles, merge_members, restrict_members_to_lines};
+    use super::{
+        apply_member_profiles, detect_original_language, merge_members, restrict_members_to_lines,
+    };
     use crate::models::{LyricLine, MemberProfile};
+
+    fn lyric_with_original(text: &str) -> LyricLine {
+        LyricLine {
+            id: None,
+            song_id: None,
+            index: 0,
+            member: None,
+            original: text.into(),
+            romanization: None,
+            english: None,
+            with_all: false,
+            segments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detect_original_language_picks_korean_for_hangul() {
+        let lyrics = vec![
+            lyric_with_original("이건 서울 City"),
+            lyric_with_original("수많은 기적이 이뤄진 곳"),
+        ];
+        assert_eq!(detect_original_language(&lyrics), Some("ko"));
+    }
+
+    #[test]
+    fn detect_original_language_picks_japanese_for_kana() {
+        let lyrics = vec![lyric_with_original("こんにちは 世界")];
+        assert_eq!(detect_original_language(&lyrics), Some("ja"));
+    }
+
+    #[test]
+    fn detect_original_language_returns_none_for_latin_only() {
+        let lyrics = vec![lyric_with_original("Tell me what you want")];
+        assert_eq!(detect_original_language(&lyrics), None);
+    }
 
     fn profile(stage_name: &str) -> MemberProfile {
         MemberProfile {

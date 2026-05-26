@@ -116,6 +116,10 @@ pub struct ForcedAlignLine {
     pub text: String,
     pub char_start: usize,
     pub char_end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint_start_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint_end_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

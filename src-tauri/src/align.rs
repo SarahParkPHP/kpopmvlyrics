@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -494,6 +494,16 @@ pub fn build_lyrics_forced_alignment_bundle(
     lyrics: &[LyricLine],
     use_original: bool,
 ) -> (String, Vec<crate::asr::ForcedAlignLine>) {
+    build_lyrics_forced_alignment_bundle_with_hints(lyrics, use_original, &[])
+}
+
+pub fn build_lyrics_forced_alignment_bundle_with_hints(
+    lyrics: &[LyricLine],
+    use_original: bool,
+    hints: &[AlignmentLine],
+) -> (String, Vec<crate::asr::ForcedAlignLine>) {
+    let hint_by_index: HashMap<usize, &AlignmentLine> =
+        hints.iter().map(|line| (line.lyric_index, line)).collect();
     let mut text = String::new();
     let mut lines = Vec::new();
     for line in lyrics {
@@ -505,11 +515,18 @@ pub fn build_lyrics_forced_alignment_bundle(
         }
         let char_start = text.len();
         text.push_str(line_text);
+        let (hint_start_ms, hint_end_ms) = hint_by_index
+            .get(&line.index)
+            .filter(|hint| has_playback_timing(hint))
+            .map(|hint| (Some(hint.start_ms), Some(hint.end_ms)))
+            .unwrap_or((None, None));
         lines.push(crate::asr::ForcedAlignLine {
             index: line.index,
             text: line_text.to_string(),
             char_start,
             char_end: text.len(),
+            hint_start_ms,
+            hint_end_ms,
         });
     }
     (text, lines)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 from dataclasses import dataclass
@@ -101,13 +102,64 @@ def resolve_device(requested: str) -> str:
     return "cpu"
 
 
-def torch_load_kwargs(device: str) -> dict:
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def vram_budget_gib() -> tuple[float, float]:
+    """Return (gpu_budget_gib, free_gib) for the current CUDA device.
+
+    Budget = free VRAM - headroom (activations + CUDA workspace + other apps).
+    """
     import torch
 
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    if device == "cuda":
-        return {"dtype": dtype, "device_map": "cuda:0"}
-    return {"dtype": dtype, "device_map": {"": "cpu"}}
+    if not torch.cuda.is_available():
+        return 0.0, 0.0
+    free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
+    free_gib = free_bytes / (1024**3)
+    headroom_gib = _env_float("KPOPMVLYRICS_ASR_VRAM_HEADROOM_GIB", 1.0)
+    budget = max(0.0, free_gib - headroom_gib)
+    return budget, free_gib
+
+
+def torch_load_kwargs(device: str, budget_share: float = 1.0) -> dict:
+    """Build from_pretrained kwargs that fit the model in available VRAM.
+
+    `budget_share` lets callers reserve a fraction of free VRAM for a sibling model
+    (e.g. ASR + aligner loaded together: ASR=0.7, aligner=0.3).
+    """
+    import torch
+
+    if device != "cuda":
+        return {"dtype": torch.float32, "device_map": {"": "cpu"}}
+
+    dtype = torch.bfloat16
+    total_budget_gib, free_gib = vram_budget_gib()
+    budget_gib = total_budget_gib * max(0.05, min(1.0, budget_share))
+    cpu_cap_gib = _env_float("KPOPMVLYRICS_ASR_CPU_BUDGET_GIB", 64.0)
+
+    if budget_gib < 0.5:
+        print(
+            f"VRAM tight (free={free_gib:.2f} GiB, share={budget_share:.2f} "
+            f"→ budget={budget_gib:.2f} GiB); loading on CPU only.",
+            file=sys.stderr,
+        )
+        return {"dtype": torch.float32, "device_map": {"": "cpu"}}
+
+    max_memory = {0: f"{budget_gib:.2f}GiB", "cpu": f"{cpu_cap_gib:.0f}GiB"}
+    print(
+        f"VRAM budget: GPU={budget_gib:.2f} GiB (free {free_gib:.2f} GiB, "
+        f"share={budget_share:.2f}), CPU cap {cpu_cap_gib:.0f} GiB. "
+        "Using device_map=auto.",
+        file=sys.stderr,
+    )
+    return {"dtype": dtype, "device_map": "auto", "max_memory": max_memory}
 
 
 def ms(value: float) -> int:
@@ -398,12 +450,20 @@ def forced_items_to_tokens(items) -> list[AlignedToken]:
 
 def line_align_language(text: str, fallback: str) -> str:
     hangul = sum(1 for ch in text if "\uac00" <= ch <= "\ud7af")
+    kana = sum(1 for ch in text if "\u3040" <= ch <= "\u30ff")
+    han = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf")
     latin = sum(1 for ch in text if ch.isascii() and ch.isalpha())
-    if hangul > latin:
-        return "Korean"
-    if latin > hangul:
-        return "English"
-    return fallback
+    counts = [
+        (hangul, "Korean"),
+        (kana, "Japanese"),
+        (han, "Chinese"),
+        (latin, "English"),
+    ]
+    counts.sort(key=lambda pair: pair[0], reverse=True)
+    top_count, top_lang = counts[0]
+    if top_count == 0:
+        return fallback
+    return top_lang
 
 
 def split_line_specs(line_specs: list[dict], chunk_count: int) -> list[list[dict]]:
@@ -413,6 +473,71 @@ def split_line_specs(line_specs: list[dict], chunk_count: int) -> list[list[dict
     for index, spec in enumerate(line_specs):
         groups[min(index * chunk_count // len(line_specs), chunk_count - 1)].append(spec)
     return [group for group in groups if group]
+
+
+def allocate_lines_to_chunks(
+    line_specs: list[dict],
+    audio_chunks: list,
+) -> list[list[dict]]:
+    """Assign each lyric line to the audio chunk whose window contains its hint_start_ms.
+
+    Falls back to count-proportional split for lines without hints, or when no hints exist.
+    `audio_chunks` is the list returned by split_audio_into_chunks: [(wav, offset_sec), ...].
+    """
+    if not audio_chunks:
+        return []
+    if len(audio_chunks) == 1:
+        return [list(line_specs)]
+
+    has_any_hint = any(spec.get("hint_start_ms") is not None for spec in line_specs)
+    if not has_any_hint:
+        return split_line_specs(line_specs, len(audio_chunks))
+
+    chunk_bounds: list[tuple[float, float]] = []
+    for idx, (chunk_wav, offset_sec) in enumerate(audio_chunks):
+        from qwen_asr.inference.utils import SAMPLE_RATE
+        duration = len(chunk_wav) / float(SAMPLE_RATE)
+        start = offset_sec
+        end = offset_sec + duration if idx < len(audio_chunks) - 1 else float("inf")
+        chunk_bounds.append((start, end))
+
+    groups: list[list[dict]] = [[] for _ in audio_chunks]
+    last_chunk_idx = 0
+    for spec in line_specs:
+        hint = spec.get("hint_start_ms")
+        if hint is None:
+            groups[last_chunk_idx].append(spec)
+            continue
+        hint_sec = hint / 1000.0
+        target = last_chunk_idx
+        for idx, (start, end) in enumerate(chunk_bounds):
+            if start <= hint_sec < end:
+                target = idx
+                break
+        last_chunk_idx = target
+        groups[target].append(spec)
+    return groups
+
+
+def chunk_output_is_degenerate(tokens: list[AlignedToken], chunk_duration_sec: float) -> bool:
+    """Return True if a chunk's forced-alignment output is unreliable garbage.
+
+    Qwen ForcedAligner emits all-zero timestamps or collapsed clusters when the input
+    lyrics don't match the chunk audio, or when the input exceeds the model's
+    reliable window. Reject those.
+    """
+    if not tokens:
+        return True
+    zero_count = sum(1 for t in tokens if t.start == 0 and t.end == 0)
+    if zero_count > len(tokens) * 0.5:
+        return True
+    distinct_starts = len({round(t.start, 1) for t in tokens})
+    if distinct_starts < max(3, len(tokens) // 4):
+        return True
+    spread = max(t.end for t in tokens) - min(t.start for t in tokens)
+    if spread > chunk_duration_sec * 2.5:
+        return True
+    return False
 
 
 def offset_line_timings(line_timings: list[dict], offset_sec: float) -> None:
@@ -439,34 +564,38 @@ def align_lyrics_chunked(
     align_language: str,
 ) -> tuple[list[AlignedToken], list[dict]]:
     from qwen_asr.inference.utils import (
-        MAX_FORCE_ALIGN_INPUT_SECONDS,
         SAMPLE_RATE,
         normalize_audios,
         split_audio_into_chunks,
     )
 
+    chunk_target_sec = _env_float("KPOPMVLYRICS_ASR_FA_CHUNK_SEC", 30.0)
     wav = normalize_audios(str(audio_path))[0]
     audio_duration_sec = len(wav) / float(SAMPLE_RATE)
     max_ms = ms(audio_duration_sec) + 500
     audio_chunks = split_audio_into_chunks(
         wav,
         SAMPLE_RATE,
-        MAX_FORCE_ALIGN_INPUT_SECONDS,
+        chunk_target_sec,
     )
-    line_groups = split_line_specs(line_specs, len(audio_chunks))
+    line_groups = allocate_lines_to_chunks(line_specs, audio_chunks)
 
     all_tokens: list[AlignedToken] = []
     all_line_timings: list[dict] = []
+    accepted_chunks = 0
 
     for chunk_index, ((chunk_wav, offset_sec), group) in enumerate(
         zip(audio_chunks, line_groups)
     ):
+        if not group:
+            continue
         chunk_text = " ".join(str(spec.get("text", "")).strip() for spec in group if spec.get("text"))
         if not chunk_text.strip():
             continue
+        chunk_duration_sec = len(chunk_wav) / float(SAMPLE_RATE)
         print(
             f"  chunk {chunk_index + 1}/{len(audio_chunks)}: "
-            f"{len(group)} lines, offset={offset_sec:.1f}s",
+            f"{len(group)} lines, offset={offset_sec:.1f}s, duration={chunk_duration_sec:.1f}s",
             file=sys.stderr,
         )
         chunk_language = line_align_language(chunk_text, align_language)
@@ -476,8 +605,18 @@ def align_lyrics_chunked(
             language=chunk_language,
         )
         if not results:
+            print(f"    skip: aligner returned no results", file=sys.stderr)
             continue
         tokens = forced_items_to_tokens(results[0])
+        if chunk_output_is_degenerate(tokens, chunk_duration_sec):
+            print(
+                f"    skip: degenerate FA output "
+                f"(tokens={len(tokens)}, "
+                f"zeros={sum(1 for t in tokens if t.start == 0 and t.end == 0)}, "
+                f"distinct={len({round(t.start, 1) for t in tokens})})",
+                file=sys.stderr,
+            )
+            continue
         repair_zero_word_timestamps(tokens)
         chunk_timings = choose_line_timings(group, chunk_text, tokens)
         offset_line_timings(chunk_timings, offset_sec)
@@ -490,11 +629,19 @@ def align_lyrics_chunked(
                 row["end_ms"] = None
         all_tokens.extend(tokens)
         all_line_timings.extend(chunk_timings)
+        accepted_chunks += 1
 
         import torch
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    print(
+        f"  accepted {accepted_chunks}/{len(audio_chunks)} chunks, "
+        f"{sum(1 for r in all_line_timings if r.get('start_ms') is not None)} of "
+        f"{len(line_specs)} lines aligned",
+        file=sys.stderr,
+    )
 
     dedupe_clustered_line_timings(all_line_timings)
 
@@ -532,14 +679,16 @@ def transcribe_with_asr_model(
     device: str,
 ):
     Qwen3ASRModel, _Qwen3ForcedAligner = import_qwen_asr()
-    load_kwargs = torch_load_kwargs(device)
+    # ASR (1.7B/0.6B) is larger than the aligner (0.6B); split the VRAM budget ~7:3.
+    asr_kwargs = torch_load_kwargs(device, budget_share=0.7)
+    aligner_kwargs = torch_load_kwargs(device, budget_share=0.3)
     model = Qwen3ASRModel.from_pretrained(
         model_id,
         forced_aligner=aligner_model,
-        forced_aligner_kwargs=load_kwargs,
+        forced_aligner_kwargs=aligner_kwargs,
         max_inference_batch_size=1,
         max_new_tokens=512,
-        **load_kwargs,
+        **asr_kwargs,
     )
     language_arg = [language] if language else None
     results = model.transcribe(
