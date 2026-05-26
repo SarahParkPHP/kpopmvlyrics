@@ -20,8 +20,8 @@ use gtk::{
 use gtk::gdk::keys::constants as keys;
 use gtk::gdk::Screen;
 
-use crate::align::is_synced_line;
-use crate::app::{format_ms, merge_members, AppContext};
+use crate::align::has_playback_timing;
+use crate::app::{apply_member_profiles, format_ms, AppContext};
 use crate::models::{
     AlignmentLine, CaptionLine, MemberProfile, SongPackage, StreamSpec, VideoFormat,
     VideoMetadata, VideoPosition,
@@ -113,10 +113,16 @@ struct MemberButton {
     name_label: Label,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemberHighlightState {
+    primary: Vec<String>,
+    backing: Vec<String>,
+}
+
 struct MemberStage {
     content_key: String,
     buttons: Vec<MemberButton>,
-    last_active: RefCell<Option<String>>,
+    last_highlight: RefCell<Option<MemberHighlightState>>,
 }
 
 impl MemberStage {
@@ -124,31 +130,75 @@ impl MemberStage {
         Self {
             content_key: String::new(),
             buttons: Vec::new(),
-            last_active: RefCell::new(None),
+            last_highlight: RefCell::new(None),
         }
     }
 
-    fn set_active(&self, active_member: Option<&str>) {
-        let active = active_member.map(str::to_lowercase);
-        if *self.last_active.borrow() == active {
+    fn set_member_highlight(&self, highlight: &crate::lyrics::MemberHighlight) {
+        let mut primary: Vec<String> = highlight
+            .primary
+            .iter()
+            .map(|name| name.to_lowercase())
+            .collect();
+        primary.sort();
+        primary.dedup();
+        let mut backing: Vec<String> = highlight
+            .backing
+            .iter()
+            .map(|name| name.to_lowercase())
+            .collect();
+        backing.sort();
+        backing.dedup();
+        let state = MemberHighlightState {
+            primary: primary.clone(),
+            backing: backing.clone(),
+        };
+        if *self.last_highlight.borrow() == Some(state.clone()) {
             return;
         }
-        *self.last_active.borrow_mut() = active.clone();
+        *self.last_highlight.borrow_mut() = Some(state);
         for entry in &self.buttons {
-            let is_active = active
-                .as_ref()
-                .is_some_and(|name| name.eq_ignore_ascii_case(&entry.stage_name));
-            let context = entry.border_wrap.style_context();
-            if is_active {
-                context.add_class("active");
+            let stage = entry.stage_name.to_lowercase();
+            let visual = if primary.iter().any(|name| name.eq_ignore_ascii_case(&stage)) {
+                MemberVisualState::Primary
+            } else if backing.iter().any(|name| name.eq_ignore_ascii_case(&stage)) {
+                MemberVisualState::Backing
             } else {
-                context.remove_class("active");
-            }
-            entry.portrait_frame.set_opacity(if is_active { 1.0 } else { 0.42 });
-            entry
-                .name_label
-                .set_opacity(if is_active { 1.0 } else { 0.55 });
-            apply_member_name_style(&entry.name_label, &entry.color, is_active);
+                MemberVisualState::Inactive
+            };
+            apply_member_visual(entry, visual);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemberVisualState {
+    Primary,
+    Backing,
+    Inactive,
+}
+
+fn apply_member_visual(entry: &MemberButton, state: MemberVisualState) {
+    let context = entry.border_wrap.style_context();
+    context.remove_class("active");
+    context.remove_class("backing");
+    match state {
+        MemberVisualState::Primary => {
+            context.add_class("active");
+            entry.portrait_frame.set_opacity(1.0);
+            entry.name_label.set_opacity(1.0);
+            apply_member_name_style(&entry.name_label, &entry.color, true);
+        }
+        MemberVisualState::Backing => {
+            context.add_class("backing");
+            entry.portrait_frame.set_opacity(0.72);
+            entry.name_label.set_opacity(0.78);
+            apply_member_name_style(&entry.name_label, &entry.color, true);
+        }
+        MemberVisualState::Inactive => {
+            entry.portrait_frame.set_opacity(0.42);
+            entry.name_label.set_opacity(0.55);
+            apply_member_name_style(&entry.name_label, &entry.color, false);
         }
     }
 }
@@ -167,6 +217,9 @@ struct UiView {
     quality_combo: ComboBoxText,
     settings_revealer: Revealer,
     query_entry: Entry,
+    original_toggle: CheckButton,
+    roman_toggle: CheckButton,
+    english_toggle: CheckButton,
     editor: EditorWidgets,
     lyric_stage: Rc<RefCell<LyricStage>>,
     member_stage: Rc<RefCell<MemberStage>>,
@@ -403,6 +456,9 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         quality_combo: quality_combo.clone(),
         settings_revealer: settings_revealer.clone(),
         query_entry: query_entry.clone(),
+        original_toggle: original_toggle.clone(),
+        roman_toggle: roman_toggle.clone(),
+        english_toggle: english_toggle.clone(),
         editor: EditorWidgets {
             revealer: editor_build.widgets.revealer.clone(),
             table_box: editor_build.widgets.table_box.clone(),
@@ -628,6 +684,7 @@ impl UiView {
             format_ms(model.current_ms)
         ));
         self.query_entry.set_text(&model.query);
+        self.sync_language_toggles(&model);
         render_status(&self.status_label, &model);
         self.schedule_lyric_build(&model);
         drop(model);
@@ -657,16 +714,42 @@ impl UiView {
         self.lyric_stage
             .borrow()
             .set_active(model.active_index, &self.lyric_scroll);
-        let active_member = model
+        let highlight = model
             .song
             .as_ref()
             .and_then(|song| {
                 song.lines
                     .iter()
                     .find(|line| line.index == model.active_index)
-                    .and_then(|line| line.member.as_deref())
+                    .map(|line| crate::lyrics::member_highlight_for_line(line, &song.members))
+            })
+            .unwrap_or(crate::lyrics::MemberHighlight {
+                primary: Vec::new(),
+                backing: Vec::new(),
             });
-        self.member_stage.borrow().set_active(active_member);
+        self.member_stage
+            .borrow()
+            .set_member_highlight(&highlight);
+    }
+
+    fn sync_language_toggles(&self, model: &UiModel) {
+        if self.original_toggle.is_active() != model.show_original {
+            self.original_toggle.set_active(model.show_original);
+        }
+        if self.roman_toggle.is_active() != model.show_romanization {
+            self.roman_toggle.set_active(model.show_romanization);
+        }
+        if self.english_toggle.is_active() != model.show_english {
+            self.english_toggle.set_active(model.show_english);
+        }
+    }
+
+    fn apply_song_language_toggles(model: &mut UiModel, lines: &[crate::models::LyricLine]) {
+        let (show_original, show_romanization, show_english) =
+            crate::lyrics::lyric_language_toggles(lines);
+        model.show_original = show_original;
+        model.show_romanization = show_romanization;
+        model.show_english = show_english;
     }
 
     fn schedule_lyric_build(&self, model: &UiModel) {
@@ -883,10 +966,12 @@ fn connect_view_handlers(
                 let mut package = snapshot.ctx.fetch_lyrics(&snapshot.query)?;
                 if let Some(group) = package.song.group_name.clone() {
                     if let Ok(profiles) = snapshot.ctx.search_member_profiles(&group) {
-                        package.members = merge_members(&package.members, &profiles);
+                        package.members =
+                            apply_member_profiles(&package.members, &profiles, &package.lines);
                     }
                 }
                 Ok(Box::new(move |model: &mut UiModel| {
+                    UiView::apply_song_language_toggles(model, &package.lines);
                     model.song = Some(package);
                     model.editor_table_dirty = true;
                 }) as Box<dyn FnOnce(&mut UiModel) + Send>)
@@ -1222,7 +1307,10 @@ fn clear_children(container: &GtkBox) {
 const NO_ACTIVE_LYRIC: usize = usize::MAX;
 
 fn active_lyric_index(alignment: &[AlignmentLine], current_ms: i64) -> usize {
-    let synced: Vec<&AlignmentLine> = alignment.iter().filter(|line| is_synced_line(line)).collect();
+    let synced: Vec<&AlignmentLine> = alignment
+        .iter()
+        .filter(|line| has_playback_timing(line))
+        .collect();
 
     if synced.is_empty() {
         return NO_ACTIVE_LYRIC;
@@ -1475,6 +1563,10 @@ fn attach_member_card_css(widget: &impl IsA<gtk::Widget>, stage_name: &str, colo
         "#member-card-{slug}.active {{
             box-shadow: inset 0 0 0 4px {color};
             border-radius: 8px;
+        }}
+        #member-card-{slug}.backing {{
+            box-shadow: inset 0 0 0 2px {color};
+            border-radius: 8px;
         }}"
     );
     let provider = CssProvider::new();
@@ -1498,7 +1590,7 @@ fn render_members(view: &UiView, model: &UiModel) {
     clear_children(container);
     view.member_stage.borrow_mut().content_key = key;
     view.member_stage.borrow_mut().buttons.clear();
-    view.member_stage.borrow_mut().last_active.replace(None);
+    view.member_stage.borrow_mut().last_highlight.replace(None);
 
     let Some(song) = &model.song else {
         let empty = Label::new(Some("Members appear after lyrics are loaded"));

@@ -239,7 +239,7 @@ pub fn clean_video_title(title: &str) -> String {
         .ok()
         .and_then(|re| re.captures(&cleaned))
     {
-        return format!("{} {}", &caps[1], &caps[2])
+        return format!("{} - {}", &caps[1], &caps[2])
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
@@ -249,7 +249,7 @@ pub fn clean_video_title(title: &str) -> String {
 
 pub fn merge_members(primary: &[MemberProfile], secondary: &[MemberProfile]) -> Vec<MemberProfile> {
     if primary.is_empty() {
-        return secondary.to_vec();
+        return Vec::new();
     }
     let mut by_name: std::collections::HashMap<String, MemberProfile> = primary
         .iter()
@@ -264,18 +264,48 @@ pub fn merge_members(primary: &[MemberProfile], secondary: &[MemberProfile]) -> 
                 .cloned()
         });
         if let Some(existing) = existing {
+            let stage_name = existing.stage_name.clone();
             let merged = MemberProfile {
-                image_url: existing.image_url.clone().or(member.image_url.clone()),
-                local_image_path: existing
+                image_url: member.image_url.clone().or(existing.image_url.clone()),
+                local_image_path: member
                     .local_image_path
                     .clone()
-                    .or(member.local_image_path.clone()),
-                ..member.clone()
+                    .or(existing.local_image_path.clone()),
+                real_name: existing.real_name.clone().or(member.real_name.clone()),
+                ..existing
             };
-            by_name.insert(existing.stage_name.to_lowercase(), merged);
+            by_name.insert(stage_name.to_lowercase(), merged);
         }
     }
     by_name.into_values().collect()
+}
+
+pub fn apply_member_profiles(
+    members: &[MemberProfile],
+    profiles: &[MemberProfile],
+    lines: &[LyricLine],
+) -> Vec<MemberProfile> {
+    let merged = merge_members(members, profiles);
+    restrict_members_to_lines(&merged, lines)
+}
+
+pub fn restrict_members_to_lines(
+    members: &[MemberProfile],
+    lines: &[LyricLine],
+) -> Vec<MemberProfile> {
+    let referenced = crate::lyrics::canonical_referenced_members(lines, members);
+    if referenced.is_empty() {
+        return members.to_vec();
+    }
+    members
+        .iter()
+        .filter(|member| {
+            referenced
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&member.stage_name))
+        })
+        .cloned()
+        .collect()
 }
 
 pub fn format_ms(ms: i64) -> String {
@@ -312,4 +342,88 @@ fn app_data_dir() -> Result<PathBuf, String> {
 
 fn to_string<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_member_profiles, merge_members, restrict_members_to_lines};
+    use crate::models::{LyricLine, MemberProfile};
+
+    fn profile(stage_name: &str) -> MemberProfile {
+        MemberProfile {
+            id: None,
+            stage_name: stage_name.to_string(),
+            real_name: None,
+            color: "#e84855".to_string(),
+            image_url: None,
+            local_image_path: None,
+            provider: None,
+        }
+    }
+
+    #[test]
+    fn merge_members_does_not_dump_full_group_roster_when_lyrics_are_untagged() {
+        let profiles = vec![profile("Bang Chan"), profile("Woojin")];
+        assert!(merge_members(&[], &profiles).is_empty());
+    }
+
+    #[test]
+    fn apply_member_profiles_keeps_only_members_referenced_in_lyrics() {
+        let lines = vec![LyricLine {
+            id: None,
+            song_id: None,
+            index: 0,
+            member: Some("Felix".into()),
+            original: "line".into(),
+            romanization: None,
+            english: None,
+            with_all: false,
+            segments: Vec::new(),
+        }];
+        let members = vec![profile("Felix")];
+        let profiles = vec![
+            MemberProfile {
+                image_url: Some("https://example.test/felix.jpg".into()),
+                ..profile("Felix")
+            },
+            MemberProfile {
+                image_url: Some("https://example.test/woojin.jpg".into()),
+                ..profile("Woojin")
+            },
+        ];
+        let merged = apply_member_profiles(&members, &profiles, &lines);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].stage_name, "Felix");
+        assert_eq!(
+            restrict_members_to_lines(&profiles, &lines)
+                .iter()
+                .map(|member| member.stage_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Felix"]
+        );
+    }
+
+    #[test]
+    fn restrict_members_to_lines_resolves_abbreviated_singer_tags() {
+        let lines = vec![LyricLine {
+            id: None,
+            song_id: None,
+            index: 0,
+            member: Some("H, FL".into()),
+            original: "line".into(),
+            romanization: None,
+            english: None,
+            with_all: false,
+            segments: Vec::new(),
+        }];
+        let profiles = vec![profile("HAN"), profile("Felix"), profile("Woojin")];
+        let filtered = restrict_members_to_lines(&profiles, &lines);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|member| member.stage_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["HAN", "Felix"]
+        );
+    }
 }

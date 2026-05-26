@@ -4,6 +4,7 @@ use html_escape::decode_html_entities;
 use regex::Regex;
 use reqwest::blocking::Client;
 use scraper::{ElementRef, Html, Node, Selector};
+use serde::Deserialize;
 use strsim::jaro_winkler;
 
 use crate::models::{LyricLine, LyricSegment, MemberProfile, Song, SongPackage};
@@ -29,11 +30,38 @@ impl Default for ColorCodedLyricsProvider {
 
 impl LyricsProvider for ColorCodedLyricsProvider {
     fn fetch(&self, query: &str) -> Result<SongPackage> {
-        let search_url = format!("https://colorcodedlyrics.com/?s={}", urlencoding(query));
-        let search_html = self.client.get(search_url).send()?.text()?;
-        let document = Html::parse_document(&search_html);
-        let link = select_best_colorcodedlyrics_link(&document, query)
-            .ok_or_else(|| anyhow!("ColorCodedLyrics result not found"))?;
+        let mut best: Option<(f64, String)> = None;
+        let mut consider = |score: f64, link: String| {
+            if best
+                .as_ref()
+                .map(|(best_score, _)| score > *best_score)
+                .unwrap_or(true)
+            {
+                best = Some((score, link));
+            }
+        };
+
+        for search_query in lyrics_search_queries(query) {
+            let search_url = format!(
+                "https://colorcodedlyrics.com/?s={}",
+                urlencoding(&search_query)
+            );
+            let search_html = self.client.get(search_url).send()?.text()?;
+            let document = Html::parse_document(&search_html);
+            if let Some((score, link)) = rank_best_colorcodedlyrics_link(&document, query) {
+                consider(score, link);
+            }
+        }
+
+        for slug in colorcodedlyrics_slug_candidates(query) {
+            if let Some((link, title)) = lookup_colorcodedlyrics_by_slug(&self.client, &slug) {
+                let score = score_colorcodedlyrics_match(query, &title, &link);
+                consider(score, link);
+            }
+        }
+
+        let (_, link) =
+            best.ok_or_else(|| anyhow!("ColorCodedLyrics result not found for {query}"))?;
         let html = self.client.get(&link).send()?.text()?;
         parse_colorcodedlyrics_html(&html, Some(link))
     }
@@ -100,10 +128,11 @@ pub fn parse_colorcodedlyrics_html(html: &str, source_url: Option<String>) -> Re
 
     let content_html = first_selector_html(&document, &[".entry-content", "article", "body"])
         .ok_or_else(|| anyhow!("No lyric content found"))?;
-    let (lines, color_members) = parse_colorcodedlyrics_content(&content_html);
+    let (mut lines, color_members) = parse_colorcodedlyrics_content(&content_html);
     if lines.is_empty() {
         return Err(anyhow!("No ColorCodedLyrics lines parsed"));
     }
+    canonicalize_line_member_names(&mut lines, &color_members);
     let (artist, title) = split_artist_title(&title);
     Ok(SongPackage {
         song: Song {
@@ -113,11 +142,7 @@ pub fn parse_colorcodedlyrics_html(html: &str, source_url: Option<String>) -> Re
             group_name: Some(artist),
             source_url,
         },
-        members: if color_members.is_empty() {
-            members_from_lines(&lines)
-        } else {
-            color_members
-        },
+        members: members_for_lines(&lines, &color_members),
         lines,
         provider: "colorcodedlyrics".into(),
     })
@@ -185,6 +210,7 @@ fn parse_plain_lines(raw: &str) -> Vec<LyricLine> {
                 original: text,
                 romanization: None,
                 english: None,
+                with_all: false,
                 segments: Vec::new(),
             }
         })
@@ -195,12 +221,14 @@ fn parse_colorcodedlyrics_content(html: &str) -> (Vec<LyricLine>, Vec<MemberProf
     let color_span_re =
         Regex::new(r#"(?is)<span[^>]*style="[^"]*color:\s*([^;"']+)[^"]*"[^>]*>(.*?)</span>"#)
             .expect("valid regex");
-    let br_re = Regex::new(r#"(?i)<br\s*/?>"#).expect("valid regex");
     let blocks = content_blocks(html);
 
     let mut color_names: Vec<(String, String)> = Vec::new();
     for block_html in &blocks {
         let block_text = strip_tags(block_html);
+        if looks_like_credits_block(&block_text) {
+            continue;
+        }
         let spans: Vec<(String, String)> = color_span_re
             .captures_iter(block_html)
             .filter_map(|cap| {
@@ -215,15 +243,10 @@ fn parse_colorcodedlyrics_content(html: &str) -> (Vec<LyricLine>, Vec<MemberProf
             .collect();
         if spans.len() >= 2
             && block_text.len() < 160
-            && spans.iter().all(|(_, text)| {
-                text.split_whitespace().count() <= 3
-                    && text.chars().all(|ch| {
-                        ch.is_alphabetic() || ch.is_whitespace() || ch == '-' || ch == '_'
-                    })
-            })
+            && looks_like_member_legend(&spans)
+            && spans.len() > color_names.len()
         {
             color_names = spans;
-            break;
         }
     }
 
@@ -259,42 +282,30 @@ fn parse_colorcodedlyrics_content(html: &str) -> (Vec<LyricLine>, Vec<MemberProf
     let mut lines = Vec::new();
     for block_html in &blocks {
         let block_text = strip_tags(block_html);
-        let marker = block_text.trim().to_lowercase();
-        if marker == "english" || marker == "romanization" || marker == "korean" {
+        if let Some(marker) = parse_language_marker(block_html, &block_text) {
             if !lines.is_empty() {
                 break;
             }
             active_language = Some(marker);
             continue;
         }
-        if marker.contains("credits") || marker.contains("disclaimer") {
+        if block_text.to_lowercase().contains("credits")
+            || block_text.to_lowercase().contains("disclaimer")
+        {
             break;
         }
         if active_language.is_none() {
             continue;
         }
 
-        let spans: Vec<_> = color_span_re.captures_iter(block_html).collect();
-        if spans.is_empty() {
-            for text in html_lines(block_html, &br_re) {
-                push_lyric_line(&mut lines, None, text);
-            }
-            continue;
-        }
-
-        for span in spans {
-            let color = span
-                .get(1)
-                .and_then(|value| normalize_color(value.as_str()));
-            let member = color
-                .as_deref()
-                .and_then(|value| color_to_member.get(value).cloned());
-            let Some(span_html) = span.get(2).map(|value| value.as_str()) else {
-                continue;
-            };
-            for text in html_lines(span_html, &br_re) {
-                push_lyric_line(&mut lines, member.clone(), text);
-            }
+        for column_line in parsed_lines_from_block(block_html) {
+            let member = aggregate_members(Some(&column_line), &color_to_member);
+            push_lyric_line(
+                &mut lines,
+                member,
+                column_line.text,
+                active_language.as_deref(),
+            );
         }
     }
 
@@ -311,6 +322,394 @@ fn clean_member_name(value: &str) -> String {
         .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '/' || ch.is_whitespace())
         .trim()
         .to_string()
+}
+
+fn looks_like_credits_block(block_text: &str) -> bool {
+    let lower = block_text.to_lowercase();
+    lower.contains("작사")
+        || lower.contains("작곡")
+        || lower.contains("편곡")
+        || lower.contains("lyrics/")
+        || lower.contains("composer/")
+        || lower.contains("arranger/")
+}
+
+fn looks_like_member_legend(spans: &[(String, String)]) -> bool {
+    let unique_colors: std::collections::HashSet<&str> =
+        spans.iter().map(|(color, _)| color.as_str()).collect();
+    if unique_colors.len() < spans.len() {
+        return false;
+    }
+    spans.iter().all(|(_, text)| {
+        let text = clean_member_name(text);
+        text.split_whitespace().count() <= 3
+            && is_latin_member_name(&text)
+            && looks_like_stage_name(&text)
+    })
+}
+
+fn looks_like_stage_name(text: &str) -> bool {
+    text.split_whitespace().any(|word| {
+        word.chars()
+            .find(|ch| ch.is_alphabetic())
+            .map(|ch| ch.is_uppercase())
+            .unwrap_or(false)
+    })
+}
+
+fn is_latin_member_name(text: &str) -> bool {
+    let stripped: String = text
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && *ch != ','
+                && *ch != '.'
+                && *ch != '-'
+                && *ch != '_'
+                && *ch != '&'
+        })
+        .collect();
+    !stripped.is_empty()
+        && stripped
+            .chars()
+            .all(|ch| ch.is_ascii_alphabetic() || ch.is_ascii_digit())
+}
+
+pub fn referenced_member_names(lines: &[LyricLine]) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in lines {
+        if let Some(member) = &line.member {
+            push_member_names(&mut names, member);
+        }
+        for segment in &line.segments {
+            if let Some(member) = &segment.member {
+                push_member_names(&mut names, member);
+            }
+        }
+    }
+    names
+}
+
+fn member_aliases(member: &MemberProfile) -> Vec<String> {
+    let mut aliases = vec![member.stage_name.clone()];
+    if let Some(real_name) = &member.real_name {
+        aliases.push(real_name.clone());
+    }
+    match member.stage_name.to_ascii_uppercase().as_str() {
+        "HAN" => aliases.push("한".into()),
+        "FELIX" => aliases.extend(["필릭스".to_string(), "필".to_string()]),
+        _ => {}
+    }
+    aliases
+}
+
+pub fn member_reference_matches(raw: &str, member: &MemberProfile, roster: &[MemberProfile]) -> bool {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    if raw.eq_ignore_ascii_case("all") {
+        return false;
+    }
+    if member_aliases(member)
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(raw))
+    {
+        return true;
+    }
+    resolve_member_name(raw, roster)
+        .is_some_and(|resolved| resolved.eq_ignore_ascii_case(&member.stage_name))
+}
+
+pub fn canonical_member_name(raw: &str, roster: &[MemberProfile]) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    if let Some(resolved) = resolve_member_name(raw, roster) {
+        return Some(resolved);
+    }
+    roster
+        .iter()
+        .find(|member| member_reference_matches(raw, member, roster))
+        .map(|member| member.stage_name.clone())
+}
+
+pub fn canonical_referenced_members(lines: &[LyricLine], roster: &[MemberProfile]) -> Vec<String> {
+    let mut names = Vec::new();
+    for raw in referenced_member_names(lines) {
+        if let Some(name) = canonical_member_name(&raw, roster) {
+            if !names
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&name))
+            {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+pub fn canonicalize_line_member_names(lines: &mut [LyricLine], roster: &[MemberProfile]) {
+    for line in lines.iter_mut() {
+        if let Some(member) = line.member.clone() {
+            let canonical: Vec<String> = member
+                .split(',')
+                .filter_map(|part| canonical_member_name(part, roster))
+                .collect();
+            line.member = (!canonical.is_empty()).then(|| canonical.join(", "));
+        }
+        for segment in &mut line.segments {
+            if let Some(member) = segment.member.clone() {
+                segment.member = canonical_member_name(&member, roster);
+            }
+        }
+    }
+}
+
+fn push_member_names(names: &mut Vec<String>, raw: &str) {
+    for part in raw.split(',') {
+        let name = clean_member_name(part);
+        if name.is_empty() || name.eq_ignore_ascii_case("all") {
+            continue;
+        }
+        if names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        names.push(name);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberHighlight {
+    pub primary: Vec<String>,
+    pub backing: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberLineTag {
+    pub parts: Vec<String>,
+    pub with_all: bool,
+}
+
+pub fn strip_member_line_tag(text: &str) -> (String, MemberLineTag) {
+    static TAG_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = TAG_RE.get_or_init(|| Regex::new(r"(?i)^\[\s*([^\]]+?)\s*\]\s*").expect("valid regex"));
+    let trimmed = text.trim();
+    let Some(captures) = re.captures(trimmed) else {
+        return (
+            trimmed.to_string(),
+            MemberLineTag {
+                parts: Vec::new(),
+                with_all: false,
+            },
+        );
+    };
+    let parts: Vec<String> = captures
+        .get(1)
+        .map(|value| value.as_str())
+        .unwrap_or_default()
+        .split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    let cleaned = re.replace(trimmed, "").trim().to_string();
+    let with_all = parts.iter().any(|part| part.eq_ignore_ascii_case("all"));
+    (cleaned, MemberLineTag { parts, with_all })
+}
+
+pub fn strip_member_singer_tag(text: &str) -> (String, Option<String>, bool) {
+    let (cleaned, tag) = strip_member_line_tag(text);
+    if tag.parts.is_empty() {
+        return (cleaned, None, false);
+    }
+    let primary = tag.parts.first().cloned();
+    (cleaned, primary, tag.with_all)
+}
+
+pub fn normalize_line_member_tags(line: &mut LyricLine) {
+    let mut with_all = line.with_all;
+    let mut named_parts = Vec::new();
+
+    let mut apply_tag = |text: &str| -> String {
+        let (cleaned, tag) = strip_member_line_tag(text);
+        if tag.with_all {
+            with_all = true;
+            if line.member.is_none() {
+                line.member = tag.parts.first().cloned();
+            }
+        } else if tag.parts.len() >= 2 {
+            for part in tag.parts {
+                if !named_parts
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(&part))
+                {
+                    named_parts.push(part);
+                }
+            }
+        }
+        cleaned
+    };
+
+    line.original = apply_tag(&line.original);
+    if let Some(romanization) = line.romanization.take() {
+        line.romanization = Some(apply_tag(&romanization)).filter(|text| !text.is_empty());
+    }
+    if let Some(english) = line.english.take() {
+        line.english = Some(apply_tag(&english)).filter(|text| !text.is_empty());
+    }
+    for segment in &mut line.segments {
+        segment.text = apply_tag(&segment.text);
+    }
+
+    line.with_all = with_all;
+    if !named_parts.is_empty() {
+        line.member = Some(named_parts.join(", "));
+    }
+}
+
+fn member_initials(name: &str) -> String {
+    name.split(|ch: char| ch.is_whitespace() || ch == '.')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.chars().find(|ch| ch.is_alphabetic()))
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect()
+}
+
+fn is_consonant(ch: char) -> bool {
+    matches!(
+        ch.to_ascii_lowercase(),
+        'b' | 'c' | 'd' | 'f' | 'g' | 'h' | 'j' | 'k' | 'l' | 'm' | 'n' | 'p' | 'q' | 'r'
+            | 's' | 't' | 'v' | 'w' | 'x' | 'y' | 'z'
+    )
+}
+
+fn single_word_two_char_abbrev(name: &str) -> String {
+    let letters: Vec<char> = name.chars().filter(|ch| ch.is_alphabetic()).collect();
+    if letters.len() < 2 {
+        return letters
+            .first()
+            .map(|ch| ch.to_ascii_uppercase().to_string())
+            .unwrap_or_default();
+    }
+    let first = letters[0].to_ascii_uppercase();
+    for ch in letters.iter().skip(1) {
+        if is_consonant(*ch) {
+            return format!("{first}{}", ch.to_ascii_uppercase());
+        }
+    }
+    format!("{first}{}", letters[1].to_ascii_uppercase())
+}
+
+fn member_abbreviations(name: &str) -> Vec<String> {
+    let mut abbrevs = vec![name.to_string()];
+    let initials = member_initials(name);
+    if !initials.is_empty() {
+        abbrevs.push(initials);
+    }
+    if name.split_whitespace().count() == 1 {
+        abbrevs.push(single_word_two_char_abbrev(name));
+        if let Some(ch) = name.chars().next() {
+            abbrevs.push(ch.to_string());
+            abbrevs.push(ch.to_ascii_uppercase().to_string());
+        }
+    }
+    abbrevs.sort_by_key(|value| value.len());
+    abbrevs.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    abbrevs
+}
+
+pub fn resolve_member_name(tag: &str, roster: &[MemberProfile]) -> Option<String> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    if let Some(member) = roster
+        .iter()
+        .find(|member| member.stage_name.eq_ignore_ascii_case(tag))
+    {
+        return Some(member.stage_name.clone());
+    }
+
+    let mut matches: Vec<&MemberProfile> = roster
+        .iter()
+        .filter(|member| {
+            member_abbreviations(&member.stage_name)
+                .iter()
+                .any(|abbrev| abbrev.eq_ignore_ascii_case(tag))
+        })
+        .collect();
+
+    if matches.len() > 1 && tag.len() == 1 {
+        matches.retain(|member| {
+            member.stage_name.split_whitespace().count() == 1
+                && member.stage_name.chars().count() <= 4
+        });
+    }
+
+    if matches.len() == 1 {
+        return Some(matches[0].stage_name.clone());
+    }
+
+    None
+}
+
+fn push_highlight_name(names: &mut Vec<String>, roster: &[MemberProfile], raw: &str) {
+    let resolved = resolve_member_name(raw, roster).unwrap_or_else(|| raw.to_string());
+    if names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&resolved))
+    {
+        return;
+    }
+    names.push(resolved);
+}
+
+pub fn member_highlight_for_line(line: &LyricLine, roster: &[MemberProfile]) -> MemberHighlight {
+    if line.with_all {
+        let mut primary = Vec::new();
+        if let Some(member) = &line.member {
+            push_highlight_name(&mut primary, roster, member);
+        }
+        let backing = roster
+            .iter()
+            .map(|member| member.stage_name.clone())
+            .filter(|name| !primary.iter().any(|primary| primary.eq_ignore_ascii_case(name)))
+            .collect();
+        return MemberHighlight { primary, backing };
+    }
+
+    MemberHighlight {
+        primary: referenced_member_names(std::slice::from_ref(line))
+            .into_iter()
+            .map(|name| resolve_member_name(&name, roster).unwrap_or(name))
+            .collect(),
+        backing: Vec::new(),
+    }
+}
+
+pub fn members_for_lines(lines: &[LyricLine], legend: &[MemberProfile]) -> Vec<MemberProfile> {
+    let referenced = referenced_member_names(lines);
+    if referenced.is_empty() {
+        return members_from_lines(lines);
+    }
+    if legend.is_empty() {
+        return members_from_lines(lines);
+    }
+
+    legend
+        .iter()
+        .filter(|member| {
+            referenced
+                .iter()
+                .any(|raw| member_reference_matches(raw, member, legend))
+        })
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -393,8 +792,13 @@ fn parse_colorcodedlyrics_columns(
                 english: english
                     .map(|line| line.text.trim().to_string())
                     .filter(|text| !text.is_empty()),
+                with_all: false,
                 segments: lyric_segments(roman, korean, english, color_to_member),
             });
+            if let Some(line) = lines.last_mut() {
+                inherit_members_on_segments(line);
+                normalize_line_member_tags(line);
+            }
         }
     }
 
@@ -408,11 +812,8 @@ fn parse_lyric_column(column: ElementRef<'_>) -> Option<(String, Vec<Vec<ParsedC
     for paragraph in column.select(&paragraph_selector) {
         let marker = strip_tags(&paragraph.html()).trim().to_lowercase();
         if language.is_none() {
-            if matches!(
-                marker.as_str(),
-                "romanization" | "hangul" | "korean" | "translation" | "english"
-            ) {
-                language = Some(marker);
+            if let Some(parsed) = parse_language_marker(&paragraph.html(), &marker) {
+                language = Some(parsed);
             }
             continue;
         }
@@ -574,6 +975,13 @@ fn push_lyric_segments(
                     .and_then(|value| color_to_member.get(value).cloned()),
                 color: Some(color),
             });
+        } else if !line.text.trim().is_empty() {
+            output.push(LyricSegment {
+                language: language.to_string(),
+                text: line.text.clone(),
+                member: None,
+                color: None,
+            });
         }
         return;
     }
@@ -585,6 +993,14 @@ fn push_lyric_segments(
             .is_none()
         && line.color.is_none()
     {
+        if !line.text.trim().is_empty() {
+            output.push(LyricSegment {
+                language: language.to_string(),
+                text: line.text.clone(),
+                member: None,
+                color: None,
+            });
+        }
         return;
     }
     for segment in &line.segments {
@@ -600,14 +1016,45 @@ fn push_lyric_segments(
     }
 }
 
-fn select_best_colorcodedlyrics_link(document: &Html, query: &str) -> Option<String> {
-    let selector = Selector::parse("h2 a, article a, .entry-title a").ok()?;
-    let query_key = search_key(query);
-    let tokens: Vec<String> = query_key
-        .split_whitespace()
-        .filter(|token| token.len() > 1)
-        .map(ToOwned::to_owned)
+fn inherit_members_on_segments(line: &mut LyricLine) {
+    let Some(line_member) = line.member.clone() else {
+        return;
+    };
+    let reference_members: Vec<(String, String)> = line
+        .segments
+        .iter()
+        .filter(|segment| segment.language == "original" || segment.language == "romanization")
+        .filter_map(|segment| {
+            segment
+                .member
+                .as_ref()
+                .and_then(|member| segment.color.as_ref().map(|color| (member.clone(), color.clone())))
+        })
         .collect();
+    for segment in &mut line.segments {
+        if segment.member.is_some() {
+            continue;
+        }
+        if segment.language == "english" {
+            if reference_members.len() == 1 {
+                let (member, color) = &reference_members[0];
+                segment.member = Some(member.clone());
+                if segment.color.is_none() {
+                    segment.color = Some(color.clone());
+                }
+            } else if !line_member.contains(',') {
+                segment.member = Some(line_member.clone());
+            }
+        }
+    }
+}
+
+fn select_best_colorcodedlyrics_link(document: &Html, query: &str) -> Option<String> {
+    rank_best_colorcodedlyrics_link(document, query).map(|(_, href)| href)
+}
+
+fn rank_best_colorcodedlyrics_link(document: &Html, query: &str) -> Option<(f64, String)> {
+    let selector = Selector::parse("h2 a, article a, .entry-title a").ok()?;
 
     document
         .select(&selector)
@@ -617,17 +1064,7 @@ fn select_best_colorcodedlyrics_link(document: &Html, query: &str) -> Option<Str
                 return None;
             }
             let text = node.text().collect::<Vec<_>>().join(" ");
-            let text_key = search_key(&text);
-            let href_key = search_key(href);
-            let candidate_key = format!("{text_key} {href_key}");
-            let mut score = jaro_winkler(&query_key, &text_key);
-            if !tokens.is_empty() {
-                let covered = tokens
-                    .iter()
-                    .filter(|token| candidate_key.contains(token.as_str()))
-                    .count() as f64;
-                score += covered / tokens.len() as f64;
-            }
+            let score = score_colorcodedlyrics_match(query, &text, href);
             Some((score, href.to_string()))
         })
         .max_by(|left, right| {
@@ -635,7 +1072,217 @@ fn select_best_colorcodedlyrics_link(document: &Html, query: &str) -> Option<Str
                 .partial_cmp(&right.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .map(|(_, href)| href)
+}
+
+fn score_colorcodedlyrics_match(query: &str, title: &str, href: &str) -> f64 {
+    let query_key = search_key(query);
+    let text_key = search_key(title);
+    let href_key = search_key(href);
+    let candidate_key = format!("{text_key} {href_key}");
+    let mut score = jaro_winkler(&query_key, &text_key);
+    let song_tokens = song_search_tokens(query);
+    if !song_tokens.is_empty() {
+        let song_hits = song_tokens
+            .iter()
+            .filter(|token| token_matches_candidate(token, &candidate_key))
+            .count() as f64;
+        let song_coverage = song_hits / song_tokens.len() as f64;
+        score += song_coverage * 3.0;
+        if song_hits == 0.0 {
+            score -= 1.5;
+        }
+    }
+    score
+}
+
+#[derive(Debug, Deserialize)]
+struct ColorCodedLyricsPost {
+    link: String,
+    title: ColorCodedLyricsPostTitle,
+}
+
+#[derive(Debug, Deserialize)]
+struct ColorCodedLyricsPostTitle {
+    rendered: String,
+}
+
+fn lookup_colorcodedlyrics_by_slug(client: &Client, slug: &str) -> Option<(String, String)> {
+    let url = format!(
+        "https://colorcodedlyrics.com/wp-json/wp/v2/posts?slug={}&_fields=link,title&per_page=1",
+        urlencoding(slug)
+    );
+    let posts: Vec<ColorCodedLyricsPost> = client.get(url).send().ok()?.json().ok()?;
+    let post = posts.first()?;
+    Some((post.link.clone(), post.title.rendered.clone()))
+}
+
+fn slugify_colorcodedlyrics(value: &str) -> String {
+    search_key(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn push_slug_candidate(slugs: &mut Vec<String>, value: &str) {
+    let slug = slugify_colorcodedlyrics(value);
+    if slug.is_empty() || slugs.iter().any(|existing| existing == &slug) {
+        return;
+    }
+    slugs.push(slug);
+}
+
+fn colorcodedlyrics_slug_candidates(query: &str) -> Vec<String> {
+    let mut slugs = Vec::new();
+    push_slug_candidate(&mut slugs, query);
+
+    let (artist, title) = split_video_query(query);
+    if let Some(artist) = artist {
+        push_slug_candidate(&mut slugs, &format!("{artist} {title}"));
+        push_slug_candidate(&mut slugs, &format!("{artist} {}", strip_parentheticals(&title)));
+        for phrase in parenthetical_phrases(&title) {
+            push_slug_candidate(&mut slugs, &format!("{artist} {phrase}"));
+        }
+        return slugs;
+    }
+
+    let words: Vec<_> = query.split_whitespace().collect();
+    if words.len() >= 2 {
+        let artist = words[0];
+        let title = words[1..].join(" ");
+        push_slug_candidate(&mut slugs, &format!("{artist} {title}"));
+    }
+
+    slugs
+}
+
+fn lyrics_search_queries(query: &str) -> Vec<String> {
+    let mut queries = vec![query.trim().to_string()];
+    let (artist, title) = split_video_query(query);
+    let Some(artist) = artist else {
+        return dedupe_queries(queries);
+    };
+
+    for romanization in parenthetical_phrases(&title) {
+        queries.push(format!("{artist} {romanization}"));
+        for suffix in ["teuk", "teug"] {
+            queries.push(format!("{artist} {romanization} {suffix}"));
+        }
+    }
+
+    if title.contains(|ch: char| ('\u{AC00}'..='\u{D7A3}').contains(&ch)) {
+        for suffix in ["teuk", "teug"] {
+            queries.push(format!("{artist} {suffix}"));
+        }
+        let hangul_title = strip_parentheticals(&title);
+        if !hangul_title.is_empty() {
+            queries.push(format!("{artist} {hangul_title}"));
+        }
+    }
+
+    dedupe_queries(queries)
+}
+
+fn dedupe_queries(queries: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    queries
+        .into_iter()
+        .filter(|query| {
+            let key = search_key(query);
+            !key.is_empty() && seen.insert(key)
+        })
+        .collect()
+}
+
+fn split_video_query(query: &str) -> (Option<String>, String) {
+    let cleaned = query.trim();
+    if let Some((artist, title)) = cleaned
+        .split_once(" – ")
+        .or_else(|| cleaned.split_once(" - "))
+    {
+        return (Some(artist.trim().to_string()), title.trim().to_string());
+    }
+    if let Some(caps) = Regex::new(r"^(.+?\([^)]+\))\s+(.+)$")
+        .ok()
+        .and_then(|re| re.captures(cleaned))
+    {
+        return (
+            Some(caps[1].trim().to_string()),
+            caps[2].trim().to_string(),
+        );
+    }
+    if let Some(caps) = Regex::new(r"^(.+?)\s+([\p{Hangul}].*)$")
+        .ok()
+        .and_then(|re| re.captures(cleaned))
+    {
+        return (
+            Some(caps[1].trim().to_string()),
+            caps[2].trim().to_string(),
+        );
+    }
+    (None, cleaned.to_string())
+}
+
+fn parenthetical_phrases(value: &str) -> Vec<String> {
+    Regex::new(r"\(([^)]+)\)")
+        .ok()
+        .map(|re| {
+            re.captures_iter(value)
+                .filter_map(|cap| cap.get(1).map(|part| part.as_str().trim().to_string()))
+                .filter(|part| !part.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn strip_parentheticals(value: &str) -> String {
+    Regex::new(r"\([^)]*\)")
+        .ok()
+        .map(|re| re.replace_all(value, " ").to_string())
+        .unwrap_or_else(|| value.to_string())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn song_search_tokens(query: &str) -> Vec<String> {
+    let (_, title) = split_video_query(query);
+    let mut tokens = Vec::new();
+    for phrase in parenthetical_phrases(&title) {
+        push_search_token(&mut tokens, &search_key(&phrase));
+        push_search_token(&mut tokens, &phrase.to_lowercase().replace(' ', "-"));
+    }
+    for token in search_key(&strip_parentheticals(&title)).split_whitespace() {
+        if token.len() > 1 {
+            push_search_token(&mut tokens, token);
+        }
+    }
+    tokens
+}
+
+fn push_search_token(tokens: &mut Vec<String>, token: &str) {
+    let token = token.trim();
+    if token.is_empty() {
+        return;
+    }
+    if tokens
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(token))
+    {
+        return;
+    }
+    tokens.push(token.to_string());
+}
+
+fn token_matches_candidate(token: &str, candidate: &str) -> bool {
+    if candidate.contains(token) {
+        return true;
+    }
+    let compact = token.replace([' ', '-', '_'], "");
+    if compact.len() > 2 && candidate.replace([' ', '-', '_'], "").contains(&compact) {
+        return true;
+    }
+    let hyphenated = token.replace(' ', "-");
+    candidate.contains(&hyphenated)
 }
 
 fn search_key(value: &str) -> String {
@@ -674,31 +1321,81 @@ fn content_blocks(html: &str) -> Vec<String> {
     blocks.into_iter().map(|(_, block)| block).collect()
 }
 
-fn push_lyric_line(lines: &mut Vec<LyricLine>, member: Option<String>, text: String) {
+fn parse_language_marker(block_html: &str, block_text: &str) -> Option<String> {
+    if let Some(language) = normalize_language_marker(&block_text.trim().to_lowercase()) {
+        return Some(language);
+    }
+    let class_marker_re = Regex::new(
+        r#"(?is)<span[^>]*has-very-light-gray-color[^>]*>(.*?)</span>"#,
+    )
+    .ok()?;
+    for cap in class_marker_re.captures_iter(block_html) {
+        let marker = strip_tags(cap.get(1)?.as_str()).trim().to_lowercase();
+        if let Some(language) = normalize_language_marker(&marker) {
+            return Some(language);
+        }
+    }
+    None
+}
+
+fn normalize_language_marker(marker: &str) -> Option<String> {
+    match marker {
+        "english" | "translation" => Some("english".into()),
+        "romanization" => Some("romanization".into()),
+        "hangul" | "korean" => Some("korean".into()),
+        _ => None,
+    }
+}
+
+pub fn lyric_language_toggles(lines: &[LyricLine]) -> (bool, bool, bool) {
+    let has_original = lines.iter().any(|line| !line.original.trim().is_empty());
+    let has_romanization = lines.iter().any(|line| {
+        line.romanization
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+    });
+    let has_english = lines.iter().any(|line| {
+        line.english
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+    });
+    (
+        has_original,
+        has_romanization,
+        has_english,
+    )
+}
+
+fn push_lyric_line(
+    lines: &mut Vec<LyricLine>,
+    member: Option<String>,
+    text: String,
+    language: Option<&str>,
+) {
     let text = text.trim();
     if text.is_empty() || looks_like_metadata(text) {
         return;
     }
-    lines.push(LyricLine {
+    let mut line = LyricLine {
         id: None,
         song_id: None,
         index: lines.len(),
         member,
-        original: text.to_string(),
+        original: String::new(),
         romanization: None,
         english: None,
+        with_all: false,
         segments: Vec::new(),
-    });
-}
-
-fn html_lines(html: &str, br_re: &Regex) -> Vec<String> {
-    br_re
-        .replace_all(html, "\n")
-        .lines()
-        .map(strip_tags)
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .collect()
+    };
+    match language {
+        Some("english") => line.english = Some(text.to_string()),
+        Some("romanization") => line.romanization = Some(text.to_string()),
+        _ => line.original = text.to_string(),
+    }
+    lines.push(line);
+    if let Some(line) = lines.last_mut() {
+        normalize_line_member_tags(line);
+    }
 }
 
 fn strip_tags(html: &str) -> String {
@@ -791,9 +1488,14 @@ fn urlencoding(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_colorcodedlyrics_html, parse_genius_html, parse_manual_lyrics,
-        select_best_colorcodedlyrics_link,
+        canonicalize_line_member_names, colorcodedlyrics_slug_candidates, ColorCodedLyricsProvider,
+        lyric_language_toggles, lyrics_search_queries, member_highlight_for_line, members_for_lines,
+        normalize_line_member_tags, parse_colorcodedlyrics_html, parse_genius_html,
+        parse_manual_lyrics, rank_best_colorcodedlyrics_link, resolve_member_name,
+        score_colorcodedlyrics_match, select_best_colorcodedlyrics_link, song_search_tokens,
+        strip_member_line_tag, strip_member_singer_tag, LyricsProvider,
     };
+    use crate::models::{LyricLine, MemberProfile};
     use scraper::Html;
 
     #[test]
@@ -828,7 +1530,11 @@ mod tests {
         assert_eq!(package.lines.len(), 3);
         assert_eq!(package.lines[0].member.as_deref(), Some("Sakura"));
         assert_eq!(package.lines[2].member.as_deref(), Some("Chaewon"));
-        assert_eq!(package.lines[0].original, "On my chest");
+        assert_eq!(
+            package.lines[0].english.as_deref(),
+            Some("On my chest")
+        );
+        assert!(package.lines[0].original.is_empty());
     }
 
     #[test]
@@ -847,7 +1553,11 @@ mod tests {
         "##;
         let package = parse_colorcodedlyrics_html(html, None).unwrap();
         assert_eq!(package.lines.len(), 2);
-        assert_eq!(package.lines[0].original, "Baby say goodbye if you see her");
+        assert_eq!(
+            package.lines[0].romanization.as_deref(),
+            Some("Baby say goodbye if you see her")
+        );
+        assert!(package.lines[0].original.is_empty());
         assert!(package
             .lines
             .iter()
@@ -878,7 +1588,14 @@ mod tests {
             </div>
         "##;
         let package = parse_colorcodedlyrics_html(html, None).unwrap();
-        assert_eq!(package.members[1].stage_name, "Haewon");
+        assert_eq!(
+            package
+                .members
+                .iter()
+                .map(|member| member.stage_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Haewon", "Jiwoo"]
+        );
         assert_eq!(package.lines.len(), 2);
         assert_eq!(package.lines[1].member.as_deref(), Some("Jiwoo"));
         assert_eq!(package.lines[1].original, "어린 맘속 헤매던 cosmos");
@@ -1005,6 +1722,22 @@ mod tests {
     }
 
     #[test]
+    fn builds_slug_candidate_for_twice_this_is_for() {
+        let slugs = colorcodedlyrics_slug_candidates("TWICE THIS IS FOR");
+        assert!(slugs.iter().any(|slug| slug == "twice-this-is-for"));
+    }
+
+    #[test]
+    fn scores_twice_this_is_for_slug_match_high() {
+        let score = score_colorcodedlyrics_match(
+            "TWICE THIS IS FOR",
+            "TWICE - THIS IS FOR",
+            "https://colorcodedlyrics.com/2025/07/11/twice-this-is-for/",
+        );
+        assert!(score > 0.8);
+    }
+
+    #[test]
     fn selects_best_colorcodedlyrics_search_result() {
         let html = r#"
             <article><h2><a href="https://colorcodedlyrics.com/2026/05/01/nmixx-loud/">NMIXX - LOUD</a></h2></article>
@@ -1014,6 +1747,339 @@ mod tests {
         let link =
             select_best_colorcodedlyrics_link(&document, "NMIXX(엔믹스) Heavy Serenade").unwrap();
         assert!(link.ends_with("/nmixx-heavy-serenade/"));
+    }
+
+    #[test]
+    fn prefers_s_class_over_other_stray_kids_results() {
+        let html = r#"
+            <article><h2><a href="https://colorcodedlyrics.com/2025/08/22/stray-kids-mess-eongmang/">Stray Kids - MESS (엉망)</a></h2></article>
+            <article><h2><a href="https://colorcodedlyrics.com/2023/06/01/stray-kids-s-class-teug/">Stray Kids - S-Class (특)</a></h2></article>
+        "#;
+        let document = Html::parse_document(html);
+        let link =
+            select_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)").unwrap();
+        assert!(link.ends_with("/stray-kids-s-class-teug/"));
+    }
+
+    #[test]
+    fn builds_teuk_search_variants_for_hangul_titles() {
+        let queries = lyrics_search_queries("Stray Kids 특(S-Class)");
+        assert!(queries.iter().any(|query| query.contains("S-Class")));
+        assert!(queries.iter().any(|query| query.contains("teuk")));
+    }
+
+    #[test]
+    fn song_search_tokens_include_parenthetical_title() {
+        let tokens = song_search_tokens("Stray Kids 특(S-Class)");
+        assert!(tokens.iter().any(|token| token.contains("class")));
+    }
+
+    #[test]
+    fn ranks_s_class_above_mess_when_both_present() {
+        let html = r#"
+            <article><h2><a href="https://colorcodedlyrics.com/2025/08/22/stray-kids-mess-eongmang/">Stray Kids - MESS (엉망)</a></h2></article>
+            <article><h2><a href="https://colorcodedlyrics.com/2023/06/01/stray-kids-s-class-teug/">Stray Kids - S-Class (특)</a></h2></article>
+        "#;
+        let document = Html::parse_document(html);
+        let mess = rank_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)").unwrap();
+        let html = r#"
+            <article><h2><a href="https://colorcodedlyrics.com/2025/08/22/stray-kids-mess-eongmang/">Stray Kids - MESS (엉망)</a></h2></article>
+        "#;
+        let document = Html::parse_document(html);
+        let only_mess =
+            rank_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)").unwrap();
+        assert!(mess.0 > only_mess.0);
+        assert!(mess.1.ends_with("/stray-kids-s-class-teug/"));
+    }
+
+    #[test]
+    fn ignores_credits_block_when_selecting_member_legend() {
+        let html = r##"
+            <h1 class="entry-title">Stray Kids - S-Class Lyrics</h1>
+            <div class="entry-content">
+              <p><span style="color: #111">방찬 (3RACHA)</span>, <span style="color: #222">창빈 (3RACHA)</span>, <span style="color: #333">한 (3RACHA)</span></p>
+              <p style="text-align:center"><span style="color: #a">Bang Chan</span>, <span style="color: #b">Lee Know</span>, <span style="color: #c">Changbin</span>, <span style="color: #d">Hyunjin</span>, <span style="color: #e">HAN</span>, <span style="color: #f">Felix</span>, <span style="color: #g">Seungmin</span>, <span style="color: #h">I.N</span></p>
+              <div class="wp-block-columns">
+                <div class="wp-block-column">
+                  <p><strong>Romanization</strong></p>
+                  <p><span style="color: #a">Counting stars</span><br/><span style="color: #b">Everyday</span></p>
+                </div>
+                <div class="wp-block-column">
+                  <p><strong>Hangul</strong></p>
+                  <p><span style="color: #a">카운팅 스타</span><br/><span style="color: #b">에브리데이</span></p>
+                </div>
+              </div>
+            </div>
+        "##;
+        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        assert_eq!(package.members.len(), 2);
+        assert!(package
+            .members
+            .iter()
+            .all(|member| member.stage_name == "Bang Chan" || member.stage_name == "Lee Know"));
+        assert!(!package
+            .members
+            .iter()
+            .any(|member| member.stage_name.contains("방찬")));
+    }
+
+    #[test]
+    fn strips_member_singer_all_tag_from_line_text() {
+        let (cleaned, tag, with_all) =
+            strip_member_singer_tag("[LK/All] bitkkal ppeonjjeok bitkkal ppeonjjeok");
+        assert!(with_all);
+        assert_eq!(tag.as_deref(), Some("LK"));
+        assert_eq!(cleaned, "bitkkal ppeonjjeok bitkkal ppeonjjeok");
+    }
+
+    #[test]
+    fn strips_duet_member_tag_from_line_text() {
+        let (cleaned, tag) = strip_member_line_tag("[H/FL] yeogi modeun goseul balkhyeo");
+        assert!(!tag.with_all);
+        assert_eq!(tag.parts, vec!["H", "FL"]);
+        assert_eq!(cleaned, "yeogi modeun goseul balkhyeo");
+    }
+
+    #[test]
+    fn resolves_common_member_abbreviations() {
+        let roster = vec![
+            profile("Bang Chan", "#5067f3"),
+            profile("Lee Know", "#3ece2b"),
+            profile("HAN", "#e1fa44"),
+            profile("Felix", "#fa231c"),
+            profile("Hyunjin", "#bb71ff"),
+        ];
+        assert_eq!(resolve_member_name("LK", &roster).as_deref(), Some("Lee Know"));
+        assert_eq!(resolve_member_name("H", &roster).as_deref(), Some("HAN"));
+        assert_eq!(resolve_member_name("FL", &roster).as_deref(), Some("Felix"));
+    }
+
+    #[test]
+    fn member_highlight_includes_both_duet_singers() {
+        let roster = vec![
+            profile("HAN", "#e1fa44"),
+            profile("Felix", "#fa231c"),
+            profile("Lee Know", "#3ece2b"),
+        ];
+        let mut line = LyricLine {
+            id: None,
+            song_id: None,
+            index: 0,
+            member: None,
+            original: "여기 모든 곳을 밝혀".into(),
+            romanization: Some("[H/FL] yeogi modeun goseul balkhyeo".into()),
+            english: Some("Shine a light here everywhere".into()),
+            with_all: false,
+            segments: Vec::new(),
+        };
+        normalize_line_member_tags(&mut line);
+        assert_eq!(line.member.as_deref(), Some("H, FL"));
+        assert_eq!(
+            line.romanization.as_deref(),
+            Some("yeogi modeun goseul balkhyeo")
+        );
+
+        let highlight = member_highlight_for_line(&line, &roster);
+        assert_eq!(highlight.primary, vec!["HAN", "Felix"]);
+        assert!(highlight.backing.is_empty());
+    }
+
+    #[test]
+    fn member_highlight_marks_roster_as_backing_for_all_lines() {
+        let roster = vec![
+            profile("Lee Know", "#3ece2b"),
+            profile("Bang Chan", "#5067f3"),
+            profile("Felix", "#f771e5"),
+        ];
+        let mut line = LyricLine {
+            id: None,
+            song_id: None,
+            index: 0,
+            member: Some("Lee Know".into()),
+            original: "빛깔 뻔쩍".into(),
+            romanization: Some("[LK/All] bitkkal ppeonjjeok".into()),
+            english: Some("Flashy, flashy".into()),
+            with_all: false,
+            segments: Vec::new(),
+        };
+        normalize_line_member_tags(&mut line);
+        assert!(line.with_all);
+        assert_eq!(line.romanization.as_deref(), Some("bitkkal ppeonjjeok"));
+
+        let highlight = member_highlight_for_line(&line, &roster);
+        assert_eq!(highlight.primary, vec!["Lee Know"]);
+        assert_eq!(highlight.backing, vec!["Bang Chan", "Felix"]);
+    }
+
+    #[test]
+    fn members_for_lines_deduplicates_abbreviated_singer_tags() {
+        let legend = vec![
+            profile("Bang Chan", "#5067f3"),
+            profile("Lee Know", "#3ece2b"),
+            profile("Changbin", "#ff6a00"),
+            profile("Hyunjin", "#bb71ff"),
+            profile("HAN", "#e1fa44"),
+            profile("Felix", "#fa231c"),
+            profile("Seungmin", "#0099ff"),
+            profile("I.N", "#ff69b4"),
+        ];
+        let mut lines = vec![
+            LyricLine {
+                id: None,
+                song_id: None,
+                index: 0,
+                member: Some("Bang Chan".into()),
+                original: "카운팅 스타".into(),
+                romanization: Some("Counting stars".into()),
+                english: None,
+                with_all: false,
+                segments: Vec::new(),
+            },
+            LyricLine {
+                id: None,
+                song_id: None,
+                index: 1,
+                member: Some("Lee Know".into()),
+                original: "에브리데이".into(),
+                romanization: Some("Everyday".into()),
+                english: None,
+                with_all: false,
+                segments: Vec::new(),
+            },
+        ];
+        let mut duet = LyricLine {
+            id: None,
+            song_id: None,
+            index: 2,
+            member: None,
+            original: "여기 모든 곳을 밝혀".into(),
+            romanization: Some("[H/FL] yeogi modeun goseul balkhyeo".into()),
+            english: Some("Shine a light here everywhere".into()),
+            with_all: false,
+            segments: Vec::new(),
+        };
+        normalize_line_member_tags(&mut duet);
+        lines.push(duet);
+
+        canonicalize_line_member_names(&mut lines, &legend);
+        let members = members_for_lines(&lines, &legend);
+        let names: Vec<_> = members
+            .iter()
+            .map(|member| member.stage_name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["Bang Chan", "Lee Know", "HAN", "Felix"]);
+        assert_eq!(lines[2].member.as_deref(), Some("HAN, Felix"));
+        assert!(!names.contains(&"H"));
+        assert!(!names.contains(&"FL"));
+        assert!(!names.contains(&"한"));
+        assert!(!names.contains(&"필릭스"));
+    }
+
+    fn profile(name: &str, color: &str) -> MemberProfile {
+        MemberProfile {
+            id: None,
+            stage_name: name.to_string(),
+            real_name: None,
+            color: color.to_string(),
+            image_url: None,
+            local_image_path: None,
+            provider: None,
+        }
+    }
+
+    #[test]
+    fn parses_english_only_colorcodedlyrics_section() {
+        let html = r##"
+            <h1 class="entry-title">TWICE - THIS IS FOR</h1>
+            <div class="entry-content">
+              <p style="text-align: center"><span style="color: #00ccff">Nayeon</span>, <span style="color: #ffb1b8">Momo</span></p>
+              <p class="has-text-align-center"><strong><span class="has-inline-color has-very-light-gray-color">English</span></strong></p>
+              <p><span style="color: #ff1744">This is for all my ladies</span><br/><span style="color: #00ccff">One time for all my ladies</span></p>
+            </div>
+        "##;
+        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        assert_eq!(package.lines.len(), 2);
+        assert!(package.lines.iter().all(|line| line.original.trim().is_empty()));
+        assert_eq!(
+            package.lines[0].english.as_deref(),
+            Some("This is for all my ladies")
+        );
+        assert_eq!(
+            package.lines[1].english.as_deref(),
+            Some("One time for all my ladies")
+        );
+        let (show_original, show_romanization, show_english) =
+            lyric_language_toggles(&package.lines);
+        assert!(!show_original);
+        assert!(!show_romanization);
+        assert!(show_english);
+    }
+
+    #[test]
+    fn keeps_uncolored_adlibs_between_colored_english_lines() {
+        let html = r##"
+            <h1 class="entry-title">TWICE - THIS IS FOR</h1>
+            <div class="entry-content">
+              <p style="text-align: center"><span style="color: #996de7">Sana</span>, <span style="color: #ffb74d">Jihyo</span></p>
+              <p class="has-text-align-center"><strong><span class="has-inline-color has-very-light-gray-color">English</span></strong></p>
+              <p>Beep beep beep<br /><span style="color: #996de7">I'm outside your door so let's go don't let that</span><br />Beep beep beep<br /><span style="color: #996de7">Have you feeling low when you're grown you got the</span><br />Key key keys <span style="color: #ffb74d">(You got it)</span></p>
+            </div>
+        "##;
+        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let english: Vec<_> = package
+            .lines
+            .iter()
+            .filter_map(|line| line.english.as_deref())
+            .collect();
+        assert_eq!(english.len(), 5);
+        assert_eq!(english[0], "Beep beep beep");
+        assert_eq!(
+            english[1],
+            "I'm outside your door so let's go don't let that"
+        );
+        assert_eq!(english[2], "Beep beep beep");
+        assert_eq!(
+            english[3],
+            "Have you feeling low when you're grown you got the"
+        );
+        assert_eq!(english[4], "Key key keys (You got it)");
+        assert_eq!(package.lines[1].member.as_deref(), Some("Sana"));
+    }
+
+    #[test]
+    #[ignore = "uses live ColorCodedLyrics endpoints"]
+    fn fetches_twice_this_is_for_from_slug_fallback() {
+        let package = ColorCodedLyricsProvider::default()
+            .fetch("TWICE THIS IS FOR")
+            .unwrap();
+        assert_eq!(package.song.artist, "TWICE");
+        assert!(package
+            .song
+            .source_url
+            .as_deref()
+            .is_some_and(|url| url.contains("twice-this-is-for")));
+        assert!(!package.lines.is_empty());
+        assert!(package.lines.iter().all(|line| line.original.trim().is_empty()));
+        assert!(package
+            .lines
+            .iter()
+            .all(|line| line.english.as_ref().is_some_and(|text| !text.trim().is_empty())));
+        assert!(package.lines.iter().any(|line| {
+            line.english.as_deref().is_some_and(|text| {
+                text.to_lowercase().contains("outside your door")
+            })
+        }));
+        assert!(package
+            .lines
+            .iter()
+            .filter(|line| line.english.as_ref().is_some_and(|text| text.contains("Beep beep beep")))
+            .count()
+            >= 2);
+        assert_eq!(package.members.len(), 9);
+        let (show_original, _, show_english) = lyric_language_toggles(&package.lines);
+        assert!(!show_original);
+        assert!(show_english);
     }
 
     #[test]

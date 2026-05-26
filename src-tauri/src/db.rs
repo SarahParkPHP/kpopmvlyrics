@@ -98,6 +98,7 @@ impl Repository {
             "#,
         )?;
         ensure_column(&self.conn, "lyric_lines", "segments", "TEXT")?;
+        ensure_column(&self.conn, "lyric_lines", "includes_all", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(())
     }
 
@@ -132,8 +133,8 @@ impl Repository {
             line.song_id = Some(song_id);
             tx.execute(
                 r#"
-                INSERT INTO lyric_lines (song_id, line_index, member, original, romanization, english, segments)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                INSERT INTO lyric_lines (song_id, line_index, member, original, romanization, english, segments, includes_all)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 "#,
                 params![
                     song_id,
@@ -142,7 +143,8 @@ impl Repository {
                     line.original,
                     line.romanization,
                     line.english,
-                    serde_json::to_string(&line.segments)?
+                    serde_json::to_string(&line.segments)?,
+                    line.with_all as i64,
                 ],
             )?;
             line.id = Some(tx.last_insert_rowid());
@@ -156,7 +158,7 @@ impl Repository {
 
     pub fn lyric_lines(&self, song_id: i64) -> Result<Vec<LyricLine>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, song_id, line_index, member, original, romanization, english, segments FROM lyric_lines WHERE song_id=?1 ORDER BY line_index",
+            "SELECT id, song_id, line_index, member, original, romanization, english, segments, includes_all FROM lyric_lines WHERE song_id=?1 ORDER BY line_index",
         )?;
         let rows = stmt.query_map(params![song_id], |row| {
             let raw_segments: Option<String> = row.get(7)?;
@@ -168,6 +170,7 @@ impl Repository {
                 original: row.get(4)?,
                 romanization: row.get(5)?,
                 english: row.get(6)?,
+                with_all: row.get::<_, i64>(8)? != 0,
                 segments: raw_segments
                     .and_then(|value| serde_json::from_str(&value).ok())
                     .unwrap_or_default(),

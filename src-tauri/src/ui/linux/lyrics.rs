@@ -3,6 +3,7 @@ use std::cell::Cell;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, Orientation, ScrolledWindow};
 
+use crate::align::has_playback_timing;
 use crate::app::format_ms;
 use crate::models::{AlignmentLine, LyricLine, MemberProfile, SongPackage};
 
@@ -31,23 +32,37 @@ pub fn lyric_content_key(
 ) -> String {
     let lines = song
         .map(|song| {
-            song.lines
-                .iter()
-                .map(|line| {
-                    let time = alignment
-                        .iter()
-                        .find(|item| item.lyric_index == line.index)
-                        .map(|item| item.start_ms)
-                        .unwrap_or(-1);
-                    format!("{}:{}", line.index, time)
-                })
-                .collect::<Vec<_>>()
-                .join("|")
+            format!(
+                "{}::{}::{}::{}",
+                song.song.title,
+                song.song.artist,
+                song.provider,
+                song.lines
+                    .iter()
+                    .map(|line| {
+                        let time = alignment
+                            .iter()
+                            .find(|item| item.lyric_index == line.index)
+                            .map(|item| item.start_ms)
+                            .unwrap_or(-1);
+                        format!(
+                            "{}:{}:{}:{}:{}:{}:{}",
+                            line.index,
+                            time,
+                            line.original,
+                            line.romanization.as_deref().unwrap_or(""),
+                            line.english.as_deref().unwrap_or(""),
+                            line.member.as_deref().unwrap_or(""),
+                            line.with_all,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            )
         })
         .unwrap_or_default();
     format!(
-        "{lines}::{}:{}:{}",
-        show_original, show_romanization, show_english
+        "{lines}::{show_original}:{show_romanization}:{show_english}"
     )
 }
 
@@ -77,7 +92,11 @@ pub fn compute_lyric_stage_content(
                 line_index: line.index,
                 member: line.member.clone().unwrap_or_else(|| "All".to_string()),
                 original_markup: show_original
-                    .then(|| colored_markup(line, "original", &line.original, members)),
+                    .then(|| {
+                        (!line.original.trim().is_empty())
+                            .then(|| colored_markup(line, "original", &line.original, members))
+                    })
+                    .flatten(),
                 roman_markup: show_romanization
                     .then(|| line.romanization.as_ref())
                     .flatten()
@@ -87,6 +106,7 @@ pub fn compute_lyric_stage_content(
                     .flatten()
                     .map(|text| colored_markup(line, "english", text, members)),
                 time_text: timing
+                    .filter(|item| has_playback_timing(item))
                     .map(|item| format_ms(item.start_ms))
                     .unwrap_or_else(|| "Unaligned".to_string()),
             }
@@ -242,47 +262,46 @@ fn colored_markup(
     fallback: &str,
     members: &[MemberProfile],
 ) -> String {
-    let member_color = member_color_for_line(line, members);
-    let segments = segments_for_display(line, language);
-    if segments.is_empty() {
-        return colorize_plain_text(fallback, member_color.as_deref());
-    }
-    segments
-        .iter()
-        .map(|segment| segment_span(segment, member_color.as_deref()))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn segments_for_display<'a>(line: &'a LyricLine, language: &str) -> Vec<&'a crate::models::LyricSegment> {
-    let exact: Vec<_> = line
+    let exact_segments: Vec<_> = line
         .segments
         .iter()
         .filter(|segment| segment.language == language)
         .collect();
-    if !exact.is_empty() {
-        return exact;
+    if exact_segments.is_empty() {
+        return colorize_plain_text(fallback, member_color_for_line(line, members).as_deref());
     }
-    for lang in ["romanization", "original", "english"] {
-        let fallback: Vec<_> = line
-            .segments
-            .iter()
-            .filter(|segment| segment.language == lang)
-            .collect();
-        if !fallback.is_empty() {
-            return fallback;
-        }
-    }
-    line.segments.iter().collect()
+    let line_color = member_color_for_line(line, members);
+    exact_segments
+        .iter()
+        .map(|segment| {
+            let color = segment
+                .color
+                .as_deref()
+                .or_else(|| {
+                    segment.member.as_ref().and_then(|name| {
+                        members
+                            .iter()
+                            .find(|member| member.stage_name.eq_ignore_ascii_case(name))
+                            .map(|member| member.color.as_str())
+                    })
+                })
+                .or(line_color.as_deref());
+            segment_span(segment, color)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn member_color_for_line(line: &LyricLine, members: &[MemberProfile]) -> Option<String> {
-    line.member.as_ref().and_then(|name| {
-        members
+    for name in crate::lyrics::referenced_member_names(std::slice::from_ref(line)) {
+        if let Some(member) = members
             .iter()
-            .find(|member| member.stage_name.eq_ignore_ascii_case(name))
-            .map(|member| member.color.clone())
-    })
+            .find(|member| member.stage_name.eq_ignore_ascii_case(&name))
+        {
+            return Some(member.color.clone());
+        }
+    }
+    None
 }
 
 fn segment_span(segment: &crate::models::LyricSegment, member_color: Option<&str>) -> String {
@@ -314,5 +333,153 @@ fn format_markup_color(color: &str) -> String {
         trimmed.to_string()
     } else {
         format!("#{trimmed}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_lyric_stage_content;
+    use crate::models::{LyricLine, LyricSegment, MemberProfile, Song, SongPackage};
+
+    fn profile(name: &str, color: &str) -> MemberProfile {
+        MemberProfile {
+            id: None,
+            stage_name: name.to_string(),
+            real_name: None,
+            color: color.to_string(),
+            image_url: None,
+            local_image_path: None,
+            provider: None,
+        }
+    }
+
+    #[test]
+    fn english_row_uses_translation_text_without_english_segments() {
+        let song = SongPackage {
+            song: Song {
+                id: None,
+                title: "S-Class".into(),
+                artist: "Stray Kids".into(),
+                group_name: Some("Stray Kids".into()),
+                source_url: None,
+            },
+            members: vec![profile("Hyunjin", "#bb71ff")],
+            lines: vec![LyricLine {
+                id: None,
+                song_id: None,
+                index: 0,
+                member: Some("Hyunjin".into()),
+                original: "특별의 별의".into(),
+                romanization: Some("teukbyeore byeore".into()),
+                english: Some("The most special star".into()),
+                with_all: false,
+                segments: vec![
+                    LyricSegment {
+                        language: "original".into(),
+                        text: "특별의 별의".into(),
+                        member: Some("Hyunjin".into()),
+                        color: Some("#bb71ff".into()),
+                    },
+                    LyricSegment {
+                        language: "romanization".into(),
+                        text: "teukbyeore byeore".into(),
+                        member: Some("Hyunjin".into()),
+                        color: Some("#bb71ff".into()),
+                    },
+                ],
+            }],
+            provider: "test".into(),
+        };
+
+        let content = compute_lyric_stage_content(Some(song), &[], true, true, true);
+        let row = &content.rows[0];
+        let english = row.english_markup.as_deref().unwrap();
+        assert!(english.contains("special star"));
+        assert!(!english.contains("teukbyeore"));
+    }
+
+    #[test]
+    fn referenced_members_include_comma_separated_line_tags() {
+        let line = LyricLine {
+            id: None,
+            song_id: None,
+            index: 0,
+            member: Some("Hyunjin, Felix".into()),
+            original: "line".into(),
+            romanization: None,
+            english: None,
+            with_all: false,
+            segments: Vec::new(),
+        };
+        let names = crate::lyrics::referenced_member_names(std::slice::from_ref(&line));
+        assert_eq!(names, vec!["Hyunjin", "Felix"]);
+    }
+
+    #[test]
+    fn unified_line_shows_korean_romanization_and_english_together() {
+        let song = SongPackage {
+            song: Song {
+                id: None,
+                title: "S-Class".into(),
+                artist: "Stray Kids".into(),
+                group_name: Some("Stray Kids".into()),
+                source_url: None,
+            },
+            members: vec![profile("Hyunjin", "#bb71ff")],
+            lines: vec![LyricLine {
+                id: None,
+                song_id: None,
+                index: 16,
+                member: Some("Hyunjin".into()),
+                original: "특별의 별의 별의 별의 별의 별의 별의".into(),
+                romanization: Some(
+                    "teukbyeore byeore byeore byeore byeore byeore byeore".into(),
+                ),
+                english: Some("The most special star, star, star, star, star, star".into()),
+                with_all: false,
+                segments: vec![
+                    LyricSegment {
+                        language: "original".into(),
+                        text: "특별의 별의 별의 별의 별의 별의 별의".into(),
+                        member: Some("Hyunjin".into()),
+                        color: Some("#bb71ff".into()),
+                    },
+                    LyricSegment {
+                        language: "romanization".into(),
+                        text: "teukbyeore byeore byeore byeore byeore byeore byeore".into(),
+                        member: Some("Hyunjin".into()),
+                        color: Some("#bb71ff".into()),
+                    },
+                    LyricSegment {
+                        language: "english".into(),
+                        text: "The most special star, star, star, star, star, star".into(),
+                        member: Some("Hyunjin".into()),
+                        color: Some("#bb71ff".into()),
+                    },
+                ],
+            }],
+            provider: "test".into(),
+        };
+
+        let content = compute_lyric_stage_content(Some(song.clone()), &[], true, true, true);
+        assert_eq!(content.rows.len(), 1);
+        let row = &content.rows[0];
+        assert_eq!(row.line_index, 16);
+        assert!(row
+            .original_markup
+            .as_deref()
+            .is_some_and(|markup| markup.contains("특별의")));
+        assert!(row
+            .roman_markup
+            .as_deref()
+            .is_some_and(|markup| markup.contains("teukbyeore")));
+        assert!(row
+            .english_markup
+            .as_deref()
+            .is_some_and(|markup| markup.contains("special star")));
+
+        let before = super::lyric_content_key(Some(&song), &[], true, true, false);
+        let after = super::lyric_content_key(Some(&song), &[], true, true, true);
+        assert_ne!(before, after);
     }
 }

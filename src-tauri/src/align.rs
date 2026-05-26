@@ -30,7 +30,7 @@ pub fn align_lines(input: AlignmentInput) -> Vec<AlignmentLine> {
     }
 
     let pairs = align_sequence(&input.lyrics, &captions);
-    input
+    let mut alignment: Vec<AlignmentLine> = input
         .lyrics
         .iter()
         .map(|lyric| {
@@ -56,7 +56,9 @@ pub fn align_lines(input: AlignmentInput) -> Vec<AlignmentLine> {
                 }
             }
         })
-        .collect()
+        .collect();
+    interpolate_unsynced_timings(&mut alignment);
+    alignment
 }
 
 fn is_usable_caption(caption: &CaptionLine) -> bool {
@@ -88,7 +90,18 @@ fn align_sequence(
         .map(|lyric| {
             captions
                 .iter()
-                .map(|caption| match_score(lyric, caption))
+                .enumerate()
+                .map(|(index, caption)| {
+                    let mut score = match_score(lyric, caption);
+                    if index > 0 {
+                        score = score.max(combined_caption_match_score(
+                            lyric,
+                            &captions[index - 1],
+                            caption,
+                        ));
+                    }
+                    score
+                })
                 .collect()
         })
         .collect();
@@ -149,7 +162,20 @@ fn align_sequence(
 }
 
 fn match_score(lyric: &LyricLine, caption: &CaptionLine) -> f64 {
-    let caption_text = normalize_text(&caption.text);
+    best_text_match_score(lyric, &caption.text)
+}
+
+fn combined_caption_match_score(
+    lyric: &LyricLine,
+    left: &CaptionLine,
+    right: &CaptionLine,
+) -> f64 {
+    let combined = format!("{} {}", left.text.trim(), right.text.trim());
+    best_text_match_score(lyric, &combined)
+}
+
+fn best_text_match_score(lyric: &LyricLine, caption_text: &str) -> f64 {
+    let caption_text = normalize_text(caption_text);
     if caption_text.is_empty() {
         return 0.0;
     }
@@ -160,6 +186,111 @@ fn match_score(lyric: &LyricLine, caption: &CaptionLine) -> f64 {
         .filter(|text| !text.is_empty())
         .map(|lyric_text| combined_similarity(&lyric_text, &caption_text))
         .fold(0.0, f64::max)
+}
+
+fn interpolate_unsynced_timings(alignment: &mut [AlignmentLine]) {
+    if alignment.is_empty() {
+        return;
+    }
+    alignment.sort_by_key(|line| line.lyric_index);
+
+    let avg_duration = average_synced_duration(alignment).unwrap_or(2000).max(400);
+    let synced_positions: Vec<usize> = alignment
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| is_synced_line(line))
+        .map(|(index, _)| index)
+        .collect();
+
+    if synced_positions.is_empty() {
+        distribute_evenly(alignment, 0, alignment.len(), 0, avg_duration * alignment.len() as i64);
+        return;
+    }
+
+    if synced_positions[0] > 0 {
+        let end = alignment[synced_positions[0]].start_ms.max(0);
+        distribute_evenly(alignment, 0, synced_positions[0], 0, end);
+    }
+
+    for window in synced_positions.windows(2) {
+        let left = window[0];
+        let right = window[1];
+        let gap_start = alignment[left].end_ms.max(alignment[left].start_ms);
+        let gap_end = alignment[right].start_ms;
+        if gap_end > gap_start {
+            distribute_evenly(alignment, left + 1, right, gap_start, gap_end);
+        } else {
+            distribute_evenly(
+                alignment,
+                left + 1,
+                right,
+                gap_start,
+                gap_start + avg_duration * (right - left - 1) as i64,
+            );
+        }
+    }
+
+    let last_synced = *synced_positions.last().expect("checked above");
+    if last_synced + 1 < alignment.len() {
+        let start = alignment[last_synced]
+            .end_ms
+            .max(alignment[last_synced].start_ms);
+        distribute_evenly(
+            alignment,
+            last_synced + 1,
+            alignment.len(),
+            start,
+            start + avg_duration * (alignment.len() - last_synced - 1) as i64,
+        );
+    }
+}
+
+fn average_synced_duration(alignment: &[AlignmentLine]) -> Option<i64> {
+    let durations: Vec<i64> = alignment
+        .iter()
+        .filter(|line| is_synced_line(line))
+        .map(|line| (line.end_ms - line.start_ms).max(0))
+        .filter(|duration| *duration > 0)
+        .collect();
+    if durations.is_empty() {
+        return None;
+    }
+    Some(durations.iter().sum::<i64>() / durations.len() as i64)
+}
+
+fn distribute_evenly(
+    alignment: &mut [AlignmentLine],
+    from: usize,
+    to: usize,
+    range_start: i64,
+    range_end: i64,
+) {
+    let unsynced: Vec<usize> = (from..to)
+        .filter(|index| !is_synced_line(&alignment[*index]))
+        .collect();
+    if unsynced.is_empty() {
+        return;
+    }
+
+    let count = unsynced.len() as i64;
+    let range = (range_end - range_start).max(count * 250);
+    let slot = (range / count).max(250);
+
+    for (offset, index) in unsynced.iter().enumerate() {
+        let start = range_start + slot * offset as i64;
+        let end = if offset as i64 == count - 1 {
+            range_end.max(start + slot)
+        } else {
+            start + slot
+        };
+        alignment[*index].start_ms = start;
+        alignment[*index].end_ms = end.max(start + 200);
+        alignment[*index].needs_review = true;
+    }
+}
+
+pub fn has_playback_timing(line: &AlignmentLine) -> bool {
+    line.start_ms >= 0 && line.end_ms >= line.start_ms
 }
 
 fn combined_similarity(lyric_text: &str, caption_text: &str) -> f64 {
@@ -344,6 +475,7 @@ mod tests {
             original: text.to_string(),
             romanization: Some(text.to_string()),
             english: None,
+            with_all: false,
             segments: Vec::new(),
         }
     }
@@ -381,8 +513,9 @@ mod tests {
             captions: vec![caption(0, "first", 1000), caption(1, "last", 5000)],
         });
         assert_eq!(output[1].caption_index, None);
-        assert_eq!(output[1].start_ms, -1);
-        assert_eq!(output[1].end_ms, -1);
+        assert!(has_playback_timing(&output[1]));
+        assert!(output[1].start_ms >= output[0].end_ms);
+        assert!(output[1].end_ms <= output[2].start_ms);
         assert!(output[1].needs_review);
     }
 
@@ -400,7 +533,8 @@ mod tests {
             ],
         });
         assert_eq!(output[0].caption_index, None);
-        assert_eq!(output[0].start_ms, -1);
+        assert!(has_playback_timing(&output[0]));
+        assert!(output[0].end_ms <= output[1].start_ms);
         assert_eq!(output[1].caption_index, Some(0));
         assert_eq!(output[1].start_ms, 5000);
         assert_eq!(output[2].caption_index, Some(1));
@@ -442,7 +576,8 @@ mod tests {
             ],
         });
         assert_eq!(output[0].caption_index, None);
-        assert_eq!(output[0].start_ms, -1);
+        assert!(has_playback_timing(&output[0]));
+        assert!(output[0].end_ms <= output[1].start_ms);
         assert_eq!(output[1].caption_index, Some(1));
         assert_eq!(output[1].start_ms, 37760);
     }
@@ -464,6 +599,7 @@ mod tests {
                 original: "어린 맘속 헤매던 cosmos".to_string(),
                 romanization: Some("eorin mamsok hemaedeon cosmos".to_string()),
                 english: Some("My childish heart once lost in the cosmos".to_string()),
+                with_all: false,
                 segments: Vec::new(),
             }],
             captions: vec![caption(
@@ -484,6 +620,44 @@ mod tests {
         });
         assert_eq!(output[0].caption_index, Some(0));
         assert!(output[0].confidence >= MATCH_THRESHOLD as f32);
+    }
+
+    fn english_lyric(index: usize, text: &str) -> LyricLine {
+        LyricLine {
+            id: None,
+            song_id: Some(1),
+            index,
+            member: None,
+            original: String::new(),
+            romanization: None,
+            english: Some(text.to_string()),
+            with_all: false,
+            segments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn interpolates_garbled_caption_gap_for_twice_intro() {
+        let output = align_lines(AlignmentInput {
+            lyrics: vec![
+                english_lyric(0, "(Hahaha) This is for all my ladies"),
+                english_lyric(1, "Who don't get hyped enough (Hey ladies)"),
+                english_lyric(2, "If you've been done wrong"),
+                english_lyric(3, "Then this your song so turn it up (Turn it up for me uh uh)"),
+            ],
+            captions: vec![
+                caption(0, "This is for all my ladies who don't get", 3760),
+                caption(1, "hyped to love. If you've been wrong,", 6320),
+                caption(2, "that is your song. So turn it up. I want", 8720),
+            ],
+        });
+        let middle = &output[1];
+        assert_eq!(middle.caption_index, None);
+        assert!(has_playback_timing(middle));
+        assert!(middle.start_ms >= output[0].end_ms);
+        assert!(middle.end_ms <= output[2].start_ms);
+        assert!(middle.start_ms >= 3760);
+        assert!(middle.end_ms <= 8720);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use gtk::{
     ScrolledWindow, SpinButton, TextView,
 };
 
-use crate::app::{merge_members, shift_alignment, DEFAULT_MANUAL_CAPTIONS, DEFAULT_MANUAL_LYRICS};
+use crate::app::{apply_member_profiles, shift_alignment, DEFAULT_MANUAL_CAPTIONS, DEFAULT_MANUAL_LYRICS};
 use crate::models::{AlignmentLine, MemberProfile};
 
 use super::{spawn_work, BackgroundUpdate, UiModel, UiView, WorkerSnapshot};
@@ -491,7 +491,8 @@ pub fn resolve_video_chain(
         report_progress(0.58);
         if let Some(group) = package.song.group_name.clone() {
             if let Ok(profiles) = snapshot.ctx.search_member_profiles(&group) {
-                package.members = merge_members(&package.members, &profiles);
+                package.members =
+                    apply_member_profiles(&package.members, &profiles, &package.lines);
             }
         }
         let video_id = metadata.video_id.clone();
@@ -519,6 +520,13 @@ pub fn resolve_video_chain(
         model.metadata = Some(metadata);
         model.query = query;
         model.formats = formats;
+        if let Some(package) = &song {
+            let (show_original, show_romanization, show_english) =
+                crate::lyrics::lyric_language_toggles(&package.lines);
+            model.show_original = show_original;
+            model.show_romanization = show_romanization;
+            model.show_english = show_english;
+        }
         model.song = song;
         model.captions = captions;
         model.alignment = alignment;

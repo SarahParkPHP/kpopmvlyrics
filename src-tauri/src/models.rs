@@ -67,6 +67,8 @@ pub struct LyricLine {
     pub romanization: Option<String>,
     pub english: Option<String>,
     #[serde(default)]
+    pub with_all: bool,
+    #[serde(default)]
     pub segments: Vec<LyricSegment>,
 }
 
