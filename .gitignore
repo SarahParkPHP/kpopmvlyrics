@@ -49,3 +49,5 @@ Thumbs.db
 *.swp
 *.swo
 *~
+# CocoIndex Code (ccc)
+/.cocoindex_code/
