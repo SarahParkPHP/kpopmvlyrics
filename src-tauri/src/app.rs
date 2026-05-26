@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::align::{align_lines, alignment_quality, AlignmentInput};
+use crate::align::{
+    align_lines, align_lyrics_to_whisper_words, alignment_playback_quality, AlignmentInput,
+};
+use crate::lyrics::lyric_language_toggles;
+use crate::whisper::{whisper_available, whisper_caption_lines, whisper_setup_hint, transcribe_video};
 use crate::captions::{parse_caption_text, CaptionProvider, YouTubeCaptionProvider};
 use crate::db::Repository;
 use crate::lyrics::{ColorCodedLyricsProvider, GeniusProvider, LyricsProvider};
@@ -13,6 +17,7 @@ use crate::video;
 pub struct AlignResult {
     pub alignment: Vec<AlignmentLine>,
     pub captions: Vec<CaptionLine>,
+    pub summary: String,
 }
 
 pub struct AppContext {
@@ -123,6 +128,10 @@ impl AppContext {
                 }]
             }
         };
+        let (has_original, has_romanization, has_english) = lyric_language_toggles(&lyrics);
+        let prefer_whisper = has_english && !has_original && !has_romanization;
+        let mut summary = String::from("Aligned from YouTube captions");
+
         let mut best_alignment = Vec::new();
         let mut best_captions = Vec::new();
         let mut best_score = f64::NEG_INFINITY;
@@ -132,11 +141,47 @@ impl AppContext {
                 lyrics: lyrics.clone(),
                 captions: track.lines.clone(),
             });
-            let score = alignment_quality(&aligned);
+            let score = alignment_playback_quality(&aligned);
             if score > best_score {
                 best_score = score;
                 best_alignment = aligned;
                 best_captions = track.lines.clone();
+            }
+        }
+
+        if prefer_whisper {
+            if whisper_available() {
+                match transcribe_video(video_id, Some("en")) {
+                    Ok(transcript) if !transcript.words.is_empty() => {
+                        let whisper_captions = whisper_caption_lines(video_id, &transcript);
+                        let whisper_alignment =
+                            align_lyrics_to_whisper_words(&lyrics, &transcript.words);
+                        best_alignment = whisper_alignment;
+                        best_captions = whisper_captions;
+                        let device = transcript.device.as_deref().unwrap_or("cpu");
+                        summary = format!(
+                            "Aligned with Whisper ({}, {} words)",
+                            device,
+                            transcript.words.len()
+                        );
+                        eprintln!("kpopmvlyrics: {summary}");
+                    }
+                    Ok(_) => {
+                        summary = "Whisper returned no words; kept YouTube caption alignment"
+                            .into();
+                        eprintln!("kpopmvlyrics: {summary}");
+                    }
+                    Err(err) => {
+                        summary = format!("Whisper failed ({err}); kept YouTube caption alignment");
+                        eprintln!("kpopmvlyrics: {summary}");
+                    }
+                }
+            } else {
+                summary = format!(
+                    "Whisper unavailable ({}); kept YouTube caption alignment",
+                    whisper_setup_hint()
+                );
+                eprintln!("kpopmvlyrics: {summary}");
             }
         }
 
@@ -152,6 +197,7 @@ impl AppContext {
         Ok(AlignResult {
             alignment: best_alignment,
             captions: best_captions,
+            summary,
         })
     }
 

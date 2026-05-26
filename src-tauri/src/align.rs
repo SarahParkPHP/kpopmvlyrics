@@ -6,6 +6,10 @@ use strsim::jaro_winkler;
 use crate::models::{AlignmentLine, CaptionLine, LyricLine};
 
 const MATCH_THRESHOLD: f64 = 0.72;
+const WHISPER_MATCH_THRESHOLD: f64 = 0.78;
+const WHISPER_MIN_TOKEN_RECALL: f64 = 0.52;
+const WHISPER_MAX_WORD_SPAN: usize = 48;
+const WHISPER_MIN_INTERPOLATED_LINE_MS: i64 = 900;
 
 pub struct AlignmentInput {
     pub lyrics: Vec<LyricLine>,
@@ -440,6 +444,294 @@ pub fn alignment_quality(lines: &[AlignmentLine]) -> f64 {
         .sum()
 }
 
+pub fn alignment_playback_quality(lines: &[AlignmentLine]) -> f64 {
+    lines
+        .iter()
+        .filter(|line| has_playback_timing(line))
+        .map(|line| 1.0 + f64::from(line.confidence))
+        .sum()
+}
+
+pub fn lyric_alignment_text(line: &LyricLine) -> &str {
+    if let Some(text) = line
+        .english
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        return text;
+    }
+    if let Some(text) = line
+        .romanization
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        return text;
+    }
+    &line.original
+}
+
+pub fn align_lyrics_to_whisper_words(
+    lyrics: &[LyricLine],
+    words: &[crate::whisper::WhisperWord],
+) -> Vec<AlignmentLine> {
+    if lyrics.is_empty() {
+        return Vec::new();
+    }
+    if words.is_empty() {
+        return lyrics
+            .iter()
+            .map(|line| unsynced_alignment_line(line.index))
+            .collect();
+    }
+
+    let n = lyrics.len();
+    let m = words.len();
+    let mut dp = vec![vec![f64::NEG_INFINITY; m + 1]; n + 1];
+    let mut prev = vec![vec![WhisperAlignChoice::default(); m + 1]; n + 1];
+    dp[0][0] = 0.0;
+
+    for i in 1..=n {
+        let target = normalize_text(lyric_alignment_text(&lyrics[i - 1]));
+        let skip_only = target.is_empty() || looks_like_metadata(&target);
+
+        for j in 0..=m {
+            if j > 0 && dp[i][j - 1] > dp[i][j] {
+                dp[i][j] = dp[i][j - 1];
+                prev[i][j] = WhisperAlignChoice::SkipWord;
+            }
+
+            if dp[i - 1][j] > dp[i][j] {
+                dp[i][j] = dp[i - 1][j];
+                prev[i][j] = WhisperAlignChoice::SkipLyric;
+            }
+
+            if skip_only {
+                continue;
+            }
+
+            for end in j..m.min(j + WHISPER_MAX_WORD_SPAN) {
+                let score = whisper_span_score(&target, words, j, end);
+                if score <= 0.0 {
+                    continue;
+                }
+                let candidate = dp[i - 1][j] + score;
+                if candidate > dp[i][end + 1] {
+                    dp[i][end + 1] = candidate;
+                    prev[i][end + 1] = WhisperAlignChoice::Match {
+                        word_start: j,
+                        word_end: end,
+                        score,
+                    };
+                }
+            }
+        }
+    }
+
+    let mut end_word = (0..=m)
+        .max_by(|left, right| {
+            dp[n][*left]
+                .partial_cmp(&dp[n][*right])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(0);
+
+    let mut matched = vec![None; n];
+    let mut i = n;
+    let mut j = end_word;
+    while i > 0 {
+        match prev[i][j] {
+            WhisperAlignChoice::SkipLyric => {
+                i -= 1;
+            }
+            WhisperAlignChoice::SkipWord => {
+                j -= 1;
+            }
+            WhisperAlignChoice::Match {
+                word_start,
+                word_end,
+                score,
+            } => {
+                matched[i - 1] = Some((word_start, word_end, score));
+                i -= 1;
+                j = word_start;
+            }
+            WhisperAlignChoice::Unset => {
+                i -= 1;
+            }
+        }
+    }
+
+    let mut alignment = Vec::with_capacity(n);
+    for (index, line) in lyrics.iter().enumerate() {
+        if let Some((word_start, word_end, score)) = matched[index] {
+            alignment.push(AlignmentLine {
+                lyric_index: line.index,
+                caption_index: Some(word_end),
+                start_ms: words[word_start].start_ms,
+                end_ms: words[word_end]
+                    .end_ms
+                    .max(words[word_end].start_ms + 200),
+                confidence: score as f32,
+                needs_review: score < 0.86,
+            });
+        } else {
+            alignment.push(unsynced_alignment_line(line.index));
+        }
+    }
+
+    interpolate_whisper_unsynced_timings(&mut alignment);
+    alignment
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum WhisperAlignChoice {
+    #[default]
+    Unset,
+    SkipLyric,
+    SkipWord,
+    Match {
+        word_start: usize,
+        word_end: usize,
+        score: f64,
+    },
+}
+
+fn whisper_span_score(
+    target: &str,
+    words: &[crate::whisper::WhisperWord],
+    start: usize,
+    end: usize,
+) -> f64 {
+    if target.is_empty() || start > end || end >= words.len() {
+        return 0.0;
+    }
+
+    let span_text = whisper_words_text(words, start, end);
+    let similarity = combined_similarity(target, &span_text);
+    if similarity < WHISPER_MATCH_THRESHOLD {
+        return 0.0;
+    }
+    if !leading_token_matches(target, &span_text) {
+        return 0.0;
+    }
+
+    let recall = ordered_token_recall(target, &span_text);
+    if recall < WHISPER_MIN_TOKEN_RECALL {
+        return 0.0;
+    }
+
+    similarity * (0.55 + (0.45 * recall))
+}
+
+fn whisper_words_text(words: &[crate::whisper::WhisperWord], start: usize, end: usize) -> String {
+    normalize_text(
+        &words[start..=end]
+            .iter()
+            .map(|word| word.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn leading_token_matches(lyric: &str, span: &str) -> bool {
+    let lyric_tokens = significant_tokens(lyric);
+    let span_tokens = significant_tokens(span);
+    if lyric_tokens.is_empty() || span_tokens.is_empty() {
+        return false;
+    }
+
+    let lookahead = span_tokens.len().min(8);
+    lyric_tokens.iter().take(3).any(|lyric_token| {
+        span_tokens
+            .iter()
+            .take(lookahead)
+            .any(|span_token| token_similar(lyric_token, span_token) >= 0.88)
+    })
+}
+
+fn ordered_token_recall(lyric: &str, span: &str) -> f64 {
+    let lyric_tokens = significant_tokens(lyric);
+    if lyric_tokens.is_empty() {
+        return 0.0;
+    }
+    let span_tokens = significant_tokens(span);
+    if span_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let mut span_index = 0usize;
+    let mut matched = 0usize;
+    for lyric_token in &lyric_tokens {
+        while span_index < span_tokens.len() {
+            if token_similar(lyric_token, &span_tokens[span_index]) >= 0.85 {
+                matched += 1;
+                span_index += 1;
+                break;
+            }
+            span_index += 1;
+        }
+    }
+
+    matched as f64 / lyric_tokens.len() as f64
+}
+
+fn token_similar(left: &str, right: &str) -> f64 {
+    if left == right {
+        1.0
+    } else {
+        jaro_winkler(left, right)
+    }
+}
+
+fn interpolate_whisper_unsynced_timings(alignment: &mut [AlignmentLine]) {
+    interpolate_unsynced_timings(alignment);
+
+    alignment.sort_by_key(|line| line.lyric_index);
+    let synced_positions: Vec<usize> = alignment
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| is_synced_line(line))
+        .map(|(index, _)| index)
+        .collect();
+
+    for window in synced_positions.windows(2) {
+        let left = window[0];
+        let right = window[1];
+        let gap_lines = right - left - 1;
+        if gap_lines == 0 {
+            continue;
+        }
+
+        let gap_start = alignment[left].end_ms.max(alignment[left].start_ms);
+        let gap_end = alignment[right].start_ms;
+        let needed = gap_lines as i64 * WHISPER_MIN_INTERPOLATED_LINE_MS;
+        let distribute_end = if gap_end - gap_start >= needed {
+            gap_end
+        } else {
+            gap_start + needed
+        };
+        distribute_evenly(alignment, left + 1, right, gap_start, distribute_end);
+    }
+}
+
+fn unsynced_alignment_line(lyric_index: usize) -> AlignmentLine {
+    AlignmentLine {
+        lyric_index,
+        caption_index: None,
+        start_ms: -1,
+        end_ms: -1,
+        confidence: 0.0,
+        needs_review: true,
+    }
+}
+
+fn looks_like_metadata(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.starts_with("english:")
+        || lower.starts_with("credits")
+        || lower.starts_with("disclaimer")
+}
+
 fn lyric_text_candidates(line: &LyricLine) -> Vec<&str> {
     let mut values = Vec::new();
     if let Some(text) = line
@@ -678,15 +970,169 @@ mod tests {
             caption(2, "일어나 거울 속 나에게 인사해", 48259),
         ];
 
-        let english_score = alignment_quality(&align_lines(AlignmentInput {
+        let english_score = alignment_playback_quality(&align_lines(AlignmentInput {
             lyrics: lyrics.clone(),
             captions: english,
         }));
-        let korean_score = alignment_quality(&align_lines(AlignmentInput {
+        let korean_score = alignment_playback_quality(&align_lines(AlignmentInput {
             lyrics,
             captions: korean,
         }));
 
         assert!(english_score > korean_score);
+    }
+
+    #[test]
+    fn aligns_english_lyrics_to_whisper_word_timestamps() {
+        use crate::whisper::WhisperWord;
+
+        let lyrics = vec![
+            english_lyric(0, "(Hahaha) This is for all my ladies"),
+            english_lyric(1, "Who don't get hyped enough (Hey ladies)"),
+            english_lyric(2, "If you've been done wrong"),
+        ];
+        let words = vec![
+            WhisperWord {
+                text: "This".into(),
+                start_ms: 3760,
+                end_ms: 3900,
+            },
+            WhisperWord {
+                text: "is".into(),
+                start_ms: 3900,
+                end_ms: 4020,
+            },
+            WhisperWord {
+                text: "for".into(),
+                start_ms: 4020,
+                end_ms: 4140,
+            },
+            WhisperWord {
+                text: "all".into(),
+                start_ms: 4140,
+                end_ms: 4260,
+            },
+            WhisperWord {
+                text: "my".into(),
+                start_ms: 4260,
+                end_ms: 4380,
+            },
+            WhisperWord {
+                text: "ladies".into(),
+                start_ms: 4380,
+                end_ms: 4700,
+            },
+            WhisperWord {
+                text: "who".into(),
+                start_ms: 4700,
+                end_ms: 4820,
+            },
+            WhisperWord {
+                text: "don't".into(),
+                start_ms: 4820,
+                end_ms: 4980,
+            },
+            WhisperWord {
+                text: "get".into(),
+                start_ms: 4980,
+                end_ms: 5080,
+            },
+            WhisperWord {
+                text: "hyped".into(),
+                start_ms: 5080,
+                end_ms: 5240,
+            },
+            WhisperWord {
+                text: "enough".into(),
+                start_ms: 5240,
+                end_ms: 5480,
+            },
+            WhisperWord {
+                text: "If".into(),
+                start_ms: 5600,
+                end_ms: 5720,
+            },
+            WhisperWord {
+                text: "you've".into(),
+                start_ms: 5720,
+                end_ms: 5880,
+            },
+            WhisperWord {
+                text: "been".into(),
+                start_ms: 5880,
+                end_ms: 6000,
+            },
+            WhisperWord {
+                text: "done".into(),
+                start_ms: 6000,
+                end_ms: 6160,
+            },
+            WhisperWord {
+                text: "wrong".into(),
+                start_ms: 6160,
+                end_ms: 6400,
+            },
+        ];
+
+        let output = align_lyrics_to_whisper_words(&lyrics, &words);
+        assert!(has_playback_timing(&output[1]));
+        assert!(output[1].start_ms >= 4700);
+        assert!(output[1].end_ms <= 5600);
+        assert!(output[1].confidence >= WHISPER_MATCH_THRESHOLD as f32);
+    }
+
+    #[test]
+    fn rejects_whisper_false_match_on_different_opening_word() {
+        use crate::whisper::WhisperWord;
+
+        let lyrics = vec![
+            english_lyric(0, "Have you feeling low when you're grown you got the"),
+            english_lyric(1, "(Ooh) This your moment go get it"),
+        ];
+        let words = vec![
+            WhisperWord {
+                text: "feeling".into(),
+                start_ms: 31_700,
+                end_ms: 32_000,
+            },
+            WhisperWord {
+                text: "low".into(),
+                start_ms: 32_000,
+                end_ms: 32_300,
+            },
+            WhisperWord {
+                text: "You".into(),
+                start_ms: 33_740,
+                end_ms: 33_900,
+            },
+            WhisperWord {
+                text: "got".into(),
+                start_ms: 33_900,
+                end_ms: 34_100,
+            },
+            WhisperWord {
+                text: "it".into(),
+                start_ms: 34_100,
+                end_ms: 34_300,
+            },
+            WhisperWord {
+                text: "you".into(),
+                start_ms: 34_820,
+                end_ms: 35_000,
+            },
+            WhisperWord {
+                text: "already".into(),
+                start_ms: 35_280,
+                end_ms: 35_600,
+            },
+            WhisperWord {
+                text: "know".into(),
+                start_ms: 35_680,
+                end_ms: 36_000,
+            },
+        ];
+
+        let output = align_lyrics_to_whisper_words(&lyrics, &words);
+        assert!(!is_synced_line(&output[1]));
     }
 }

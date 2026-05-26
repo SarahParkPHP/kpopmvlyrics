@@ -534,11 +534,13 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                     Ok(apply) => {
                         if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
                             apply(&mut model);
-                            model.message = Some(if update.label == "Open" {
-                                "Video, lyrics, captions, and alignment complete".to_string()
-                            } else {
-                                format!("{} complete", update.label)
-                            });
+                            if update.label != "Alignment" {
+                                model.message = Some(if update.label == "Open" {
+                                    "Video, lyrics, captions, and alignment complete".to_string()
+                                } else {
+                                    format!("{} complete", update.label)
+                                });
+                            }
                             if is_open {
                                 model.open_progress = Some(0.96);
                             }
@@ -1018,6 +1020,7 @@ fn connect_view_handlers(
                 Ok(Box::new(move |model: &mut UiModel| {
                     model.captions = result.captions;
                     model.alignment = result.alignment;
+                    model.message = Some(result.summary);
                     model.editor_table_dirty = true;
                 }) as Box<dyn FnOnce(&mut UiModel) + Send>)
             });

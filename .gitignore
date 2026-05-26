@@ -14,6 +14,9 @@ src-tauri/target/
 # Local tool cache
 .fallow/
 
+# Python venv for faster-whisper
+.venv-whisper/
+
 # Environment
 .env
 .env.*
