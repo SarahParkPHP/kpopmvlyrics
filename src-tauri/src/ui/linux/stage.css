@@ -3,9 +3,19 @@
   border-radius: 8px;
 }
 
-.lyric-stage-panel scrollbar.vertical {
-  border: none;
-  background: transparent;
+.lyric-current-panel {
+  min-height: 0;
+  padding: 10px 24px 16px 24px;
+}
+
+.lyric-current-line label,
+label.lyric-current-text {
+  font-size: 32px;
+  font-weight: 800;
+}
+
+.lyric-empty-message {
+  color: #666666;
 }
 
 .member-strip {
@@ -35,20 +45,6 @@
   font-weight: 800;
   font-size: 13px;
   letter-spacing: 0.02em;
-}
-
-.lyric-line {
-  padding: 10px 24px;
-  transition: opacity 150ms ease;
-}
-
-.lyric-line label {
-  font-size: 17px;
-}
-
-.lyric-line-active label {
-  font-size: 30px;
-  font-weight: 800;
 }
 
 .video-controls-card {

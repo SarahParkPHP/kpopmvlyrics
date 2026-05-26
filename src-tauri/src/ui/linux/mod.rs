@@ -28,6 +28,7 @@ use crate::models::{
 };
 use crate::player::PlaybackEvents;
 use crate::player::NativeLinuxPlayer;
+use crate::asr::AsrModelSize;
 
 use editor::{build_editor_panel, connect_editor_handlers, pick_member_image, resolve_video_chain, EditorWidgets};
 use lyrics::{
@@ -93,6 +94,7 @@ struct UiModel {
     show_original: bool,
     show_romanization: bool,
     show_english: bool,
+    asr_model_size: AsrModelSize,
     busy: Option<String>,
     message: Option<String>,
     error: Option<String>,
@@ -211,10 +213,10 @@ struct UiView {
     url_progress_provider: Rc<CssProvider>,
     status_label: Label,
     clock_label: Label,
-    lyric_scroll: ScrolledWindow,
     lyric_box: GtkBox,
     member_box: GtkBox,
     quality_combo: ComboBoxText,
+    asr_model_combo: ComboBoxText,
     settings_revealer: Revealer,
     query_entry: Entry,
     original_toggle: CheckButton,
@@ -227,6 +229,7 @@ struct UiView {
     lyric_build_key: Rc<RefCell<String>>,
     format_render_key: Rc<RefCell<String>>,
     suppress_quality_reload: Rc<Cell<bool>>,
+    suppress_asr_model_reload: Rc<Cell<bool>>,
     video_overlay: Rc<VideoOverlay>,
     member_image_cache: Rc<RefCell<HashMap<String, String>>>,
     member_image_pending: Rc<RefCell<HashSet<String>>>,
@@ -237,6 +240,7 @@ struct UiView {
 fn build_main_window(app: &Application) -> Result<(), String> {
     load_stage_css();
     let ctx = Arc::new(AppContext::open()?);
+    let initial_asr_model = ctx.asr_model_size();
 
     let (position_tx, position_rx) = std::sync::mpsc::channel::<VideoPosition>();
     let (error_tx, error_rx) = std::sync::mpsc::channel::<String>();
@@ -270,6 +274,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         show_original: true,
         show_romanization: false,
         show_english: true,
+        asr_model_size: initial_asr_model,
         busy: None,
         message: None,
         error: None,
@@ -357,21 +362,17 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     stage_toolbar.pack_start(&lang_box, false, false, 0);
     stage_toolbar.pack_end(&clock_label, false, false, 0);
 
-    let lyric_scroll = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-    lyric_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    lyric_scroll.set_vexpand(true);
-    lyric_scroll.set_margin_start(8);
-    lyric_scroll.set_margin_end(8);
-    lyric_scroll.set_margin_bottom(8);
     let lyric_box = GtkBox::new(Orientation::Vertical, 4);
     lyric_box.set_valign(gtk::Align::Start);
-    lyric_scroll.add(&lyric_box);
+    lyric_box.set_margin_start(8);
+    lyric_box.set_margin_end(8);
+    lyric_box.set_margin_bottom(8);
 
     let lyric_frame = Frame::new(None);
     lyric_frame.set_shadow_type(gtk::ShadowType::None);
     lyric_frame.style_context().add_class("lyric-stage-panel");
     lyric_frame.set_vexpand(true);
-    lyric_frame.add(&lyric_scroll);
+    lyric_frame.add(&lyric_box);
 
     let play_button = Button::with_label("Start Sync");
     let pause_button = Button::with_label("Pause Sync");
@@ -390,6 +391,16 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let save_button = Button::with_label("Save");
     let settings_panel = GtkBox::new(Orientation::Vertical, 6);
     settings_panel.pack_start(&query_entry, false, false, 0);
+
+    let asr_model_row = GtkBox::new(Orientation::Horizontal, 8);
+    asr_model_row.pack_start(&Label::new(Some("ASR model")), false, false, 0);
+    let asr_model_combo = ComboBoxText::new();
+    asr_model_combo.append(Some("small"), AsrModelSize::Small.label());
+    asr_model_combo.append(Some("large"), AsrModelSize::Large.label());
+    asr_model_combo.set_active_id(Some(initial_asr_model.as_storage()));
+    asr_model_row.pack_start(&asr_model_combo, false, false, 0);
+    settings_panel.pack_start(&asr_model_row, false, false, 0);
+
     let settings_actions = GtkBox::new(Orientation::Horizontal, 6);
     settings_actions.pack_start(&fetch_lyrics_button, false, false, 0);
     settings_actions.pack_start(&fetch_captions_button, false, false, 0);
@@ -450,10 +461,10 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         url_progress_provider: Rc::clone(&url_progress_provider),
         status_label: status_label.clone(),
         clock_label: clock_label.clone(),
-        lyric_scroll: lyric_scroll.clone(),
         lyric_box: lyric_box.clone(),
         member_box: member_box.clone(),
         quality_combo: quality_combo.clone(),
+        asr_model_combo: asr_model_combo.clone(),
         settings_revealer: settings_revealer.clone(),
         query_entry: query_entry.clone(),
         original_toggle: original_toggle.clone(),
@@ -470,6 +481,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         lyric_build_key: Rc::new(RefCell::new(String::new())),
         format_render_key: Rc::new(RefCell::new(String::new())),
         suppress_quality_reload: Rc::new(Cell::new(false)),
+        suppress_asr_model_reload: Rc::new(Cell::new(false)),
         video_overlay: Rc::clone(&video_overlay),
         member_image_cache: Rc::new(RefCell::new(HashMap::new())),
         member_image_pending: Rc::new(RefCell::new(HashSet::new())),
@@ -617,6 +629,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         open_progress_tx,
         &url_entry,
         &quality_combo,
+        &asr_model_combo,
         &open_button,
         &stream_button,
         &settings_button,
@@ -709,6 +722,7 @@ impl UiView {
         ));
         self.query_entry.set_text(&model.query);
         self.sync_language_toggles(&model);
+        self.sync_asr_model_combo(&model);
         render_status(&self.status_label, &model);
         self.schedule_lyric_build(&model);
         drop(model);
@@ -735,9 +749,7 @@ impl UiView {
     }
 
     fn sync_active_line(&self, model: &UiModel) {
-        self.lyric_stage
-            .borrow()
-            .set_active(model.active_index, &self.lyric_scroll);
+        self.lyric_stage.borrow().set_active(model.active_index);
         let highlight = model
             .song
             .as_ref()
@@ -765,6 +777,18 @@ impl UiView {
         }
         if self.english_toggle.is_active() != model.show_english {
             self.english_toggle.set_active(model.show_english);
+        }
+    }
+
+    fn sync_asr_model_combo(&self, model: &UiModel) {
+        if self.suppress_asr_model_reload.get() {
+            return;
+        }
+        let target = model.asr_model_size.as_storage();
+        if self.asr_model_combo.active_id().as_deref() != Some(target) {
+            self.suppress_asr_model_reload.set(true);
+            self.asr_model_combo.set_active_id(Some(target));
+            self.suppress_asr_model_reload.set(false);
         }
     }
 
@@ -826,6 +850,7 @@ fn connect_view_handlers(
     open_progress_tx: std::sync::mpsc::Sender<f64>,
     url_entry: &Entry,
     quality_combo: &ComboBoxText,
+    asr_model_combo: &ComboBoxText,
     open_button: &Button,
     stream_button: &Button,
     settings_button: &Button,
@@ -881,6 +906,32 @@ fn connect_view_handlers(
                 Ok(Box::new(move |model: &mut UiModel| {
                     model.pending_stream = Some(spec);
                 }) as Box<dyn FnOnce(&mut UiModel) + Send>)
+            });
+        });
+    }
+
+    {
+        let view = Rc::clone(view);
+        let asr_model_combo = asr_model_combo.clone();
+        let suppress = Rc::clone(&view.suppress_asr_model_reload);
+        asr_model_combo.connect_changed(move |combo| {
+            if suppress.get() {
+                return;
+            }
+            let Some(id) = combo.active_id() else {
+                return;
+            };
+            let size = AsrModelSize::from_storage(&id);
+            view.refresh_mut(|model| {
+                model.asr_model_size = size;
+                if let Err(err) = model.ctx.set_asr_model_size(size) {
+                    model.error = Some(err);
+                } else {
+                    model.message = Some(format!(
+                        "ASR model set to {}",
+                        size.label()
+                    ));
+                }
             });
         });
     }
@@ -1397,15 +1448,21 @@ fn active_lyric_index(alignment: &[AlignmentLine], current_ms: i64) -> usize {
 
     if let Some(active) = synced
         .iter()
-        .find(|line| current_ms >= line.start_ms && current_ms <= line.end_ms)
+        .find(|line| current_ms >= line.start_ms && current_ms < line.end_ms)
     {
         return active.lyric_index;
     }
 
+    // Fallback: latest line whose start time has passed.
+    // When several lines share a start time, prefer the earliest lyric in the song.
     if let Some(active) = synced
         .iter()
         .filter(|line| current_ms >= line.start_ms)
-        .max_by_key(|line| line.start_ms)
+        .max_by(|left, right| {
+            left.start_ms
+                .cmp(&right.start_ms)
+                .then_with(|| right.lyric_index.cmp(&left.lyric_index))
+        })
     {
         return active.lyric_index;
     }

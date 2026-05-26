@@ -471,9 +471,247 @@ pub fn lyric_alignment_text(line: &LyricLine) -> &str {
     &line.original
 }
 
-pub fn align_lyrics_to_whisper_words(
+pub fn lyric_whisper_alignment_text(line: &LyricLine, use_original: bool) -> &str {
+    if use_original && !line.original.trim().is_empty() {
+        return &line.original;
+    }
+    lyric_alignment_text(line)
+}
+
+pub fn lyric_line_for_forced_alignment(line: &LyricLine, use_original: bool) -> Option<&str> {
+    let text = lyric_whisper_alignment_text(line, use_original).trim();
+    if text.is_empty() || looks_like_metadata(&normalize_text(text)) {
+        return None;
+    }
+    Some(text)
+}
+
+pub fn build_lyrics_forced_alignment_text(lyrics: &[LyricLine], use_original: bool) -> String {
+    build_lyrics_forced_alignment_bundle(lyrics, use_original).0
+}
+
+pub fn build_lyrics_forced_alignment_bundle(
     lyrics: &[LyricLine],
-    words: &[crate::whisper::WhisperWord],
+    use_original: bool,
+) -> (String, Vec<crate::asr::ForcedAlignLine>) {
+    let mut text = String::new();
+    let mut lines = Vec::new();
+    for line in lyrics {
+        let Some(line_text) = lyric_line_for_forced_alignment(line, use_original) else {
+            continue;
+        };
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        let char_start = text.len();
+        text.push_str(line_text);
+        lines.push(crate::asr::ForcedAlignLine {
+            index: line.index,
+            text: line_text.to_string(),
+            char_start,
+            char_end: text.len(),
+        });
+    }
+    (text, lines)
+}
+
+/// Reject forced-alignment output that clusters most lines on a few timestamps
+/// or leaves an opening line spanning tens of seconds (symptom of bad FA word times).
+pub fn forced_line_timing_quality(lines: &[AlignmentLine]) -> f64 {
+    let synced: Vec<&AlignmentLine> = lines
+        .iter()
+        .filter(|line| has_playback_timing(line))
+        .collect();
+    if synced.len() < 4 {
+        return 0.0;
+    }
+
+    let distinct_starts = synced
+        .iter()
+        .map(|line| line.start_ms)
+        .collect::<HashSet<_>>()
+        .len();
+    let start_spread = distinct_starts as f64 / synced.len() as f64;
+    if start_spread < 0.35 {
+        return 0.0;
+    }
+
+    if let Some(first) = synced.iter().min_by_key(|line| line.lyric_index) {
+        let first_span = first.end_ms - first.start_ms;
+        if first_span > 25_000 {
+            return 0.0;
+        }
+    }
+
+    let max_span = synced
+        .iter()
+        .map(|line| line.end_ms - line.start_ms)
+        .max()
+        .unwrap_or(0);
+    if max_span > 45_000 {
+        return 0.0;
+    }
+
+    start_spread
+}
+
+fn is_cjk_codepoint(cp: u32) -> bool {
+    (0x4E00..=0x9FFF).contains(&cp)
+        || (0x3400..=0x4DBF).contains(&cp)
+        || (0x3040..=0x309F).contains(&cp)
+        || (0x30A0..=0x30FF).contains(&cp)
+        || (0xAC00..=0xD7AF).contains(&cp)
+        || (0x3000..=0x303F).contains(&cp)
+        || (0xFF00..=0xFFEF).contains(&cp)
+}
+
+fn tokenise_alignment_words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if is_cjk_codepoint(ch as u32) {
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            out.push(ch.to_string());
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+pub fn clamp_alignment_line_ends(alignment: &mut [AlignmentLine]) {
+    let synced_indices: Vec<usize> = alignment
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| has_playback_timing(line))
+        .map(|(index, _)| index)
+        .collect();
+
+    let mut ordered = synced_indices;
+    ordered.sort_by_key(|&index| alignment[index].start_ms);
+
+    for window in ordered.windows(2) {
+        let left = window[0];
+        let right = window[1];
+        let next_start = alignment[right].start_ms;
+        let line = &mut alignment[left];
+        if line.end_ms >= next_start {
+            line.end_ms = (next_start - 1).max(line.start_ms + 200);
+        }
+    }
+}
+
+pub fn align_lyrics_from_line_timings(
+    lyrics: &[LyricLine],
+    timings: &[crate::asr::AsrLineTiming],
+) -> Vec<AlignmentLine> {
+    let mut alignment: Vec<AlignmentLine> = lyrics
+        .iter()
+        .map(|line| {
+            timings
+                .iter()
+                .find(|timing| timing.lyric_index == line.index)
+                .and_then(|timing| {
+                    let start_ms = timing.start_ms?;
+                    let end_ms = timing.end_ms?;
+                    Some(AlignmentLine {
+                        lyric_index: line.index,
+                        caption_index: Some(0),
+                        start_ms,
+                        end_ms: end_ms.max(start_ms + 200),
+                        confidence: 0.98,
+                        needs_review: false,
+                    })
+                })
+                .unwrap_or_else(|| unsynced_alignment_line(line.index))
+        })
+        .collect();
+    clamp_alignment_line_ends(&mut alignment);
+    let synced_count = alignment.iter().filter(|line| is_synced_line(line)).count();
+    if synced_count * 2 < alignment.len() {
+        interpolate_whisper_unsynced_timings(&mut alignment);
+    }
+    alignment
+}
+
+pub fn align_lyrics_to_forced_words(
+    lyrics: &[LyricLine],
+    words: &[crate::asr::AsrWord],
+    use_original: bool,
+) -> Vec<AlignmentLine> {
+    if lyrics.is_empty() {
+        return Vec::new();
+    }
+    if words.is_empty() {
+        return lyrics
+            .iter()
+            .map(|line| unsynced_alignment_line(line.index))
+            .collect();
+    }
+
+    let mut word_index = 0;
+    let mut alignment = Vec::with_capacity(lyrics.len());
+    for line in lyrics {
+        let text = lyric_whisper_alignment_text(line, use_original);
+        if text.trim().is_empty() || looks_like_metadata(&normalize_text(text)) {
+            alignment.push(unsynced_alignment_line(line.index));
+            continue;
+        }
+
+        let expected = tokenise_alignment_words(text);
+        if expected.is_empty() {
+            alignment.push(unsynced_alignment_line(line.index));
+            continue;
+        }
+
+        if word_index + expected.len() > words.len() {
+            alignment.push(unsynced_alignment_line(line.index));
+            continue;
+        }
+
+        let chunk = &words[word_index..word_index + expected.len()];
+        word_index += expected.len();
+        let start_ms = chunk.iter().map(|word| word.start_ms).min().unwrap_or(0);
+        let end_ms = chunk
+            .iter()
+            .map(|word| word.end_ms)
+            .max()
+            .unwrap_or(start_ms + 900)
+            .max(start_ms + 200);
+        alignment.push(AlignmentLine {
+            lyric_index: line.index,
+            caption_index: Some(word_index.saturating_sub(1)),
+            start_ms,
+            end_ms,
+            confidence: 0.98,
+            needs_review: false,
+        });
+    }
+
+    if word_index != words.len() {
+        return align_lyrics_to_timed_words(lyrics, words, use_original);
+    }
+
+    clamp_alignment_line_ends(&mut alignment);
+    interpolate_whisper_unsynced_timings(&mut alignment);
+    alignment
+}
+
+pub fn align_lyrics_to_timed_words(
+    lyrics: &[LyricLine],
+    words: &[crate::asr::AsrWord],
+    use_original: bool,
 ) -> Vec<AlignmentLine> {
     if lyrics.is_empty() {
         return Vec::new();
@@ -489,7 +727,7 @@ pub fn align_lyrics_to_whisper_words(
     let m = words.len();
     let normalized_lyrics: Vec<String> = lyrics
         .par_iter()
-        .map(|line| normalize_text(lyric_alignment_text(line)))
+        .map(|line| normalize_text(lyric_whisper_alignment_text(line, use_original)))
         .collect();
     let normalized_words: Vec<String> = words
         .par_iter()
@@ -616,6 +854,7 @@ pub fn align_lyrics_to_whisper_words(
         }
     }
 
+    clamp_alignment_line_ends(&mut alignment);
     interpolate_whisper_unsynced_timings(&mut alignment);
     alignment
 }
@@ -1004,8 +1243,72 @@ mod tests {
     }
 
     #[test]
+    fn aligns_english_lyrics_to_forced_word_timestamps() {
+        use crate::asr::AsrWord;
+
+        let lyrics = vec![
+            english_lyric(0, "This is the first line"),
+            english_lyric(1, "Here comes the second"),
+        ];
+        let words = vec![
+            AsrWord {
+                text: "This".into(),
+                start_ms: 1000,
+                end_ms: 1200,
+            },
+            AsrWord {
+                text: "is".into(),
+                start_ms: 1200,
+                end_ms: 1350,
+            },
+            AsrWord {
+                text: "the".into(),
+                start_ms: 1350,
+                end_ms: 1500,
+            },
+            AsrWord {
+                text: "first".into(),
+                start_ms: 1500,
+                end_ms: 1700,
+            },
+            AsrWord {
+                text: "line".into(),
+                start_ms: 1700,
+                end_ms: 2000,
+            },
+            AsrWord {
+                text: "Here".into(),
+                start_ms: 2200,
+                end_ms: 2400,
+            },
+            AsrWord {
+                text: "comes".into(),
+                start_ms: 2400,
+                end_ms: 2600,
+            },
+            AsrWord {
+                text: "the".into(),
+                start_ms: 2600,
+                end_ms: 2750,
+            },
+            AsrWord {
+                text: "second".into(),
+                start_ms: 2750,
+                end_ms: 3100,
+            },
+        ];
+
+        let output = align_lyrics_to_forced_words(&lyrics, &words, false);
+        assert_eq!(output.len(), 2);
+        assert!(is_synced_line(&output[0]));
+        assert!(is_synced_line(&output[1]));
+        assert_eq!(output[0].start_ms, 1000);
+        assert_eq!(output[1].start_ms, 2200);
+    }
+
+    #[test]
     fn aligns_english_lyrics_to_whisper_word_timestamps() {
-        use crate::whisper::WhisperWord;
+        use crate::asr::AsrWord;
 
         let lyrics = vec![
             english_lyric(0, "(Hahaha) This is for all my ladies"),
@@ -1013,89 +1316,89 @@ mod tests {
             english_lyric(2, "If you've been done wrong"),
         ];
         let words = vec![
-            WhisperWord {
+            AsrWord {
                 text: "This".into(),
                 start_ms: 3760,
                 end_ms: 3900,
             },
-            WhisperWord {
+            AsrWord {
                 text: "is".into(),
                 start_ms: 3900,
                 end_ms: 4020,
             },
-            WhisperWord {
+            AsrWord {
                 text: "for".into(),
                 start_ms: 4020,
                 end_ms: 4140,
             },
-            WhisperWord {
+            AsrWord {
                 text: "all".into(),
                 start_ms: 4140,
                 end_ms: 4260,
             },
-            WhisperWord {
+            AsrWord {
                 text: "my".into(),
                 start_ms: 4260,
                 end_ms: 4380,
             },
-            WhisperWord {
+            AsrWord {
                 text: "ladies".into(),
                 start_ms: 4380,
                 end_ms: 4700,
             },
-            WhisperWord {
+            AsrWord {
                 text: "who".into(),
                 start_ms: 4700,
                 end_ms: 4820,
             },
-            WhisperWord {
+            AsrWord {
                 text: "don't".into(),
                 start_ms: 4820,
                 end_ms: 4980,
             },
-            WhisperWord {
+            AsrWord {
                 text: "get".into(),
                 start_ms: 4980,
                 end_ms: 5080,
             },
-            WhisperWord {
+            AsrWord {
                 text: "hyped".into(),
                 start_ms: 5080,
                 end_ms: 5240,
             },
-            WhisperWord {
+            AsrWord {
                 text: "enough".into(),
                 start_ms: 5240,
                 end_ms: 5480,
             },
-            WhisperWord {
+            AsrWord {
                 text: "If".into(),
                 start_ms: 5600,
                 end_ms: 5720,
             },
-            WhisperWord {
+            AsrWord {
                 text: "you've".into(),
                 start_ms: 5720,
                 end_ms: 5880,
             },
-            WhisperWord {
+            AsrWord {
                 text: "been".into(),
                 start_ms: 5880,
                 end_ms: 6000,
             },
-            WhisperWord {
+            AsrWord {
                 text: "done".into(),
                 start_ms: 6000,
                 end_ms: 6160,
             },
-            WhisperWord {
+            AsrWord {
                 text: "wrong".into(),
                 start_ms: 6160,
                 end_ms: 6400,
             },
         ];
 
-        let output = align_lyrics_to_whisper_words(&lyrics, &words);
+        let output = align_lyrics_to_timed_words(&lyrics, &words, false);
         assert!(has_playback_timing(&output[1]));
         assert!(output[1].start_ms >= 4700);
         assert!(output[1].end_ms <= 5600);
@@ -1104,56 +1407,110 @@ mod tests {
 
     #[test]
     fn rejects_whisper_false_match_on_different_opening_word() {
-        use crate::whisper::WhisperWord;
+        use crate::asr::AsrWord;
 
         let lyrics = vec![
             english_lyric(0, "Have you feeling low when you're grown you got the"),
             english_lyric(1, "(Ooh) This your moment go get it"),
         ];
         let words = vec![
-            WhisperWord {
+            AsrWord {
                 text: "feeling".into(),
                 start_ms: 31_700,
                 end_ms: 32_000,
             },
-            WhisperWord {
+            AsrWord {
                 text: "low".into(),
                 start_ms: 32_000,
                 end_ms: 32_300,
             },
-            WhisperWord {
+            AsrWord {
                 text: "You".into(),
                 start_ms: 33_740,
                 end_ms: 33_900,
             },
-            WhisperWord {
+            AsrWord {
                 text: "got".into(),
                 start_ms: 33_900,
                 end_ms: 34_100,
             },
-            WhisperWord {
+            AsrWord {
                 text: "it".into(),
                 start_ms: 34_100,
                 end_ms: 34_300,
             },
-            WhisperWord {
+            AsrWord {
                 text: "you".into(),
                 start_ms: 34_820,
                 end_ms: 35_000,
             },
-            WhisperWord {
+            AsrWord {
                 text: "already".into(),
                 start_ms: 35_280,
                 end_ms: 35_600,
             },
-            WhisperWord {
+            AsrWord {
                 text: "know".into(),
                 start_ms: 35_680,
                 end_ms: 36_000,
             },
         ];
 
-        let output = align_lyrics_to_whisper_words(&lyrics, &words);
+        let output = align_lyrics_to_timed_words(&lyrics, &words, false);
         assert!(!is_synced_line(&output[1]));
+    }
+
+    #[test]
+    fn rejects_clustered_forced_line_timings() {
+        let lines = vec![
+            AlignmentLine {
+                lyric_index: 0,
+                caption_index: Some(0),
+                start_ms: 0,
+                end_ms: 100_000,
+                confidence: 0.98,
+                needs_review: false,
+            },
+            AlignmentLine {
+                lyric_index: 1,
+                caption_index: Some(0),
+                start_ms: 103_120,
+                end_ms: 103_320,
+                confidence: 0.98,
+                needs_review: false,
+            },
+            AlignmentLine {
+                lyric_index: 2,
+                caption_index: Some(0),
+                start_ms: 103_120,
+                end_ms: 103_320,
+                confidence: 0.98,
+                needs_review: false,
+            },
+            AlignmentLine {
+                lyric_index: 3,
+                caption_index: Some(0),
+                start_ms: 103_120,
+                end_ms: 103_320,
+                confidence: 0.98,
+                needs_review: false,
+            },
+        ];
+        assert_eq!(forced_line_timing_quality(&lines), 0.0);
+    }
+
+    #[test]
+    fn accepts_spread_forced_line_timings() {
+        let lines = (0..8)
+            .map(|index| AlignmentLine {
+                lyric_index: index,
+                caption_index: Some(0),
+                start_ms: 90_000 + (index as i64 * 2_000),
+                end_ms: 90_000 + (index as i64 * 2_000) + 1_500,
+                confidence: 0.98,
+                needs_review: false,
+            })
+            .collect::<Vec<_>>();
+        assert!(forced_line_timing_quality(&lines) > 0.0);
     }
 }

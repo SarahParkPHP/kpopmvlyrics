@@ -2,12 +2,17 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::align::{
-    align_lines, align_lyrics_to_whisper_words, alignment_playback_quality, AlignmentInput,
+    align_lines, align_lyrics_from_line_timings, align_lyrics_to_forced_words,
+    align_lyrics_to_timed_words, alignment_playback_quality, build_lyrics_forced_alignment_bundle,
+    forced_line_timing_quality, lyric_whisper_alignment_text, AlignmentInput,
+};
+use crate::asr::{
+    asr_available, asr_caption_lines, asr_setup_hint, effective_asr_model, forced_align_language,
+    transcribe_video, AsrModelSize, AsrTranscript,
 };
 use crate::log::{progress, PhaseGuard, verbose};
 use crate::lyrics::lyric_language_toggles;
 use rayon::prelude::*;
-use crate::whisper::{whisper_available, whisper_caption_lines, whisper_setup_hint, transcribe_video};
 use crate::captions::{parse_caption_text, CaptionProvider, YouTubeCaptionProvider};
 use crate::db::Repository;
 use crate::lyrics::{ColorCodedLyricsProvider, GeniusProvider, LyricsProvider};
@@ -26,6 +31,8 @@ pub struct AppContext {
     repo: Mutex<Repository>,
 }
 
+const ASR_MODEL_SETTING: &str = "whisper_model";
+
 impl AppContext {
     pub fn open() -> Result<Self, String> {
         let app_dir = app_data_dir()?;
@@ -34,6 +41,26 @@ impl AppContext {
         Ok(Self {
             repo: Mutex::new(repo),
         })
+    }
+
+    pub fn asr_model_size(&self) -> AsrModelSize {
+        self.repo
+            .lock()
+            .ok()
+            .and_then(|repo| repo.get_user_setting(ASR_MODEL_SETTING).ok())
+            .flatten()
+            .map(|value| AsrModelSize::from_storage(&value))
+            .unwrap_or_default()
+    }
+
+    pub fn set_asr_model_size(&self, size: AsrModelSize) -> Result<(), String> {
+        let repo = self.repo.lock().map_err(to_string)?;
+        repo.set_user_setting(ASR_MODEL_SETTING, size.as_storage())
+            .map_err(to_string)
+    }
+
+    pub fn effective_asr_model(&self) -> AsrModelSize {
+        effective_asr_model(self.asr_model_size())
     }
 
     pub fn resolve_video_metadata(&self, url: &str) -> Result<VideoMetadata, String> {
@@ -151,9 +178,18 @@ impl AppContext {
         };
         verbose(format!("align caption tracks={}", track_sets.len()));
         let (has_original, has_romanization, has_english) = lyric_language_toggles(&lyrics);
-        let prefer_whisper = has_english && !has_original && !has_romanization;
+        let prefer_asr =
+            has_original || (has_english && !has_original && !has_romanization);
+        let asr_use_original = has_original;
+        let asr_language = if has_original {
+            Some("ko")
+        } else if has_english && !has_original && !has_romanization {
+            Some("en")
+        } else {
+            None
+        };
         verbose(format!(
-            "align languages original={has_original} roman={has_romanization} english={has_english} prefer_whisper={prefer_whisper}"
+            "align languages original={has_original} roman={has_romanization} english={has_english} prefer_asr={prefer_asr} asr_lang={asr_language:?}"
         ));
         let mut summary = String::from("Aligned from YouTube captions");
 
@@ -196,52 +232,132 @@ impl AppContext {
             best_alignment.len()
         ));
 
-        if prefer_whisper {
+        if prefer_asr {
             report_progress(0.78);
-            progress("align whisper branch", 0.78);
-            let _phase = PhaseGuard::begin("align whisper_available check");
-            let whisper_ok = whisper_available();
-            verbose(format!("align whisper_available={whisper_ok}"));
+            progress("align asr branch", 0.78);
+            let _phase = PhaseGuard::begin("align asr_available check");
+            let asr_ok = asr_available();
+            verbose(format!("align asr_available={asr_ok}"));
             drop(_phase);
-            if whisper_ok {
-                let result = {
+            if asr_ok {
+                let model_size = self.effective_asr_model();
+                verbose(format!("align asr model={}", model_size.model_filename()));
+                // CCL "original" lines often mix Korean and English; English lyrics align more reliably.
+                let align_with_english = has_english;
+                let (lyrics_text, forced_lines, primary_align_language, asr_language_for_run) =
+                    if align_with_english {
+                        let (text, lines) =
+                            build_lyrics_forced_alignment_bundle(&lyrics, false);
+                        (text, lines, "English", Some("en"))
+                    } else {
+                        let lang = forced_align_language(asr_use_original, asr_language);
+                        let (text, lines) =
+                            build_lyrics_forced_alignment_bundle(&lyrics, asr_use_original);
+                        (text, lines, lang, asr_language)
+                    };
+                let transcript = {
                     let _phase = PhaseGuard::begin("align transcribe_video");
-                    transcribe_video(video_id, Some("en"))
+                    transcribe_video(
+                        video_id,
+                        asr_language_for_run,
+                        model_size,
+                        Some(&lyrics_text),
+                        Some(&forced_lines),
+                        Some(primary_align_language),
+                    )
                 };
-                match result {
+                let transcript = match transcript {
+                    Ok(mut primary) => {
+                        let primary_alignment = alignment_from_transcript(
+                            &lyrics,
+                            &primary,
+                            !align_with_english && asr_use_original,
+                        );
+                        if forced_line_timing_quality(&primary_alignment) == 0.0
+                            && has_english
+                            && !align_with_english
+                        {
+                            verbose("align asr retrying forced alignment with English lyrics");
+                            let (english_text, english_lines) =
+                                build_lyrics_forced_alignment_bundle(&lyrics, false);
+                            if let Ok(english_transcript) = transcribe_video(
+                                video_id,
+                                Some("en"),
+                                model_size,
+                                Some(&english_text),
+                                Some(&english_lines),
+                                Some("English"),
+                            ) {
+                                let english_alignment = alignment_from_transcript(
+                                    &lyrics,
+                                    &english_transcript,
+                                    false,
+                                );
+                                if forced_line_timing_quality(&english_alignment)
+                                    > forced_line_timing_quality(&primary_alignment)
+                                {
+                                    primary = english_transcript;
+                                }
+                            }
+                        }
+                        Ok(primary)
+                    }
+                    Err(err) => Err(err),
+                };
+                match transcript {
                     Ok(transcript) if !transcript.words.is_empty() => {
                         verbose(format!(
-                            "align whisper words={} device={:?}",
+                            "align asr words={} source={:?} line_timings={}",
                             transcript.words.len(),
-                            transcript.device
+                            transcript.alignment_source,
+                            transcript.line_timings.len()
                         ));
-                        let whisper_captions = whisper_caption_lines(video_id, &transcript);
-                        let whisper_alignment =
-                            align_lyrics_to_whisper_words(&lyrics, &transcript.words);
-                        best_alignment = whisper_alignment;
-                        best_captions = whisper_captions;
-                        let device = transcript.device.as_deref().unwrap_or("cpu");
-                        summary = format!(
-                            "Aligned with Whisper ({}, {} words)",
-                            device,
-                            transcript.words.len()
+                        let asr_captions = asr_caption_lines(video_id, &transcript);
+                        let asr_alignment = alignment_from_transcript(
+                            &lyrics,
+                            &transcript,
+                            !align_with_english && asr_use_original,
                         );
-                        eprintln!("kpopmvlyrics: {summary}");
+                        let asr_score = alignment_playback_quality(&asr_alignment);
+                        let timing_quality = forced_line_timing_quality(&asr_alignment);
+                        verbose(format!(
+                            "align asr score={asr_score:.3} timing_quality={timing_quality:.3} caption_score={best_score:.3}"
+                        ));
+                        if timing_quality > 0.0 {
+                            best_alignment = asr_alignment;
+                            best_captions = asr_captions;
+                            let backend = transcript
+                                .backend
+                                .as_deref()
+                                .unwrap_or(model_size.backend());
+                            summary = format!(
+                                "Aligned with Qwen3 ASR ({}, {} words, {})",
+                                backend,
+                                transcript.words.len(),
+                                runtime_device_label(&transcript)
+                            );
+                            eprintln!("kpopmvlyrics: {summary}");
+                        } else {
+                            summary = format!(
+                                "Qwen3 ASR timings looked unreliable (quality={timing_quality:.2}); kept caption alignment"
+                            );
+                            eprintln!("kpopmvlyrics: {summary}");
+                        }
                     }
                     Ok(_) => {
-                        summary = "Whisper returned no words; kept YouTube caption alignment"
+                        summary = "Qwen3 ASR returned no words; kept YouTube caption alignment"
                             .into();
                         eprintln!("kpopmvlyrics: {summary}");
                     }
                     Err(err) => {
-                        summary = format!("Whisper failed ({err}); kept YouTube caption alignment");
+                        summary = format!("Qwen3 ASR failed ({err}); kept YouTube caption alignment");
                         eprintln!("kpopmvlyrics: {summary}");
                     }
                 }
             } else {
                 summary = format!(
-                    "Whisper unavailable ({}); kept YouTube caption alignment",
-                    whisper_setup_hint()
+                    "Qwen3 ASR unavailable ({}); kept YouTube caption alignment",
+                    asr_setup_hint()
                 );
                 eprintln!("kpopmvlyrics: {summary}");
             }
@@ -326,6 +442,29 @@ impl AppContext {
         repo.save_member_override(group_name, member)
             .map_err(to_string)?;
         Ok(member.clone())
+    }
+}
+
+fn alignment_from_transcript(
+    lyrics: &[LyricLine],
+    transcript: &AsrTranscript,
+    use_original: bool,
+) -> Vec<AlignmentLine> {
+    if !transcript.line_timings.is_empty() {
+        align_lyrics_from_line_timings(lyrics, &transcript.line_timings)
+    } else if transcript.alignment_source.as_deref() == Some("lyrics") {
+        align_lyrics_to_forced_words(lyrics, &transcript.words, use_original)
+    } else {
+        align_lyrics_to_timed_words(lyrics, &transcript.words, use_original)
+    }
+}
+
+fn runtime_device_label(transcript: &AsrTranscript) -> &'static str {
+    match transcript.device.as_deref() {
+        Some(device) if device.eq_ignore_ascii_case("cuda") => "cuda",
+        Some(device) if device.eq_ignore_ascii_case("cpu") => "cpu",
+        Some(_) => "auto",
+        None => "auto",
     }
 }
 

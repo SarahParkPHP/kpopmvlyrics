@@ -10,7 +10,7 @@ mod player;
 mod process_util;
 mod tauri_app;
 mod video;
-mod whisper;
+mod asr;
 
 #[cfg(target_os = "linux")]
 mod ui;

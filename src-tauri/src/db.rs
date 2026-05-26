@@ -298,6 +298,31 @@ impl Repository {
         Ok(())
     }
 
+    pub fn get_user_setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM user_overrides WHERE entity_type='setting' AND entity_key=?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_user_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO user_overrides (entity_type, entity_key, value, updated_at)
+            VALUES ('setting', ?1, ?2, CURRENT_TIMESTAMP)
+            ON CONFLICT(entity_type, entity_key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=CURRENT_TIMESTAMP
+            "#,
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn alignment_count(&self, song_id: i64, video_id: &str) -> Result<i64> {
         Ok(self.conn.query_row(

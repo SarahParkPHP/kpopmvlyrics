@@ -14,8 +14,10 @@ src-tauri/target/
 # Local tool cache
 .fallow/
 
-# Python venv for faster-whisper
+# Python venv for Qwen3 ASR (CrispASR)
+.venv-asr/
 .venv-whisper/
+.vendor/crispasr/
 
 # Environment
 .env

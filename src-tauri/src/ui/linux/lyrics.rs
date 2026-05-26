@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use gtk::prelude::*;
-use gtk::{Box as GtkBox, Label, Orientation, ScrolledWindow};
+use gtk::{Box as GtkBox, Label, Orientation};
 
 use crate::align::has_playback_timing;
 use crate::app::format_ms;
@@ -131,15 +131,20 @@ pub fn compute_lyric_stage_content(
     }
 }
 
-pub struct LyricStage {
-    content_key: String,
-    rows: Vec<LyricRowWidget>,
-    last_active: Cell<Option<usize>>,
+struct LyricStageWidgets {
+    empty_label: Label,
+    text_box: GtkBox,
+    original_label: Label,
+    roman_label: Label,
+    english_label: Label,
 }
 
-struct LyricRowWidget {
-    line_index: usize,
-    row: GtkBox,
+pub struct LyricStage {
+    content_key: String,
+    rows: Vec<LyricRowContent>,
+    empty_message: Option<String>,
+    last_active: Cell<Option<usize>>,
+    widgets: Option<LyricStageWidgets>,
 }
 
 impl LyricStage {
@@ -147,7 +152,9 @@ impl LyricStage {
         Self {
             content_key: String::new(),
             rows: Vec::new(),
+            empty_message: None,
             last_active: Cell::new(None),
+            widgets: None,
         }
     }
 
@@ -168,104 +175,151 @@ impl LyricStage {
         for child in container.children() {
             container.remove(&child);
         }
-        self.rows.clear();
+        self.widgets = None;
         self.last_active.set(None);
         self.content_key = content_key;
+        self.rows = content.rows;
+        self.empty_message = content.empty_message;
 
-        if let Some(message) = content.empty_message {
-            let empty = Label::new(None);
-            empty.set_markup(&format!(
-                "<span size='large' foreground='#666666'>{message}</span>"
-            ));
-            empty.set_line_wrap(true);
-            empty.set_xalign(0.5);
-            empty.set_halign(gtk::Align::Center);
-            empty.set_margin_top(48);
-            empty.set_margin_bottom(48);
-            container.pack_start(&empty, true, true, 0);
-            container.show_all();
-            return;
+        let panel = GtkBox::new(Orientation::Vertical, 6);
+        panel.set_halign(gtk::Align::Fill);
+        panel.set_valign(gtk::Align::Start);
+        panel.style_context().add_class("lyric-current-panel");
+
+        let empty_label = Label::new(None);
+        empty_label.set_line_wrap(true);
+        empty_label.set_xalign(0.5);
+        empty_label.set_halign(gtk::Align::Center);
+        empty_label.set_margin_top(24);
+        empty_label.set_margin_bottom(24);
+        empty_label.style_context().add_class("lyric-empty-message");
+
+        let text_box = GtkBox::new(Orientation::Vertical, 8);
+        text_box.set_halign(gtk::Align::Center);
+        text_box.set_valign(gtk::Align::Center);
+        text_box.style_context().add_class("lyric-current-line");
+
+        let original_label = markup_label("");
+        let roman_label = markup_label("");
+        let english_label = markup_label("");
+
+        text_box.pack_start(&original_label, false, false, 0);
+        text_box.pack_start(&roman_label, false, false, 0);
+        text_box.pack_start(&english_label, false, false, 0);
+
+        panel.pack_start(&empty_label, false, false, 0);
+        panel.pack_start(&text_box, false, false, 0);
+        container.pack_start(&panel, false, false, 0);
+
+        self.widgets = Some(LyricStageWidgets {
+            empty_label,
+            text_box,
+            original_label,
+            roman_label,
+            english_label,
+        });
+
+        if self.empty_message.is_some() {
+            self.show_empty_state();
+        } else {
+            self.show_line_display();
+            self.render_active_line(None);
         }
 
-        for row_content in content.rows {
-            let row = GtkBox::new(Orientation::Vertical, 4);
-            row.set_halign(gtk::Align::Fill);
-            row.style_context().add_class("lyric-line");
-
-            let text_box = GtkBox::new(Orientation::Vertical, 6);
-            text_box.set_halign(gtk::Align::Center);
-
-            if let Some(markup) = &row_content.original_markup {
-                text_box.pack_start(&markup_label(markup), false, false, 0);
-            }
-            if let Some(markup) = &row_content.roman_markup {
-                text_box.pack_start(&markup_label(markup), false, false, 0);
-            }
-            if let Some(markup) = &row_content.english_markup {
-                text_box.pack_start(&markup_label(markup), false, false, 0);
-            }
-
-            row.pack_start(&text_box, false, false, 0);
-            container.pack_start(&row, false, false, 0);
-            self.rows.push(LyricRowWidget {
-                line_index: row_content.line_index,
-                row,
-            });
-        }
         container.show_all();
     }
 
-    pub fn set_active(&self, active_index: usize, scroll: &ScrolledWindow) {
+    pub fn set_active(&self, active_index: usize) {
+        if self.empty_message.is_some() {
+            return;
+        }
         if self.last_active.get() == Some(active_index) {
             return;
         }
         self.last_active.set(Some(active_index));
-
-        let mut active_row: Option<GtkBox> = None;
-        for widget in &self.rows {
-            let context = widget.row.style_context();
-            let is_active = active_index != usize::MAX && widget.line_index == active_index;
-            if is_active {
-                context.add_class("lyric-line-active");
-                widget.row.set_opacity(1.0);
-                active_row = Some(widget.row.clone());
-            } else {
-                context.remove_class("lyric-line-active");
-                widget.row.set_opacity(0.34);
-            }
-        }
-
-        if let Some(row) = active_row {
-            scroll_to_row(scroll, &row);
-        }
+        self.render_active_line(Some(active_index));
     }
+
+    fn show_empty_state(&self) {
+        let Some(widgets) = &self.widgets else {
+            return;
+        };
+        if let Some(message) = &self.empty_message {
+            widgets.empty_label.set_markup(&format!(
+                "<span size='large' foreground='#666666'>{message}</span>"
+            ));
+            widgets.empty_label.show();
+        }
+        widgets.text_box.hide();
+    }
+
+    fn show_line_display(&self) {
+        let Some(widgets) = &self.widgets else {
+            return;
+        };
+        widgets.empty_label.hide();
+        widgets.text_box.show();
+    }
+
+    fn render_active_line(&self, active_index: Option<usize>) {
+        let Some(widgets) = &self.widgets else {
+            return;
+        };
+
+        let row = active_index.and_then(|index| {
+            if index == usize::MAX {
+                None
+            } else {
+                self.rows.iter().find(|row| row.line_index == index)
+            }
+        });
+
+        let Some(row) = row else {
+            widgets.original_label.hide();
+            widgets.roman_label.hide();
+            widgets.english_label.hide();
+            return;
+        };
+
+        set_markup_label(&widgets.original_label, row.original_markup.as_deref());
+        set_markup_label(&widgets.roman_label, row.roman_markup.as_deref());
+        set_markup_label(&widgets.english_label, row.english_markup.as_deref());
+    }
+}
+
+const LYRIC_DISPLAY_PANGO_SIZE: &str = "32768"; // 32pt in Pango markup units (pt * 1024)
+
+fn set_markup_label(label: &Label, markup: Option<&str>) {
+    match markup.filter(|value| !value.is_empty()) {
+        Some(markup) => {
+            label.set_markup(&wrap_lyric_display_markup(markup));
+            label.show();
+        }
+        None => label.hide(),
+    }
+}
+
+fn wrap_lyric_display_markup(inner: &str) -> String {
+    format!(
+        "<span size='{LYRIC_DISPLAY_PANGO_SIZE}' weight='heavy'>{inner}</span>"
+    )
+}
+
+fn configure_lyric_label(label: &Label) {
+    label.style_context().add_class("lyric-current-text");
+    label.set_xalign(0.5);
+    label.set_justify(gtk::Justification::Center);
+    label.set_line_wrap(true);
+    label.set_max_width_chars(52);
 }
 
 fn markup_label(markup: &str) -> Label {
     let label = Label::new(None);
-    label.set_markup(markup);
-    label.set_xalign(0.5);
-    label.set_justify(gtk::Justification::Center);
-    label.set_line_wrap(true);
-    label.set_max_width_chars(48);
+    configure_lyric_label(&label);
+    if !markup.is_empty() {
+        label.set_markup(&wrap_lyric_display_markup(markup));
+    }
     label
-}
-
-fn scroll_to_row(scroll: &ScrolledWindow, row: &GtkBox) {
-    let adj = scroll.vadjustment();
-    gtk::glib::idle_add_local_once({
-        let scroll = scroll.clone();
-        let row = row.clone();
-        move || {
-            let allocation = row.allocation();
-            let row_y = allocation.y() as f64;
-            let row_h = allocation.height() as f64;
-            let page = scroll.allocation().height().max(1) as f64;
-            let upper = adj.upper();
-            let target = (row_y - (page - row_h) * 0.42).clamp(0.0, (upper - page).max(0.0));
-            adj.set_value(target);
-        }
-    });
 }
 
 fn colored_markup(
@@ -342,22 +396,87 @@ fn colorize_plain_text(text: &str, color: Option<&str>) -> String {
     if let Some(color) = color.map(format_markup_color) {
         format!("<span foreground='{color}'>{escaped}</span>")
     } else {
-        escaped.to_string()
+        format!("<span foreground='#1a1a1a'>{escaped}</span>")
     }
 }
 
 fn format_markup_color(color: &str) -> String {
-    let trimmed = color.trim();
-    if trimmed.starts_with('#') {
-        trimmed.to_string()
-    } else {
-        format!("#{trimmed}")
+    readable_on_light_background(color)
+}
+
+const MIN_CONTRAST_ON_LIGHT: f64 = 4.5;
+const LIGHT_BACKGROUND: (f64, f64, f64) = (247.0 / 255.0, 247.0 / 255.0, 247.0 / 255.0);
+
+fn readable_on_light_background(color: &str) -> String {
+    let trimmed = color.trim().trim_start_matches('#');
+    let Some(mut rgb) = parse_hex_rgb(trimmed) else {
+        return if color.starts_with('#') {
+            color.to_string()
+        } else {
+            format!("#{color}")
+        };
+    };
+
+    let bg_lum = relative_luminance(LIGHT_BACKGROUND.0, LIGHT_BACKGROUND.1, LIGHT_BACKGROUND.2);
+    for _ in 0..28 {
+        let lum = relative_luminance(rgb.0, rgb.1, rgb.2);
+        if contrast_ratio(lum, bg_lum) >= MIN_CONTRAST_ON_LIGHT {
+            break;
+        }
+        rgb.0 = (rgb.0 * 0.86).max(0.0);
+        rgb.1 = (rgb.1 * 0.86).max(0.0);
+        rgb.2 = (rgb.2 * 0.86).max(0.0);
     }
+
+    rgb_to_hex(rgb.0, rgb.1, rgb.2)
+}
+
+fn parse_hex_rgb(trimmed: &str) -> Option<(f64, f64, f64)> {
+    let expanded = match trimmed.len() {
+        3 => trimmed
+            .chars()
+            .map(|ch| format!("{ch}{ch}"))
+            .collect::<String>(),
+        6 => trimmed.to_string(),
+        _ => return None,
+    };
+    let r = u8::from_str_radix(&expanded[0..2], 16).ok()? as f64 / 255.0;
+    let g = u8::from_str_radix(&expanded[2..4], 16).ok()? as f64 / 255.0;
+    let b = u8::from_str_radix(&expanded[4..6], 16).ok()? as f64 / 255.0;
+    Some((r, g, b))
+}
+
+fn rgb_to_hex(r: f64, g: f64, b: f64) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8
+    )
+}
+
+fn relative_luminance(r: f64, g: f64, b: f64) -> f64 {
+    fn channel(value: f64) -> f64 {
+        if value <= 0.03928 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+fn contrast_ratio(l1: f64, l2: f64) -> f64 {
+    let (lighter, darker) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (lighter + 0.05) / (darker + 0.05)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compute_lyric_stage_content;
+    use super::{
+        colored_markup, compute_lyric_stage_content, contrast_ratio, format_markup_color,
+        readable_on_light_background, relative_luminance,
+    };
     use crate::models::{LyricLine, LyricSegment, MemberProfile, Song, SongPackage};
 
     fn profile(name: &str, color: &str) -> MemberProfile {
@@ -370,6 +489,33 @@ mod tests {
             local_image_path: None,
             provider: None,
         }
+    }
+
+    fn light_bg_luminance() -> f64 {
+        relative_luminance(247.0 / 255.0, 247.0 / 255.0, 247.0 / 255.0)
+    }
+
+    fn meets_contrast(hex: &str) -> bool {
+        let rgb = super::parse_hex_rgb(hex.trim_start_matches('#')).expect("hex");
+        let lum = relative_luminance(rgb.0, rgb.1, rgb.2);
+        contrast_ratio(lum, light_bg_luminance()) >= 4.5
+    }
+
+    #[test]
+    fn light_member_colors_are_darkened_for_lyric_panel() {
+        for light in ["#ffc0cb", "#90ee90", "#1af0af", "#ffff99", "#87cefa"] {
+            let adjusted = readable_on_light_background(light);
+            assert!(
+                meets_contrast(&adjusted),
+                "{light} -> {adjusted} should meet contrast"
+            );
+        }
+    }
+
+    #[test]
+    fn strong_colors_stay_readable_without_over_darkening() {
+        let adjusted = readable_on_light_background("#ff1744");
+        assert!(adjusted.eq_ignore_ascii_case("#ff1744") || meets_contrast(&adjusted));
     }
 
     #[test]
@@ -504,8 +650,6 @@ mod tests {
 
     #[test]
     fn colors_multi_segment_english_line_without_bleeding_line_color() {
-        use super::colored_markup;
-
         let line = LyricLine {
             id: None,
             song_id: None,
@@ -535,8 +679,11 @@ mod tests {
             profile("Mina", "1af0af"),
         ];
         let markup = colored_markup(&line, "english", line.english.as_deref().unwrap(), &members);
-        assert!(markup.contains("foreground='#ff1744'"));
-        assert!(markup.contains("foreground='#1af0af'"));
+        assert!(markup.contains("foreground='#"));
         assert!(markup.matches("foreground=").count() >= 2);
+        let chaeyoung_color = format_markup_color("#ff1744");
+        let mina_color = format_markup_color("#1af0af");
+        assert!(markup.contains(&format!("foreground='{chaeyoung_color}'")));
+        assert!(markup.contains(&format!("foreground='{mina_color}'")));
     }
 }
