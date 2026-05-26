@@ -46,7 +46,7 @@ pub fn lyric_content_key(
                             .map(|item| item.start_ms)
                             .unwrap_or(-1);
                         format!(
-                            "{}:{}:{}:{}:{}:{}:{}",
+                            "{}:{}:{}:{}:{}:{}:{}:{}",
                             line.index,
                             time,
                             line.original,
@@ -54,6 +54,18 @@ pub fn lyric_content_key(
                             line.english.as_deref().unwrap_or(""),
                             line.member.as_deref().unwrap_or(""),
                             line.with_all,
+                            line.segments
+                                .iter()
+                                .map(|segment| {
+                                    format!(
+                                        "{}:{}:{}",
+                                        segment.language,
+                                        segment.member.as_deref().unwrap_or(""),
+                                        segment.text
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(";"),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -270,6 +282,7 @@ fn colored_markup(
     if exact_segments.is_empty() {
         return colorize_plain_text(fallback, member_color_for_line(line, members).as_deref());
     }
+    let multi_segment = exact_segments.len() > 1;
     let line_color = member_color_for_line(line, members);
     exact_segments
         .iter()
@@ -285,11 +298,17 @@ fn colored_markup(
                             .map(|member| member.color.as_str())
                     })
                 })
-                .or(line_color.as_deref());
+                .or_else(|| {
+                    if !multi_segment && !line.with_all {
+                        line_color.as_deref()
+                    } else {
+                        None
+                    }
+                });
             segment_span(segment, color)
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join("")
 }
 
 fn member_color_for_line(line: &LyricLine, members: &[MemberProfile]) -> Option<String> {
@@ -481,5 +500,43 @@ mod tests {
         let before = super::lyric_content_key(Some(&song), &[], true, true, false);
         let after = super::lyric_content_key(Some(&song), &[], true, true, true);
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn colors_multi_segment_english_line_without_bleeding_line_color() {
+        use super::colored_markup;
+
+        let line = LyricLine {
+            id: None,
+            song_id: None,
+            index: 0,
+            member: Some("Chaeyoung, Mina".into()),
+            original: String::new(),
+            romanization: None,
+            english: Some("Then this your song so turn it up (Turn it up for me uh uh)".into()),
+            with_all: false,
+            segments: vec![
+                LyricSegment {
+                    language: "english".into(),
+                    text: "Then this your song so turn it up ".into(),
+                    member: Some("Chaeyoung".into()),
+                    color: Some("#ff1744".into()),
+                },
+                LyricSegment {
+                    language: "english".into(),
+                    text: "(Turn it up for me uh uh)".into(),
+                    member: Some("Mina".into()),
+                    color: Some("#1af0af".into()),
+                },
+            ],
+        };
+        let members = vec![
+            profile("Chaeyoung", "ff1744"),
+            profile("Mina", "1af0af"),
+        ];
+        let markup = colored_markup(&line, "english", line.english.as_deref().unwrap(), &members);
+        assert!(markup.contains("foreground='#ff1744'"));
+        assert!(markup.contains("foreground='#1af0af'"));
+        assert!(markup.matches("foreground=").count() >= 2);
     }
 }

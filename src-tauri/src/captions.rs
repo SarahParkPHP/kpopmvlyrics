@@ -1,13 +1,16 @@
+use std::process::Command;
+
 use anyhow::{anyhow, Result};
 use html_escape::decode_html_entities;
 use regex::Regex;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use std::process::Command;
 use url::Url;
 
 use crate::models::CaptionLine;
+use crate::log::{verbose, PhaseGuard};
+use crate::process_util::{command_output_with_timeout, http_client, YTDLP_TIMEOUT};
 
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const CAPTION_LANGUAGE_ALLOWLIST: &[&str] = &["en", "ko", "ja", "zh", "es"];
@@ -31,10 +34,7 @@ pub struct YouTubeCaptionProvider {
 impl Default for YouTubeCaptionProvider {
     fn default() -> Self {
         Self {
-            client: Client::builder()
-                .user_agent(BROWSER_USER_AGENT)
-                .build()
-                .expect("client"),
+            client: http_client(BROWSER_USER_AGENT),
         }
     }
 }
@@ -50,9 +50,18 @@ impl CaptionProvider for YouTubeCaptionProvider {
 
 impl YouTubeCaptionProvider {
     pub fn fetch_all(&self, video_id: &str) -> Result<Vec<CaptionTrackSet>> {
-        let mut results = self.fetch_all_via_ytdlp(video_id).unwrap_or_default();
+        verbose(format!("captions fetch_all video_id={video_id}"));
+        let mut results = {
+            let _phase = PhaseGuard::begin("captions fetch_all_via_ytdlp");
+            self.fetch_all_via_ytdlp(video_id).unwrap_or_default()
+        };
+        verbose(format!("captions ytdlp tracks={}", results.len()));
         if results.is_empty() {
-            results = self.fetch_all_via_watch_page(video_id)?;
+            results = {
+                let _phase = PhaseGuard::begin("captions fetch_all_via_watch_page");
+                self.fetch_all_via_watch_page(video_id)?
+            };
+            verbose(format!("captions watch page tracks={}", results.len()));
         }
         if results.is_empty() {
             return Err(anyhow!(
@@ -198,10 +207,10 @@ fn pick_subtitle_url(formats: &Value) -> Option<String> {
 
 fn fetch_ytdlp_json(video_id: &str) -> Result<Value> {
     let watch_url = format!("https://www.youtube.com/watch?v={video_id}");
-    let output = Command::new("yt-dlp")
-        .args(["--no-playlist", "-J", "--skip-download", &watch_url])
-        .output()
-        .map_err(|err| anyhow!("Could not run yt-dlp: {err}. Install yt-dlp."))?;
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["--no-playlist", "-J", "--skip-download", &watch_url]);
+    let output = command_output_with_timeout(cmd, YTDLP_TIMEOUT)
+    .map_err(|err| anyhow!("Could not run yt-dlp: {err}. Install yt-dlp."))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

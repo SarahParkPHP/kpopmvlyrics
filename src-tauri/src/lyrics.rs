@@ -8,6 +8,7 @@ use serde::Deserialize;
 use strsim::jaro_winkler;
 
 use crate::models::{LyricLine, LyricSegment, MemberProfile, Song, SongPackage};
+use crate::process_util::http_client;
 
 pub trait LyricsProvider {
     fn fetch(&self, query: &str) -> Result<SongPackage>;
@@ -20,10 +21,7 @@ pub struct ColorCodedLyricsProvider {
 impl Default for ColorCodedLyricsProvider {
     fn default() -> Self {
         Self {
-            client: Client::builder()
-                .user_agent("kpopmvlyrics/0.1")
-                .build()
-                .expect("client"),
+            client: http_client("kpopmvlyrics/0.1"),
         }
     }
 }
@@ -74,10 +72,7 @@ pub struct GeniusProvider {
 impl Default for GeniusProvider {
     fn default() -> Self {
         Self {
-            client: Client::builder()
-                .user_agent("kpopmvlyrics/0.1")
-                .build()
-                .expect("client"),
+            client: http_client("kpopmvlyrics/0.1"),
         }
     }
 }
@@ -299,12 +294,11 @@ fn parse_colorcodedlyrics_content(html: &str) -> (Vec<LyricLine>, Vec<MemberProf
         }
 
         for column_line in parsed_lines_from_block(block_html) {
-            let member = aggregate_members(Some(&column_line), &color_to_member);
-            push_lyric_line(
+            push_parsed_lyric_line(
                 &mut lines,
-                member,
-                column_line.text,
-                active_language.as_deref(),
+                column_line,
+                active_language.as_deref().unwrap_or("original"),
+                &color_to_member,
             );
         }
     }
@@ -751,6 +745,7 @@ fn parse_colorcodedlyrics_columns(
         return None;
     }
 
+    let english_only = romanization.is_empty() && hangul.is_empty() && !translation.is_empty();
     let group_count = romanization.len().max(hangul.len()).max(translation.len());
     let mut lines = Vec::new();
     for group_index in 0..group_count {
@@ -771,15 +766,27 @@ fn parse_colorcodedlyrics_columns(
             let roman = roman_group.get(index);
             let korean = korean_group.get(index);
             let english = english_group.get(index);
-            let original = korean
-                .or(roman)
-                .or(english)
-                .map(|line| line.text.trim().to_string())
-                .unwrap_or_default();
-            if original.is_empty() || looks_like_metadata(&original) {
-                continue;
+            let source_line = korean.or(roman).or(english);
+            let original = if english_only {
+                String::new()
+            } else {
+                source_line
+                    .map(|line| line.text.trim().to_string())
+                    .unwrap_or_default()
+            };
+            if (original.is_empty() && !english_only) || looks_like_metadata(&original) {
+                if english_only {
+                    if english
+                        .is_none_or(|line| line.text.trim().is_empty() || looks_like_metadata(&line.text))
+                    {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
             }
-            let member = aggregate_members(korean.or(roman), color_to_member);
+            let member = aggregate_members(korean.or(roman).or(english), color_to_member);
+            let with_all = source_line.is_some_and(parsed_column_is_all_members);
             lines.push(LyricLine {
                 id: None,
                 song_id: None,
@@ -792,7 +799,7 @@ fn parse_colorcodedlyrics_columns(
                 english: english
                     .map(|line| line.text.trim().to_string())
                     .filter(|text| !text.is_empty()),
-                with_all: false,
+                with_all,
                 segments: lyric_segments(roman, korean, english, color_to_member),
             });
             if let Some(line) = lines.last_mut() {
@@ -1364,6 +1371,56 @@ pub fn lyric_language_toggles(lines: &[LyricLine]) -> (bool, bool, bool) {
         has_romanization,
         has_english,
     )
+}
+
+fn push_parsed_lyric_line(
+    lines: &mut Vec<LyricLine>,
+    column_line: ParsedColumnLine,
+    language: &str,
+    color_to_member: &std::collections::HashMap<String, String>,
+) {
+    let text = column_line.text.trim();
+    if text.is_empty() || looks_like_metadata(text) {
+        return;
+    }
+
+    let member = aggregate_members(Some(&column_line), color_to_member);
+    let with_all = parsed_column_is_all_members(&column_line);
+    let mut segments = Vec::new();
+    push_lyric_segments(
+        &mut segments,
+        language,
+        Some(&column_line),
+        color_to_member,
+    );
+
+    let mut line = LyricLine {
+        id: None,
+        song_id: None,
+        index: lines.len(),
+        member,
+        original: String::new(),
+        romanization: None,
+        english: None,
+        with_all,
+        segments,
+    };
+    match language {
+        "english" => line.english = Some(text.to_string()),
+        "romanization" => line.romanization = Some(text.to_string()),
+        _ => line.original = text.to_string(),
+    }
+    lines.push(line);
+    if let Some(line) = lines.last_mut() {
+        normalize_line_member_tags(line);
+    }
+}
+
+fn parsed_column_is_all_members(line: &ParsedColumnLine) -> bool {
+    if line.segments.is_empty() {
+        return line.color.is_none();
+    }
+    line.segments.iter().all(|segment| segment.color.is_none())
 }
 
 fn push_lyric_line(
@@ -2045,6 +2102,92 @@ mod tests {
         );
         assert_eq!(english[4], "Key key keys (You got it)");
         assert_eq!(package.lines[1].member.as_deref(), Some("Sana"));
+        assert!(package.lines[0].with_all);
+        assert!(!package.lines[1].with_all);
+        let key_line = package.lines.iter().find(|line| {
+            line.english
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Key key keys"))
+        });
+        assert!(key_line.is_some());
+        let key_line = key_line.unwrap();
+        let english_segments: Vec<_> = key_line
+            .segments
+            .iter()
+            .filter(|segment| segment.language == "english")
+            .collect();
+        assert_eq!(english_segments.len(), 2);
+        assert_eq!(english_segments[0].member, None);
+        assert_eq!(english_segments[1].member.as_deref(), Some("Jihyo"));
+    }
+
+    #[test]
+    fn parses_multi_color_english_adlibs_on_one_line() {
+        let html = r##"
+            <h1 class="entry-title">TWICE - THIS IS FOR</h1>
+            <div class="entry-content">
+              <p style="text-align: center"><span style="color: #ff1744">Chaeyoung</span>, <span style="color: #1af0af">Mina</span>, <span style="color: #ffb1b8">Momo</span>, <span style="color: #396ad8">Tzuyu</span></p>
+              <p class="has-text-align-center"><strong><span class="has-inline-color has-very-light-gray-color">English</span></strong></p>
+              <p><span style="color: #ff1744"><span style="color: #1af0af">(Hahaha) </span>This is for all my ladies</span></p>
+              <p><span style="color: #ff1744">Who don't get hyped enough <span style="color: #1af0af">(Hey ladies)</span></span></p>
+              <p><span style="color: #ff1744">Then this your song so turn it up </span><span style="color: #1af0af">(Turn it up for me uh uh)</span></p>
+              <p><span style="color: #396ad8">Something about that water tastes like fun <span style="color: #ffb1b8">(Yeah yeah)</span></span></p>
+            </div>
+        "##;
+        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let hahaha = package
+            .lines
+            .iter()
+            .find(|line| {
+                line.english
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Hahaha"))
+            })
+            .expect("hahaha line");
+        let segments: Vec<_> = hahaha
+            .segments
+            .iter()
+            .filter(|segment| segment.language == "english")
+            .collect();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].member.as_deref(), Some("Mina"));
+        assert_eq!(segments[1].member.as_deref(), Some("Chaeyoung"));
+
+        let turn_it_up = package
+            .lines
+            .iter()
+            .find(|line| {
+                line.english
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Turn it up for me"))
+            })
+            .expect("turn it up line");
+        let segments: Vec<_> = turn_it_up
+            .segments
+            .iter()
+            .filter(|segment| segment.language == "english")
+            .collect();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].member.as_deref(), Some("Chaeyoung"));
+        assert_eq!(segments[1].member.as_deref(), Some("Mina"));
+
+        let yeah = package
+            .lines
+            .iter()
+            .find(|line| {
+                line.english
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Yeah yeah"))
+            })
+            .expect("yeah yeah line");
+        let segments: Vec<_> = yeah
+            .segments
+            .iter()
+            .filter(|segment| segment.language == "english")
+            .collect();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].member.as_deref(), Some("Tzuyu"));
+        assert_eq!(segments[1].member.as_deref(), Some("Momo"));
     }
 
     #[test]

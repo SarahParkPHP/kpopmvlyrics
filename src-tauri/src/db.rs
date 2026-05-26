@@ -307,6 +307,25 @@ impl Repository {
         )?)
     }
 
+    pub fn alignment_lines(&self, song_id: i64, video_id: &str) -> Result<Vec<AlignmentLine>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lyric_index, caption_index, start_ms, end_ms, confidence, needs_review FROM alignments WHERE song_id=?1 AND video_id=?2 ORDER BY lyric_index",
+        )?;
+        let rows = stmt.query_map(params![song_id, video_id], |row| {
+            Ok(AlignmentLine {
+                lyric_index: row.get::<_, i64>(0)? as usize,
+                caption_index: row
+                    .get::<_, Option<i64>>(1)?
+                    .map(|index| index as usize),
+                start_ms: row.get(2)?,
+                end_ms: row.get(3)?,
+                confidence: row.get(4)?,
+                needs_review: row.get::<_, i64>(5)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     #[allow(dead_code)]
     pub fn song_id(&self, title: &str, artist: &str) -> Result<Option<i64>> {
         Ok(self

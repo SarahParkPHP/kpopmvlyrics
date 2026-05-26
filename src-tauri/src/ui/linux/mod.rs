@@ -37,14 +37,14 @@ use video_overlay::{build_video_overlay, VideoOverlay};
 
 const APP_ID: &str = "com.kpopmvlyrics.desktop";
 
-pub fn run() {
+pub fn run(args: Vec<String>) {
     let application = Application::builder().application_id(APP_ID).build();
     application.connect_activate(|app| {
         if let Err(err) = build_main_window(app) {
             eprintln!("Failed to start K-Pop MV Lyrics: {err}");
         }
     });
-    application.run();
+    application.run_with_args(&args);
 }
 
 struct BackgroundUpdate {
@@ -478,6 +478,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     });
     *view.this.borrow_mut() = Some(Rc::clone(&view));
 
+    let work_tx_for_tick = work_tx.clone();
     let view_for_tick = Rc::clone(&view);
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         if catch_unwind(AssertUnwindSafe(|| {
@@ -527,19 +528,18 @@ fn build_main_window(app: &Application) -> Result<(), String> {
             }
             while let Ok(update) = work_rx.try_recv() {
                 let is_open = update.label == "Open";
-                if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
-                    model.set_busy(None);
+                let is_background_members = update.label == "Members";
+                if !is_background_members {
+                    if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
+                        model.set_busy(None);
+                    }
                 }
                 match update.result {
                     Ok(apply) => {
                         if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
                             apply(&mut model);
-                            if update.label != "Alignment" {
-                                model.message = Some(if update.label == "Open" {
-                                    "Video, lyrics, captions, and alignment complete".to_string()
-                                } else {
-                                    format!("{} complete", update.label)
-                                });
+                            if update.label != "Alignment" && !is_background_members && update.label != "Open" {
+                                model.message = Some(format!("{} complete", update.label));
                             }
                             if is_open {
                                 model.open_progress = Some(0.96);
@@ -547,20 +547,42 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                         }
                         if is_open {
                             apply_url_entry_progress(&view_for_tick, Some(0.96));
+                            let group = view_for_tick
+                                .model
+                                .try_borrow()
+                                .ok()
+                                .and_then(|model| {
+                                    model
+                                        .song
+                                        .as_ref()
+                                        .and_then(|song| song.song.group_name.clone())
+                                });
+                            if let Some(group) = group {
+                                spawn_member_profiles_in_background(
+                                    work_tx_for_tick.clone(),
+                                    Rc::clone(&view_for_tick),
+                                    group,
+                                );
+                            }
+                        }
+                        if is_background_members {
+                            *view_for_tick.member_render_key.borrow_mut() = String::new();
                         }
                         needs_full_refresh = true;
                     }
                     Err(err) => {
-                        if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
-                            model.error = Some(err);
-                            if is_open {
-                                model.open_progress = None;
+                        if !is_background_members {
+                            if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
+                                model.error = Some(err);
+                                if is_open {
+                                    model.open_progress = None;
+                                }
                             }
+                            if is_open {
+                                apply_url_entry_progress(&view_for_tick, None);
+                            }
+                            needs_full_refresh = true;
                         }
-                        if is_open {
-                            apply_url_entry_progress(&view_for_tick, None);
-                        }
-                        needs_full_refresh = true;
                     }
                 }
                 let pending_spec = view_for_tick
@@ -1064,6 +1086,11 @@ fn spawn_open_work(
     progress_tx: std::sync::mpsc::Sender<f64>,
     view: Rc<UiView>,
 ) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use crate::log::{verbose, verbose_enabled};
+
     view.refresh_mut(|model| {
         model.set_busy(Some("Open"));
         model.open_progress = Some(0.0);
@@ -1071,10 +1098,35 @@ fn spawn_open_work(
     apply_url_entry_progress(&view, Some(0.0));
 
     let snapshot = view.model.borrow().clone_for_thread();
+    let open_done = Arc::new(AtomicBool::new(false));
+    let last_progress = Arc::new(AtomicU64::new(0));
+
+    if verbose_enabled() {
+        let done = Arc::clone(&open_done);
+        let last = Arc::clone(&last_progress);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(15));
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                let fraction = f64::from_bits(last.load(Ordering::Relaxed));
+                if fraction > 0.0 {
+                    verbose(format!("open heartbeat still running at progress {fraction:.2}"));
+                } else {
+                    verbose("open heartbeat still running (no progress yet)");
+                }
+            }
+        });
+    }
+
     std::thread::spawn(move || {
+        let last = Arc::clone(&last_progress);
         let result = resolve_video_chain(snapshot, |progress| {
+            last.store(progress.to_bits(), Ordering::Relaxed);
             let _ = progress_tx.send(progress);
         });
+        open_done.store(true, Ordering::Relaxed);
         let _ = work_tx.send(BackgroundUpdate {
             label: "Open",
             result,
@@ -1105,6 +1157,30 @@ fn apply_url_entry_progress(view: &UiView, progress: Option<f64>) {
         }}"
     );
     let _ = view.url_progress_provider.load_from_data(css.as_bytes());
+}
+
+fn spawn_member_profiles_in_background(
+    work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
+    view: Rc<UiView>,
+    group: String,
+) {
+    let snapshot = view.model.borrow().clone_for_thread();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let profiles = snapshot.ctx.search_member_profiles(&group)?;
+            Ok(Box::new(move |model: &mut UiModel| {
+                if let Some(song) = &mut model.song {
+                    song.members =
+                        apply_member_profiles(&song.members, &profiles, &song.lines);
+                    model.editor_table_dirty = true;
+                }
+            }) as Box<dyn FnOnce(&mut UiModel) + Send>)
+        })();
+        let _ = work_tx.send(BackgroundUpdate {
+            label: "Members",
+            result,
+        });
+    });
 }
 
 fn spawn_work<F>(

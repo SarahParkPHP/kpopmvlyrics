@@ -5,6 +5,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::models::CaptionLine;
+use crate::log::{verbose, PhaseGuard};
+use crate::process_util::{command_output_with_timeout, WHISPER_TIMEOUT, YTDLP_TIMEOUT};
+
+const WHISPER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WhisperWord {
@@ -34,15 +38,22 @@ pub struct WhisperTranscript {
 }
 
 pub fn whisper_available() -> bool {
-    whisper_python()
-        .ok()
-        .is_some_and(|python| {
-            Command::new(&python)
-                .args(["-c", "import faster_whisper"])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-        })
+    let _phase = PhaseGuard::begin("whisper_available probe");
+    let python = match whisper_python() {
+        Ok(path) => path,
+        Err(err) => {
+            verbose(format!("whisper python not found: {err}"));
+            return false;
+        }
+    };
+    verbose(format!("whisper probe python={}", python.display()));
+    let mut command = Command::new(&python);
+    command.args(["-c", "import faster_whisper"]);
+    let available = command_output_with_timeout(command, WHISPER_PROBE_TIMEOUT)
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    verbose(format!("whisper_available={available}"));
+    available
 }
 
 pub fn whisper_setup_hint() -> &'static str {
@@ -53,9 +64,14 @@ pub fn transcribe_video(
     video_id: &str,
     language_hint: Option<&str>,
 ) -> Result<WhisperTranscript> {
+    verbose(format!("whisper transcribe_video video_id={video_id}"));
     let cache_dir = whisper_cache_dir()?;
     std::fs::create_dir_all(&cache_dir).context("create whisper cache dir")?;
-    let audio_path = download_audio(video_id, &cache_dir)?;
+    let audio_path = {
+        let _phase = PhaseGuard::begin("whisper download_audio");
+        download_audio(video_id, &cache_dir)?
+    };
+    verbose(format!("whisper audio={}", audio_path.display()));
     transcribe_audio(&audio_path, language_hint)
 }
 
@@ -102,9 +118,8 @@ pub fn transcribe_audio(
         command.arg("--language").arg(language);
     }
 
-    let output = command
-        .output()
-        .context("Could not run faster-whisper transcription script")?;
+    let output = command_output_with_timeout(command, WHISPER_TIMEOUT)
+        .map_err(|err| anyhow!("Could not run faster-whisper transcription script: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -177,22 +192,22 @@ fn download_audio(video_id: &str, cache_dir: &Path) -> Result<PathBuf> {
 
     let url = format!("https://www.youtube.com/watch?v={video_id}");
     let output_template = cache_dir.join(format!("{video_id}.%(ext)s"));
-    let output = Command::new("yt-dlp")
-        .args([
-            "--no-playlist",
-            "-f",
-            "ba[ext=m4a]/ba/b",
-            "-x",
-            "--audio-format",
-            "wav",
-            "--audio-quality",
-            "0",
-            "-o",
-            &output_template.to_string_lossy(),
-            &url,
-        ])
-        .output()
-        .context("Could not run yt-dlp to download audio for whisper")?;
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "--no-playlist",
+        "-f",
+        "ba[ext=m4a]/ba/b",
+        "-x",
+        "--audio-format",
+        "wav",
+        "--audio-quality",
+        "0",
+        "-o",
+        &output_template.to_string_lossy(),
+        &url,
+    ]);
+    let output = command_output_with_timeout(cmd, YTDLP_TIMEOUT)
+    .context("Could not run yt-dlp to download audio for whisper")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("yt-dlp audio download failed: {}", stderr.trim()));

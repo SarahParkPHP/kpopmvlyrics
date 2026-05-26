@@ -3,6 +3,7 @@ use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 
 use crate::models::MemberProfile;
+use crate::process_util::http_client;
 
 pub trait MemberProfileProvider {
     fn search(&self, group_name: &str) -> Result<Vec<MemberProfile>>;
@@ -15,10 +16,7 @@ pub struct KpoppingProvider {
 impl Default for KpoppingProvider {
     fn default() -> Self {
         Self {
-            client: Client::builder()
-                .user_agent("kpopmvlyrics/0.1")
-                .build()
-                .expect("client"),
+            client: http_client("kpopmvlyrics/0.1"),
         }
     }
 }
@@ -44,10 +42,7 @@ pub struct KpopFandomProvider {
 impl Default for KpopFandomProvider {
     fn default() -> Self {
         Self {
-            client: Client::builder()
-                .user_agent("kpopmvlyrics/0.1")
-                .build()
-                .expect("client"),
+            client: http_client("kpopmvlyrics/0.1"),
         }
     }
 }

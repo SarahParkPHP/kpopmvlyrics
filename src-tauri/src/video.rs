@@ -8,6 +8,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::models::{StreamSpec, VideoFormat, VideoMetadata};
+use crate::process_util::{command_output_with_timeout, http_client, YTDLP_TIMEOUT};
 
 const DEFAULT_STREAM_FORMAT: &str =
     "bestvideo[protocol=https]+bestaudio[protocol=https]/bestvideo+bestaudio/best[protocol=https]/best";
@@ -168,9 +169,7 @@ fn stream_spec_from_urls(urls: &[String]) -> Result<StreamSpec> {
 }
 
 fn fetch_video_title(watch_url: &str) -> Result<String> {
-    let html = Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; kpopmvlyrics/0.1)")
-        .build()?
+    let html = http_client("Mozilla/5.0 (compatible; kpopmvlyrics/0.1)")
         .get(watch_url)
         .send()?
         .text()?;
@@ -269,10 +268,10 @@ fn is_video_id_char(ch: char) -> bool {
 }
 
 fn fetch_ytdlp_json(watch_url: &str) -> Result<YtDlpJson> {
-    let output = Command::new("yt-dlp")
-        .args(["--no-playlist", "-J", watch_url])
-        .output()
-        .map_err(|err| anyhow!("Could not run yt-dlp: {err}. Install yt-dlp."))?;
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["--no-playlist", "-J", watch_url]);
+    let output = command_output_with_timeout(cmd, YTDLP_TIMEOUT)
+    .map_err(|err| anyhow!("Could not run yt-dlp: {err}. Install yt-dlp."))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -283,10 +282,10 @@ fn fetch_ytdlp_json(watch_url: &str) -> Result<YtDlpJson> {
 }
 
 fn get_stream_urls(watch_url: &str, format: &str) -> Result<Vec<String>> {
-    let output = Command::new("yt-dlp")
-        .args(["--no-playlist", "-f", format, "--get-url", watch_url])
-        .output()
-        .map_err(|err| anyhow!("Could not run yt-dlp: {err}. Install yt-dlp."))?;
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["--no-playlist", "-f", format, "--get-url", watch_url]);
+    let output = command_output_with_timeout(cmd, YTDLP_TIMEOUT)
+    .map_err(|err| anyhow!("Could not run yt-dlp: {err}. Install yt-dlp."))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

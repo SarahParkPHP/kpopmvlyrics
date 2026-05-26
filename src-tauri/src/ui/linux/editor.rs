@@ -10,6 +10,7 @@ use gtk::{
 };
 
 use crate::app::{apply_member_profiles, shift_alignment, DEFAULT_MANUAL_CAPTIONS, DEFAULT_MANUAL_LYRICS};
+use crate::log::{progress, PhaseGuard, verbose};
 use crate::models::{AlignmentLine, MemberProfile};
 
 use super::{spawn_work, BackgroundUpdate, UiModel, UiView, WorkerSnapshot};
@@ -472,49 +473,85 @@ pub fn resolve_video_chain(
     snapshot: WorkerSnapshot,
     report_progress: impl Fn(f64),
 ) -> Result<Box<dyn FnOnce(&mut UiModel) + Send>, String> {
+    verbose(format!("open url={}", snapshot.url));
     report_progress(0.08);
-    let metadata = snapshot.ctx.resolve_video_metadata(&snapshot.url)?;
+    progress("open metadata", 0.08);
+    let metadata = {
+        let _phase = PhaseGuard::begin("resolve_video_metadata");
+        snapshot.ctx.resolve_video_metadata(&snapshot.url)?
+    };
     let query = crate::app::query_from_metadata(&metadata);
+    verbose(format!("open video_id={} query={query}", metadata.video_id));
     report_progress(0.22);
-    let formats = snapshot
-        .ctx
-        .list_video_formats(&snapshot.url)
-        .unwrap_or_default();
+    progress("open formats", 0.22);
+    let formats = {
+        let _phase = PhaseGuard::begin("list_video_formats");
+        snapshot
+            .ctx
+            .list_video_formats(&snapshot.url)
+            .unwrap_or_default()
+    };
+    verbose(format!("open formats count={}", formats.len()));
 
     let mut song = None;
     let mut captions = Vec::new();
     let mut alignment = Vec::new();
+    let mut align_summary = None;
 
     if !query.is_empty() {
         report_progress(0.38);
-        let mut package = snapshot.ctx.fetch_lyrics(&query)?;
+        progress("open fetch_lyrics", 0.38);
+        let mut package = {
+            let _phase = PhaseGuard::begin("fetch_lyrics");
+            snapshot.ctx.fetch_lyrics(&query)?
+        };
+        verbose(format!(
+            "open lyrics lines={} song_id={:?}",
+            package.lines.len(),
+            package.song.id
+        ));
         report_progress(0.58);
-        if let Some(group) = package.song.group_name.clone() {
-            if let Ok(profiles) = snapshot.ctx.search_member_profiles(&group) {
-                package.members =
-                    apply_member_profiles(&package.members, &profiles, &package.lines);
-            }
-        }
+        progress("open lyrics done", 0.58);
         let video_id = metadata.video_id.clone();
         if let Some(song_id) = package.song.id {
-            report_progress(0.72);
-            alignment = snapshot
-                .ctx
-                .align_lyrics(song_id, &video_id)
-                .map(|result| {
-                    captions = result.captions;
-                    result.alignment
-                })?;
+            report_progress(0.68);
+            progress("open align start", 0.68);
+            let result = {
+                let _phase = PhaseGuard::begin("align_lyrics_with_progress");
+                snapshot.ctx.align_lyrics_with_progress(song_id, &video_id, |p| {
+                    progress("open align", p);
+                    report_progress(p);
+                })?
+            };
+            verbose(format!(
+                "open align done lines={} captions={} summary={}",
+                result.alignment.len(),
+                result.captions.len(),
+                result.summary
+            ));
+            alignment = result.alignment;
+            captions = result.captions;
+            align_summary = Some(result.summary);
+        } else {
+            verbose("open skipped align: song has no id");
         }
         song = Some(package);
+    } else {
+        verbose("open skipped lyrics: empty query from metadata");
     }
 
     report_progress(0.86);
-    let stream_spec = snapshot.ctx.resolve_stream(
-        &snapshot.url,
-        snapshot.selected_format.as_deref(),
-    )?;
+    progress("open resolve_stream", 0.86);
+    let stream_spec = {
+        let _phase = PhaseGuard::begin("resolve_stream");
+        snapshot.ctx.resolve_stream(
+            &snapshot.url,
+            snapshot.selected_format.as_deref(),
+        )?
+    };
+    verbose(format!("open stream resolved: {stream_spec:?}"));
     report_progress(0.94);
+    progress("open complete", 0.94);
 
     Ok(Box::new(move |model: &mut UiModel| {
         model.metadata = Some(metadata);
@@ -535,6 +572,9 @@ pub fn resolve_video_chain(
         model.active_index = 0;
         model.pending_stream = Some(stream_spec);
         model.editor_table_dirty = true;
+        if let Some(summary) = align_summary {
+            model.message = Some(summary);
+        }
     }))
 }
 

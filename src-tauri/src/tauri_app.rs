@@ -17,6 +17,11 @@ struct TauriAppState {
 }
 
 #[cfg(not(target_os = "linux"))]
+pub fn run_with_args(_args: Vec<String>) {
+    run();
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -50,8 +55,8 @@ pub fn run() {
 }
 
 #[cfg(target_os = "linux")]
-pub fn run() {
-    crate::ui::run();
+pub fn run_with_args(args: Vec<String>) {
+    crate::ui::run(args);
 }
 
 #[cfg(not(target_os = "linux"))]

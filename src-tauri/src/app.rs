@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use crate::align::{
     align_lines, align_lyrics_to_whisper_words, alignment_playback_quality, AlignmentInput,
 };
+use crate::log::{progress, PhaseGuard, verbose};
 use crate::lyrics::lyric_language_toggles;
 use crate::whisper::{whisper_available, whisper_caption_lines, whisper_setup_hint, transcribe_video};
 use crate::captions::{parse_caption_text, CaptionProvider, YouTubeCaptionProvider};
@@ -106,53 +107,105 @@ impl AppContext {
         song_id: i64,
         video_id: &str,
     ) -> Result<AlignResult, String> {
+        self.align_lyrics_with_progress(song_id, video_id, |_| {})
+    }
+
+    pub fn align_lyrics_with_progress(
+        &self,
+        song_id: i64,
+        video_id: &str,
+        mut report_progress: impl FnMut(f64),
+    ) -> Result<AlignResult, String> {
+        verbose(format!("align song_id={song_id} video_id={video_id}"));
         let lyrics = {
+            let _phase = PhaseGuard::begin("align load lyric_lines");
             let repo = self.repo.lock().map_err(to_string)?;
             repo.lyric_lines(song_id).map_err(to_string)?
         };
+        verbose(format!("align lyric count={}", lyrics.len()));
 
+        report_progress(0.70);
+        progress("align fetch captions", 0.70);
         let provider = YouTubeCaptionProvider::default();
-        let track_sets = match provider.fetch_all(video_id) {
-            Ok(tracks) => tracks,
-            Err(err) => {
-                let repo = self.repo.lock().map_err(to_string)?;
-                let cached = repo.caption_lines(video_id).map_err(to_string)?;
-                if cached.is_empty() {
-                    return Err(err.to_string());
+        let track_sets = {
+            let _phase = PhaseGuard::begin("align fetch_all captions");
+            match provider.fetch_all(video_id) {
+                Ok(tracks) => tracks,
+                Err(err) => {
+                    verbose(format!("align caption fetch failed: {err}; trying cache"));
+                    let repo = self.repo.lock().map_err(to_string)?;
+                    let cached = repo.caption_lines(video_id).map_err(to_string)?;
+                    if cached.is_empty() {
+                        return Err(err.to_string());
+                    }
+                    verbose(format!("align using {} cached caption lines", cached.len()));
+                    vec![crate::captions::CaptionTrackSet {
+                        language_code: String::new(),
+                        auto_generated: false,
+                        label: "imported".into(),
+                        lines: cached,
+                    }]
                 }
-                vec![crate::captions::CaptionTrackSet {
-                    language_code: String::new(),
-                    auto_generated: false,
-                    label: "imported".into(),
-                    lines: cached,
-                }]
             }
         };
+        verbose(format!("align caption tracks={}", track_sets.len()));
         let (has_original, has_romanization, has_english) = lyric_language_toggles(&lyrics);
         let prefer_whisper = has_english && !has_original && !has_romanization;
+        verbose(format!(
+            "align languages original={has_original} roman={has_romanization} english={has_english} prefer_whisper={prefer_whisper}"
+        ));
         let mut summary = String::from("Aligned from YouTube captions");
 
         let mut best_alignment = Vec::new();
         let mut best_captions = Vec::new();
         let mut best_score = f64::NEG_INFINITY;
 
-        for track in &track_sets {
-            let aligned = align_lines(AlignmentInput {
-                lyrics: lyrics.clone(),
-                captions: track.lines.clone(),
-            });
-            let score = alignment_playback_quality(&aligned);
-            if score > best_score {
-                best_score = score;
-                best_alignment = aligned;
-                best_captions = track.lines.clone();
+        report_progress(0.74);
+        progress("align caption tracks", 0.74);
+        {
+            let _phase = PhaseGuard::begin("align caption track scoring");
+            for track in &track_sets {
+                verbose(format!(
+                    "align scoring track label={} lines={}",
+                    track.label,
+                    track.lines.len()
+                ));
+                let aligned = align_lines(AlignmentInput {
+                    lyrics: lyrics.clone(),
+                    captions: track.lines.clone(),
+                });
+                let score = alignment_playback_quality(&aligned);
+                if score > best_score {
+                    best_score = score;
+                    best_alignment = aligned;
+                    best_captions = track.lines.clone();
+                }
             }
         }
+        verbose(format!(
+            "align best caption score={best_score:.3} lines={}",
+            best_alignment.len()
+        ));
 
         if prefer_whisper {
-            if whisper_available() {
-                match transcribe_video(video_id, Some("en")) {
+            report_progress(0.78);
+            progress("align whisper branch", 0.78);
+            let _phase = PhaseGuard::begin("align whisper_available check");
+            let whisper_ok = whisper_available();
+            verbose(format!("align whisper_available={whisper_ok}"));
+            drop(_phase);
+            if whisper_ok {
+                let result = {
+                    let _phase = PhaseGuard::begin("align transcribe_video");
+                    transcribe_video(video_id, Some("en"))
+                };
+                match result {
                     Ok(transcript) if !transcript.words.is_empty() => {
+                        verbose(format!(
+                            "align whisper words={} device={:?}",
+                            transcript.words.len(),
+                            transcript.device
+                        ));
                         let whisper_captions = whisper_caption_lines(video_id, &transcript);
                         let whisper_alignment =
                             align_lyrics_to_whisper_words(&lyrics, &transcript.words);
@@ -185,15 +238,20 @@ impl AppContext {
             }
         }
 
+        report_progress(0.84);
+        progress("align persist", 0.84);
         if best_alignment.is_empty() {
             return Err("No caption tracks available for alignment".into());
         }
 
-        let mut repo = self.repo.lock().map_err(to_string)?;
-        repo.upsert_caption_lines(video_id, &best_captions)
-            .map_err(to_string)?;
-        repo.upsert_alignment(song_id, video_id, &best_alignment)
-            .map_err(to_string)?;
+        {
+            let _phase = PhaseGuard::begin("align upsert db");
+            let mut repo = self.repo.lock().map_err(to_string)?;
+            repo.upsert_caption_lines(video_id, &best_captions)
+                .map_err(to_string)?;
+            repo.upsert_alignment(song_id, video_id, &best_alignment)
+                .map_err(to_string)?;
+        }
         Ok(AlignResult {
             alignment: best_alignment,
             captions: best_captions,
@@ -210,6 +268,24 @@ impl AppContext {
         let mut repo = self.repo.lock().map_err(to_string)?;
         repo.upsert_alignment(song_id, video_id, lines)
             .map_err(to_string)
+    }
+
+    pub fn load_playback_cache(
+        &self,
+        song_id: i64,
+        video_id: &str,
+        lyric_count: usize,
+    ) -> Option<(Vec<AlignmentLine>, Vec<CaptionLine>)> {
+        let repo = self.repo.lock().ok()?;
+        let alignment = repo.alignment_lines(song_id, video_id).ok()?;
+        if alignment.is_empty() || alignment.len() != lyric_count {
+            return None;
+        }
+        let captions = repo.caption_lines(video_id).ok()?;
+        if captions.is_empty() {
+            return None;
+        }
+        Some((alignment, captions))
     }
 
     pub fn search_member_profiles(&self, group_name: &str) -> Result<Vec<MemberProfile>, String> {
