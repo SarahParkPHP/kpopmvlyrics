@@ -6,6 +6,7 @@ use crate::align::{
 };
 use crate::log::{progress, PhaseGuard, verbose};
 use crate::lyrics::lyric_language_toggles;
+use rayon::prelude::*;
 use crate::whisper::{whisper_available, whisper_caption_lines, whisper_setup_hint, transcribe_video};
 use crate::captions::{parse_caption_text, CaptionProvider, YouTubeCaptionProvider};
 use crate::db::Repository;
@@ -164,22 +165,30 @@ impl AppContext {
         progress("align caption tracks", 0.74);
         {
             let _phase = PhaseGuard::begin("align caption track scoring");
-            for track in &track_sets {
-                verbose(format!(
-                    "align scoring track label={} lines={}",
-                    track.label,
-                    track.lines.len()
-                ));
-                let aligned = align_lines(AlignmentInput {
-                    lyrics: lyrics.clone(),
-                    captions: track.lines.clone(),
-                });
-                let score = alignment_playback_quality(&aligned);
-                if score > best_score {
-                    best_score = score;
-                    best_alignment = aligned;
-                    best_captions = track.lines.clone();
-                }
+            if let Some((score, aligned, captions)) = track_sets
+                .par_iter()
+                .map(|track| {
+                    verbose(format!(
+                        "align scoring track label={} lines={}",
+                        track.label,
+                        track.lines.len()
+                    ));
+                    let aligned = align_lines(AlignmentInput {
+                        lyrics: lyrics.clone(),
+                        captions: track.lines.clone(),
+                    });
+                    let score = alignment_playback_quality(&aligned);
+                    (score, aligned, track.lines.clone())
+                })
+                .max_by(|left, right| {
+                    left.0
+                        .partial_cmp(&right.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
+                best_score = score;
+                best_alignment = aligned;
+                best_captions = captions;
             }
         }
         verbose(format!(

@@ -1,6 +1,8 @@
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use regex::Regex;
+use rayon::prelude::*;
 use strsim::jaro_winkler;
 
 use crate::models::{AlignmentLine, CaptionLine, LyricLine};
@@ -40,7 +42,8 @@ pub fn align_lines(input: AlignmentInput) -> Vec<AlignmentLine> {
         .map(|lyric| {
             if let Some(caption_index) = pairs.get(&lyric.index).copied() {
                 let caption = &captions[caption_index];
-                let score = match_score(lyric, caption);
+                let score =
+                    best_text_match_score_for_caption(lyric, &normalize_text(&caption.text));
                 AlignmentLine {
                     lyric_index: lyric.index,
                     caption_index: Some(caption.index),
@@ -89,20 +92,25 @@ fn align_sequence(
 ) -> std::collections::HashMap<usize, usize> {
     let n = lyrics.len();
     let m = captions.len();
-    let scores: Vec<Vec<f64>> = lyrics
+    let normalized_captions: Vec<String> = captions
         .iter()
+        .map(|caption| normalize_text(&caption.text))
+        .collect();
+    let scores: Vec<Vec<f64>> = lyrics
+        .par_iter()
         .map(|lyric| {
             captions
                 .iter()
                 .enumerate()
-                .map(|(index, caption)| {
-                    let mut score = match_score(lyric, caption);
+                .map(|(index, _caption)| {
+                    let mut score =
+                        best_text_match_score_for_caption(lyric, &normalized_captions[index]);
                     if index > 0 {
-                        score = score.max(combined_caption_match_score(
-                            lyric,
-                            &captions[index - 1],
-                            caption,
-                        ));
+                        let combined = format!(
+                            "{} {}",
+                            normalized_captions[index - 1], normalized_captions[index]
+                        );
+                        score = score.max(best_text_match_score_for_caption(lyric, &combined));
                     }
                     score
                 })
@@ -165,21 +173,7 @@ fn align_sequence(
     pairs
 }
 
-fn match_score(lyric: &LyricLine, caption: &CaptionLine) -> f64 {
-    best_text_match_score(lyric, &caption.text)
-}
-
-fn combined_caption_match_score(
-    lyric: &LyricLine,
-    left: &CaptionLine,
-    right: &CaptionLine,
-) -> f64 {
-    let combined = format!("{} {}", left.text.trim(), right.text.trim());
-    best_text_match_score(lyric, &combined)
-}
-
-fn best_text_match_score(lyric: &LyricLine, caption_text: &str) -> f64 {
-    let caption_text = normalize_text(caption_text);
+fn best_text_match_score_for_caption(lyric: &LyricLine, caption_text: &str) -> f64 {
     if caption_text.is_empty() {
         return 0.0;
     }
@@ -188,7 +182,7 @@ fn best_text_match_score(lyric: &LyricLine, caption_text: &str) -> f64 {
         .into_iter()
         .map(normalize_text)
         .filter(|text| !text.is_empty())
-        .map(|lyric_text| combined_similarity(&lyric_text, &caption_text))
+        .map(|lyric_text| combined_similarity(&lyric_text, caption_text))
         .fold(0.0, f64::max)
 }
 
@@ -421,16 +415,23 @@ fn containment_score(lyric_text: &str, caption_text: &str) -> f64 {
 }
 
 pub fn normalize_text(value: &str) -> String {
-    let bracketed = Regex::new(r"\[[^\]]+\]|\([^\)]+\)").expect("valid regex");
-    let punctuation = Regex::new(r"[^\p{L}\p{N}\s]").expect("valid regex");
-    let romanization_noise = Regex::new(r"\b(yeah|oh|uh|ah|hey|woo|la|na)\b").expect("valid regex");
-    let whitespace = Regex::new(r"\s+").expect("valid regex");
     let value = value.to_lowercase();
-    let value = bracketed.replace_all(&value, " ");
-    let value = punctuation.replace_all(&value, " ");
-    let value = romanization_noise.replace_all(&value, " ");
-    whitespace.replace_all(value.trim(), " ").to_string()
+    let value = NORMALIZE_BRACKETED.replace_all(&value, " ");
+    let value = NORMALIZE_PUNCTUATION.replace_all(&value, " ");
+    let value = NORMALIZE_ROMANIZATION_NOISE.replace_all(&value, " ");
+    NORMALIZE_WHITESPACE
+        .replace_all(value.trim(), " ")
+        .to_string()
 }
+
+static NORMALIZE_BRACKETED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[[^\]]+\]|\([^\)]+\)").expect("valid regex"));
+static NORMALIZE_PUNCTUATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[^\p{L}\p{N}\s]").expect("valid regex"));
+static NORMALIZE_ROMANIZATION_NOISE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(yeah|oh|uh|ah|hey|woo|la|na)\b").expect("valid regex"));
+static NORMALIZE_WHITESPACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s+").expect("valid regex"));
 
 pub fn is_synced_line(line: &AlignmentLine) -> bool {
     line.caption_index.is_some() && line.start_ms >= 0
@@ -486,13 +487,49 @@ pub fn align_lyrics_to_whisper_words(
 
     let n = lyrics.len();
     let m = words.len();
+    let normalized_lyrics: Vec<String> = lyrics
+        .par_iter()
+        .map(|line| normalize_text(lyric_alignment_text(line)))
+        .collect();
+    let normalized_words: Vec<String> = words
+        .par_iter()
+        .map(|word| normalize_text(&word.text))
+        .collect();
+    let span_texts: Vec<Vec<String>> = (0..m)
+        .into_par_iter()
+        .map(|start| {
+            let max_end = (start + WHISPER_MAX_WORD_SPAN).min(m);
+            (start..max_end)
+                .map(|end| normalized_words[start..=end].join(" "))
+                .collect()
+        })
+        .collect();
+    let span_scores: Vec<Vec<Vec<f64>>> = (0..n)
+        .into_par_iter()
+        .map(|lyric_idx| {
+            let target = &normalized_lyrics[lyric_idx];
+            if target.is_empty() || looks_like_metadata(target) {
+                return vec![vec![0.0; WHISPER_MAX_WORD_SPAN]; m];
+            }
+            (0..m)
+                .map(|start| {
+                    let mut offsets = vec![0.0; WHISPER_MAX_WORD_SPAN];
+                    for (offset, span_text) in span_texts[start].iter().enumerate() {
+                        offsets[offset] = whisper_span_score_normalized(target, span_text);
+                    }
+                    offsets
+                })
+                .collect()
+        })
+        .collect();
+
     let mut dp = vec![vec![f64::NEG_INFINITY; m + 1]; n + 1];
     let mut prev = vec![vec![WhisperAlignChoice::default(); m + 1]; n + 1];
     dp[0][0] = 0.0;
 
     for i in 1..=n {
-        let target = normalize_text(lyric_alignment_text(&lyrics[i - 1]));
-        let skip_only = target.is_empty() || looks_like_metadata(&target);
+        let skip_only =
+            normalized_lyrics[i - 1].is_empty() || looks_like_metadata(&normalized_lyrics[i - 1]);
 
         for j in 0..=m {
             if j > 0 && dp[i][j - 1] > dp[i][j] {
@@ -510,7 +547,7 @@ pub fn align_lyrics_to_whisper_words(
             }
 
             for end in j..m.min(j + WHISPER_MAX_WORD_SPAN) {
-                let score = whisper_span_score(&target, words, j, end);
+                let score = span_scores[i - 1][j][end - j];
                 if score <= 0.0 {
                     continue;
                 }
@@ -527,7 +564,7 @@ pub fn align_lyrics_to_whisper_words(
         }
     }
 
-    let mut end_word = (0..=m)
+    let end_word = (0..=m)
         .max_by(|left, right| {
             dp[n][*left]
                 .partial_cmp(&dp[n][*right])
@@ -596,41 +633,25 @@ enum WhisperAlignChoice {
     },
 }
 
-fn whisper_span_score(
-    target: &str,
-    words: &[crate::whisper::WhisperWord],
-    start: usize,
-    end: usize,
-) -> f64 {
-    if target.is_empty() || start > end || end >= words.len() {
+fn whisper_span_score_normalized(target: &str, span_text: &str) -> f64 {
+    if target.is_empty() || span_text.is_empty() {
         return 0.0;
     }
 
-    let span_text = whisper_words_text(words, start, end);
-    let similarity = combined_similarity(target, &span_text);
+    let similarity = combined_similarity(target, span_text);
     if similarity < WHISPER_MATCH_THRESHOLD {
         return 0.0;
     }
-    if !leading_token_matches(target, &span_text) {
+    if !leading_token_matches(target, span_text) {
         return 0.0;
     }
 
-    let recall = ordered_token_recall(target, &span_text);
+    let recall = ordered_token_recall(target, span_text);
     if recall < WHISPER_MIN_TOKEN_RECALL {
         return 0.0;
     }
 
     similarity * (0.55 + (0.45 * recall))
-}
-
-fn whisper_words_text(words: &[crate::whisper::WhisperWord], start: usize, end: usize) -> String {
-    normalize_text(
-        &words[start..=end]
-            .iter()
-            .map(|word| word.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
 }
 
 fn leading_token_matches(lyric: &str, span: &str) -> bool {
