@@ -1,6 +1,9 @@
 mod events;
 mod pipeline;
 
+#[cfg(target_os = "linux")]
+mod hw_decode;
+
 pub use events::PlaybackEvents;
 
 #[cfg(target_os = "linux")]

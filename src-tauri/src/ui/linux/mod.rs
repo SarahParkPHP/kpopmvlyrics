@@ -99,6 +99,7 @@ struct UiModel {
     pending_stream: Option<StreamSpec>,
     pending_seek_ms: Option<u64>,
     pending_autoplay: bool,
+    open_progress: Option<f64>,
     editor_table_dirty: bool,
 }
 
@@ -156,6 +157,8 @@ struct UiView {
     this: Rc<RefCell<Option<Rc<UiView>>>>,
     model: Rc<RefCell<UiModel>>,
     window: ApplicationWindow,
+    url_entry: Entry,
+    url_progress_provider: Rc<CssProvider>,
     status_label: Label,
     clock_label: Label,
     lyric_scroll: ScrolledWindow,
@@ -220,6 +223,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         pending_stream: None,
         pending_seek_ms: None,
         pending_autoplay: false,
+        open_progress: None,
         editor_table_dirty: false,
     }));
 
@@ -242,6 +246,13 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     url_entry.set_hexpand(true);
     url_entry.set_placeholder_text(Some("Paste a YouTube MV URL"));
     url_entry.set_text(&model.borrow().url);
+
+    let url_progress_provider = Rc::new(CssProvider::new());
+    url_entry
+        .style_context()
+        .add_provider(&*url_progress_provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+
+    let (open_progress_tx, open_progress_rx) = std::sync::mpsc::channel::<f64>();
 
     let quality_combo = ComboBoxText::new();
     quality_combo.append(None, "Auto");
@@ -382,6 +393,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         this: Rc::new(RefCell::new(None)),
         model: Rc::clone(&model),
         window: window.clone(),
+        url_entry: url_entry.clone(),
+        url_progress_provider: Rc::clone(&url_progress_provider),
         status_label: status_label.clone(),
         clock_label: clock_label.clone(),
         lyric_scroll: lyric_scroll.clone(),
@@ -428,6 +441,12 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                     model.error = Some(message);
                 }
             }
+            while let Ok(progress) = open_progress_rx.try_recv() {
+                if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
+                    model.open_progress = Some(progress);
+                }
+                apply_url_entry_progress(&view_for_tick, Some(progress));
+            }
             while let Ok((url, path)) = member_image_rx.try_recv() {
                 view_for_tick
                     .member_image_pending
@@ -451,6 +470,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                 needs_full_refresh = true;
             }
             while let Ok(update) = work_rx.try_recv() {
+                let is_open = update.label == "Open";
                 if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
                     model.set_busy(None);
                 }
@@ -463,12 +483,24 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                             } else {
                                 format!("{} complete", update.label)
                             });
+                            if is_open {
+                                model.open_progress = Some(0.96);
+                            }
+                        }
+                        if is_open {
+                            apply_url_entry_progress(&view_for_tick, Some(0.96));
                         }
                         needs_full_refresh = true;
                     }
                     Err(err) => {
                         if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
                             model.error = Some(err);
+                            if is_open {
+                                model.open_progress = None;
+                            }
+                        }
+                        if is_open {
+                            apply_url_entry_progress(&view_for_tick, None);
                         }
                         needs_full_refresh = true;
                     }
@@ -502,6 +534,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     connect_view_handlers(
         &view,
         work_tx.clone(),
+        open_progress_tx,
         &url_entry,
         &quality_combo,
         &open_button,
@@ -683,6 +716,7 @@ impl UiView {
 fn connect_view_handlers(
     view: &Rc<UiView>,
     work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
+    open_progress_tx: std::sync::mpsc::Sender<f64>,
     url_entry: &Entry,
     quality_combo: &ComboBoxText,
     open_button: &Button,
@@ -716,7 +750,7 @@ fn connect_view_handlers(
                 model.active_index = 0;
             });
             let view = Rc::clone(&view);
-            spawn_work(work_tx.clone(), view, "Open", resolve_video_chain);
+            spawn_open_work(work_tx.clone(), open_progress_tx.clone(), view);
         });
     }
 
@@ -937,6 +971,54 @@ enum LanguageField {
     English,
 }
 
+fn spawn_open_work(
+    work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
+    progress_tx: std::sync::mpsc::Sender<f64>,
+    view: Rc<UiView>,
+) {
+    view.refresh_mut(|model| {
+        model.set_busy(Some("Open"));
+        model.open_progress = Some(0.0);
+    });
+    apply_url_entry_progress(&view, Some(0.0));
+
+    let snapshot = view.model.borrow().clone_for_thread();
+    std::thread::spawn(move || {
+        let result = resolve_video_chain(snapshot, |progress| {
+            let _ = progress_tx.send(progress);
+        });
+        let _ = work_tx.send(BackgroundUpdate {
+            label: "Open",
+            result,
+        });
+    });
+}
+
+fn apply_url_entry_progress(view: &UiView, progress: Option<f64>) {
+    let entry = &view.url_entry;
+    let context = entry.style_context();
+
+    let Some(fraction) = progress else {
+        context.remove_class("url-loading");
+        entry.set_sensitive(true);
+        let _ = view.url_progress_provider.load_from_data(
+            b"entry.url-loading { background-image: none; background-color: inherit; }",
+        );
+        return;
+    };
+
+    context.add_class("url-loading");
+    entry.set_sensitive(false);
+    let pct = (fraction.clamp(0.0, 1.0) * 100.0).round();
+    let css = format!(
+        "entry.url-loading {{ \
+            background-image: linear-gradient(to right, rgba(78, 148, 255, 0.38) {pct:.0}%, rgba(255, 255, 255, 0.96) {pct:.0}%); \
+            background-color: #ffffff; \
+        }}"
+    );
+    let _ = view.url_progress_provider.load_from_data(css.as_bytes());
+}
+
 fn spawn_work<F>(
     work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
     view: Rc<UiView>,
@@ -1048,13 +1130,21 @@ fn spawn_player_load(view: Rc<UiView>, spec: StreamSpec) {
                 model.player_loaded = true;
                 model.pending_autoplay = false;
                 model.error = None;
+                if model.open_progress.is_some() {
+                    model.open_progress = None;
+                }
             }
+            apply_url_entry_progress(&view, None);
         }
         Ok(Err(err)) => {
             if let Ok(mut model) = view.model.try_borrow_mut() {
                 model.pending_autoplay = false;
                 model.error = Some(err);
+                if model.open_progress.is_some() {
+                    model.open_progress = None;
+                }
             }
+            apply_url_entry_progress(&view, None);
         }
         Err(payload) => {
             let message = panic_payload_message(payload);
@@ -1062,7 +1152,11 @@ fn spawn_player_load(view: Rc<UiView>, spec: StreamSpec) {
             if let Ok(mut model) = view.model.try_borrow_mut() {
                 model.pending_autoplay = false;
                 model.error = Some(format!("Video player failed: {message}"));
+                if model.open_progress.is_some() {
+                    model.open_progress = None;
+                }
             }
+            apply_url_entry_progress(&view, None);
         }
     }
 

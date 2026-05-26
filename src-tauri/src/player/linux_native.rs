@@ -84,23 +84,26 @@ impl NativeLinuxPlayer {
 }
 
 fn configure_video_sink(sink: &gst::Element) {
-    sink.set_property("async", false);
+    let _ = sink.set_property("sync", true);
+    let _ = sink.set_property("async", true);
 }
 
 fn create_platform_sink() -> Result<gst::Element, String> {
     if is_wayland_session() {
         gst::ElementFactory::make("gtksink")
+            .name("video-sink")
             .build()
-            .or_else(|_| gst::ElementFactory::make("waylandsink").build())
+            .or_else(|_| gst::ElementFactory::make("waylandsink").name("video-sink").build())
             .map_err(|err| {
                 format!("Could not create a Wayland video sink (install gst-plugin-gtk): {err}")
             })
     } else {
         gst::ElementFactory::make("gtksink")
+            .name("video-sink")
             .build()
-            .or_else(|_| gst::ElementFactory::make("glimagesink").build())
-            .or_else(|_| gst::ElementFactory::make("xvimagesink").build())
-            .or_else(|_| gst::ElementFactory::make("autovideosink").build())
+            .or_else(|_| gst::ElementFactory::make("glimagesink").name("video-sink").build())
+            .or_else(|_| gst::ElementFactory::make("xvimagesink").name("video-sink").build())
+            .or_else(|_| gst::ElementFactory::make("autovideosink").name("video-sink").build())
             .map_err(|err| format!("Could not create an X11 video sink: {err}"))
     }
 }

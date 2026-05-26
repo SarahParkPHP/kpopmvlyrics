@@ -14,6 +14,9 @@ use gstreamer_video::prelude::VideoOverlayExtManual;
 use crate::models::{StreamSpec, VideoPosition};
 use crate::player::events::PlaybackEvents;
 
+#[cfg(target_os = "linux")]
+use crate::player::hw_decode::{caps_use_cuda_memory, configure_decoder_ranks, hw_decode_profile, prepare_environment};
+
 pub struct PlaybackEngine {
     pipeline: Option<gst::Pipeline>,
     volume_element: Option<gst::Element>,
@@ -157,20 +160,17 @@ impl PlaybackEngine {
             return Ok(());
         };
 
-        let _ = pipeline.state(Some(gst::ClockTime::from_seconds(2)));
-        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE;
-        let position = gst::ClockTime::from_mseconds(ms);
-        let target = seek_target(pipeline);
+        let was_playing = self.playing;
+        perform_seek(pipeline, ms, was_playing).map_err(|err| err.to_string())?;
 
-        if target.seek_simple(flags, position).is_ok() {
-            if let Ok(mut snapshot) = self.shared.lock() {
-                snapshot.position_ms = ms;
-            }
-            self.sync_snapshot(self.playing, self.buffering);
-            return Ok(());
+        if was_playing {
+            self.playing = true;
         }
-
-        Err("Failed to seek".to_string())
+        if let Ok(mut snapshot) = self.shared.lock() {
+            snapshot.position_ms = ms;
+        }
+        self.sync_snapshot(self.playing, self.buffering);
+        Ok(())
     }
 
     pub fn replay(&mut self) -> Result<(), String> {
@@ -178,25 +178,14 @@ impl PlaybackEngine {
             return Err("No video loaded".into());
         };
 
-        let _ = pipeline.set_state(gst::State::Paused);
-        let target = seek_target(pipeline);
-        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE;
-        target
-            .seek_simple(flags, gst::ClockTime::ZERO)
-            .map_err(|_| "Failed to seek to start".to_string())?;
+        perform_seek(pipeline, 0, true).map_err(|err| err.to_string())?;
 
         if let Ok(mut snapshot) = self.shared.lock() {
             snapshot.position_ms = 0;
-            snapshot.playing = false;
+            snapshot.playing = true;
         }
-        self.playing = false;
-        self.sync_snapshot(false, self.buffering);
-
-        pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|err| format_state_error(pipeline, &self.last_error, err))?;
         self.playing = true;
-        self.sync_snapshot(true, self.buffering);
+        self.sync_snapshot(true, false);
         Ok(())
     }
 
@@ -319,6 +308,7 @@ fn handle_bus_message(
         }
         MessageView::Eos(_) => {
             playing_for_bus.set(false);
+            buffering_for_bus.set(false);
         }
         MessageView::Buffering(buffering) => {
             buffering_for_bus.set(buffering.percent() < 100);
@@ -410,10 +400,109 @@ fn add_to_pipeline(
         .map_err(|err| format!("Failed to add element '{label}': {err}"))
 }
 
-fn seek_target(pipeline: &gst::Pipeline) -> gst::Element {
-    pipeline
-        .by_name("playbin")
-        .unwrap_or_else(|| pipeline.clone().upcast::<gst::Element>())
+fn seek_flags_for(ms: u64) -> gst::SeekFlags {
+    if ms == 0 {
+        gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE
+    } else {
+        gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT
+    }
+}
+
+fn try_pipeline_seek(
+    pipeline: &gst::Pipeline,
+    position: gst::ClockTime,
+    flags: gst::SeekFlags,
+) -> bool {
+    if pipeline.seek_simple(flags, position).is_ok() {
+        return true;
+    }
+
+    if pipeline
+        .seek(
+            1.0,
+            flags,
+            gst::SeekType::Set,
+            position,
+            gst::SeekType::None,
+            gst::ClockTime::NONE,
+        )
+        .is_ok()
+    {
+        return true;
+    }
+
+    if let Some(playbin) = pipeline.by_name("playbin") {
+        if playbin.seek_simple(flags, position).is_ok() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn perform_seek(pipeline: &gst::Pipeline, ms: u64, resume_playback: bool) -> Result<(), String> {
+    let _ = pipeline.state(Some(gst::ClockTime::from_seconds(2)));
+    let position = gst::ClockTime::from_mseconds(ms);
+    let flags = seek_flags_for(ms);
+    let adaptive = pipeline.by_name("video-decode").is_some();
+    let replay = ms == 0;
+
+    if adaptive && replay {
+        let _ = pipeline.set_state(gst::State::Paused);
+        let _ = pipeline.state(Some(gst::ClockTime::from_seconds(3)));
+    }
+
+    let ok = if adaptive && replay {
+        seek_adaptive_branches(pipeline, position, flags)
+    } else {
+        let pipeline_ok = try_pipeline_seek(pipeline, position, flags);
+        if pipeline_ok {
+            true
+        } else if adaptive {
+            seek_adaptive_branches(pipeline, position, flags)
+        } else {
+            false
+        }
+    };
+
+    if !ok {
+        return Err("Failed to seek".to_string());
+    }
+
+    if resume_playback {
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|err| err.to_string())?;
+        let _ = pipeline.state(Some(gst::ClockTime::from_seconds(3)));
+    }
+
+    Ok(())
+}
+
+fn seek_adaptive_branches(
+    pipeline: &gst::Pipeline,
+    position: gst::ClockTime,
+    flags: gst::SeekFlags,
+) -> bool {
+    let seek_event = gst::event::Seek::new(
+        1.0,
+        flags,
+        gst::SeekType::Set,
+        position,
+        gst::SeekType::None,
+        gst::ClockTime::NONE,
+    );
+
+    let mut video_ok = false;
+    let mut audio_ok = false;
+    if let Some(element) = pipeline.by_name("video-decode") {
+        video_ok = element.send_event(seek_event.clone());
+    }
+    if let Some(element) = pipeline.by_name("audio-decode") {
+        audio_ok = element.send_event(seek_event);
+    }
+
+    video_ok && audio_ok
 }
 
 fn format_state_error(
@@ -493,9 +582,16 @@ fn build_adaptive_pipeline(
         .property("uri", audio_uri)
         .build()
         .map_err(|err| err.to_string())?;
-    let video_queue = gst::ElementFactory::make("queue").build().map_err(|err| err.to_string())?;
+    configure_uri_decodebin(&video_decode);
+    configure_uri_decodebin(&audio_decode);
+
+    let video_queue = gst::ElementFactory::make("queue")
+        .name("video-queue")
+        .build()
+        .map_err(|err| err.to_string())?;
     let audio_queue = gst::ElementFactory::make("queue").build().map_err(|err| err.to_string())?;
     let video_convert = gst::ElementFactory::make("videoconvert")
+        .name("video-convert")
         .build()
         .map_err(|err| err.to_string())?;
     let audio_convert = gst::ElementFactory::make("audioconvert")
@@ -546,10 +642,109 @@ fn build_adaptive_pipeline(
         .link(&audio_sink)
         .map_err(|err| err.to_string())?;
 
-    connect_decodebin_to_queue(&video_decode, &video_queue, "video/");
+    connect_video_decode_to_queue(&video_decode, &video_queue, &pipeline);
     connect_decodebin_to_queue(&audio_decode, &audio_queue, "audio/");
 
     Ok(pipeline)
+}
+
+fn configure_uri_decodebin(decode: &gst::Element) {
+    decode.set_property("download", true);
+    decode.set_property("use-buffering", true);
+    decode.set_property("force-sw-decoders", false);
+}
+
+fn connect_video_decode_to_queue(
+    decode: &gst::Element,
+    queue: &gst::Element,
+    pipeline: &gst::Pipeline,
+) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        connect_decodebin_to_queue(decode, queue, "video/");
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let queue_weak = queue.downgrade();
+        let pipeline_weak = pipeline.downgrade();
+        let prefer_cuda_bridge = hw_decode_profile().prefer_nvidia;
+
+        decode.connect_pad_added(move |_decode, pad| {
+            let Some(caps) = pad.current_caps().or_else(|| pad.allowed_caps()) else {
+                return;
+            };
+            let Some(structure) = caps.structure(0) else {
+                return;
+            };
+            if !structure.name().starts_with("video/") {
+                return;
+            }
+            let Some(queue) = queue_weak.upgrade() else {
+                return;
+            };
+            let Some(sink_pad) = queue.static_pad("sink") else {
+                return;
+            };
+            if sink_pad.is_linked() {
+                return;
+            }
+
+            if prefer_cuda_bridge && caps_use_cuda_memory(&caps) {
+                if let Some(pipeline) = pipeline_weak.upgrade() {
+                    if link_cuda_video_pad(&pipeline, pad, &queue) {
+                        return;
+                    }
+                }
+            }
+
+            if let Err(err) = pad.link(&sink_pad) {
+                eprintln!("kpopmvlyrics: failed to link video decode pad: {err}");
+            }
+        });
+    }
+}
+
+fn link_cuda_video_pad(
+    pipeline: &gst::Pipeline,
+    src_pad: &gst::Pad,
+    queue: &gst::Element,
+) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pipeline, src_pad, queue);
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let download = match gst::ElementFactory::make("cudadownload")
+            .name("video-cuda-download")
+            .build()
+        {
+            Ok(element) => element,
+            Err(_) => return false,
+        };
+
+        if pipeline.add(&download).is_err() {
+            return false;
+        }
+
+        let Some(download_sink) = download.static_pad("sink") else {
+            return false;
+        };
+        if src_pad.link(&download_sink).is_err() {
+            return false;
+        }
+        if download.link(queue).is_err() {
+            return false;
+        }
+
+        let _ = download.sync_state_with_parent();
+        eprintln!("kpopmvlyrics: linked NVDEC output through cudadownload");
+        true
+    }
 }
 
 fn connect_decodebin_to_queue(decode: &gst::Element, queue: &gst::Element, prefix: &'static str) {
@@ -624,34 +819,12 @@ pub(crate) fn ensure_gstreamer() -> Result<(), String> {
     static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
     GST_INIT
         .get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            prepare_environment();
             gst::init().map_err(|err| err.to_string())?;
-            configure_hardware_decoders();
+            #[cfg(target_os = "linux")]
+            configure_decoder_ranks();
             Ok(())
         })
         .clone()
-}
-
-fn configure_hardware_decoders() {
-    let boost_rank = gst::Rank::PRIMARY + 100;
-
-    const HARDWARE_DECODERS: &[&str] = &[
-        "vah264dec",
-        "vah265dec",
-        "vavp9dec",
-        "vaav1dec",
-        "nvh264dec",
-        "nvh265dec",
-        "nvvp9dec",
-        "nvav1dec",
-        "nvvp8dec",
-        "vaapih264dec",
-        "vaapivp9dec",
-        "vaapih265dec",
-    ];
-
-    for name in HARDWARE_DECODERS {
-        if let Some(factory) = gst::ElementFactory::find(name) {
-            factory.set_rank(boost_rank);
-        }
-    }
 }

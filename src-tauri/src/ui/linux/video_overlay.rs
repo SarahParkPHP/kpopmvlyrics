@@ -19,8 +19,9 @@ pub struct VideoOverlay {
     pub replay_button: Button,
     pub seek_scale: Scale,
     pub seek_adjustment: Adjustment,
-    pub volume_scale: Scale,
+    pub     volume_scale: Scale,
     seek_dragging: Rc<Cell<bool>>,
+    pending_seek_ms: Rc<Cell<Option<u64>>>,
     hide_source: Rc<RefCell<Option<gtk::glib::SourceId>>>,
 }
 
@@ -88,6 +89,7 @@ pub fn build_video_overlay(video_widget: &Widget) -> VideoOverlay {
         seek_adjustment,
         volume_scale,
         seek_dragging: Rc::new(Cell::new(false)),
+        pending_seek_ms: Rc::new(Cell::new(None)),
         hide_source: Rc::new(RefCell::new(None)),
     }
 }
@@ -183,30 +185,45 @@ impl VideoOverlay {
 
         {
             let view = Rc::clone(view);
+            let pending_seek_ms = Rc::clone(&self.pending_seek_ms);
+            let seek_adjustment = self.seek_adjustment.clone();
             self.replay_button.connect_clicked(move |_| {
+                pending_seek_ms.set(Some(0));
+                seek_adjustment.set_value(0.0);
                 spawn_player_work(Rc::clone(&view), |player| player.replay());
             });
         }
 
         {
-            let seek_dragging = Rc::clone(&self.seek_dragging);
-            self.seek_scale
-                .connect_button_press_event(move |_, _| {
-                    seek_dragging.set(true);
-                    gtk::glib::Propagation::Proceed
-                });
-        }
-
-        {
             let view = Rc::clone(view);
-            let seek_dragging = Rc::clone(&self.seek_dragging);
-            self.seek_scale
-                .connect_button_release_event(move |scale, _| {
-                    seek_dragging.set(false);
-                    let ms = scale.value().max(0.0) as u64;
-                    spawn_player_work(Rc::clone(&view), move |player| player.seek(ms));
-                    gtk::glib::Propagation::Proceed
-                });
+            let pending_seek_ms = Rc::clone(&self.pending_seek_ms);
+            let seek_adjustment = self.seek_adjustment.clone();
+            let seek_dragging_press = Rc::clone(&self.seek_dragging);
+            let seek_dragging_release = Rc::clone(&self.seek_dragging);
+            let seek_dragging_change = Rc::clone(&self.seek_dragging);
+            self.seek_scale.connect_button_press_event(move |_, _| {
+                seek_dragging_press.set(true);
+                gtk::glib::Propagation::Proceed
+            });
+            self.seek_scale.connect_button_release_event(move |scale, _| {
+                let ms = scale.value().max(0.0) as u64;
+                seek_dragging_release.set(false);
+                pending_seek_ms.set(Some(ms));
+                seek_adjustment.set_value(ms as f64);
+                spawn_player_work(Rc::clone(&view), move |player| player.seek(ms));
+                gtk::glib::Propagation::Proceed
+            });
+            self.seek_scale.connect_change_value(move |_, scroll_type, _new_value| {
+                if matches!(
+                    scroll_type,
+                    gtk::ScrollType::Jump
+                        | gtk::ScrollType::StepForward
+                        | gtk::ScrollType::StepBackward
+                ) {
+                    seek_dragging_change.set(true);
+                }
+                gtk::glib::Propagation::Proceed
+            });
         }
 
         {
@@ -226,6 +243,15 @@ impl VideoOverlay {
             return;
         }
 
+        if let Some(pending) = self.pending_seek_ms.get() {
+            let current = current_ms.max(0) as u64;
+            if current.abs_diff(pending) > 1_500 {
+                self.seek_adjustment.set_value(pending as f64);
+                return;
+            }
+            self.pending_seek_ms.set(None);
+        }
+
         let upper = duration_ms.map(|value| value as f64).unwrap_or(0.0);
         if upper > 0.0 && (self.seek_adjustment.upper() - upper).abs() > 1.0 {
             self.seek_adjustment.set_upper(upper);
@@ -237,7 +263,7 @@ impl VideoOverlay {
             current_ms.max(0) as f64
         };
 
-        if (self.seek_adjustment.value() - value).abs() > 250.0 {
+        if (self.seek_adjustment.value() - value).abs() > 50.0 {
             self.seek_adjustment.set_value(value);
         }
     }

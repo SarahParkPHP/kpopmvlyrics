@@ -470,9 +470,12 @@ pub fn pick_member_image(
 
 pub fn resolve_video_chain(
     snapshot: WorkerSnapshot,
+    report_progress: impl Fn(f64),
 ) -> Result<Box<dyn FnOnce(&mut UiModel) + Send>, String> {
+    report_progress(0.08);
     let metadata = snapshot.ctx.resolve_video_metadata(&snapshot.url)?;
     let query = crate::app::query_from_metadata(&metadata);
+    report_progress(0.22);
     let formats = snapshot
         .ctx
         .list_video_formats(&snapshot.url)
@@ -483,7 +486,9 @@ pub fn resolve_video_chain(
     let mut alignment = Vec::new();
 
     if !query.is_empty() {
+        report_progress(0.38);
         let mut package = snapshot.ctx.fetch_lyrics(&query)?;
+        report_progress(0.58);
         if let Some(group) = package.song.group_name.clone() {
             if let Ok(profiles) = snapshot.ctx.search_member_profiles(&group) {
                 package.members = merge_members(&package.members, &profiles);
@@ -491,6 +496,7 @@ pub fn resolve_video_chain(
         }
         let video_id = metadata.video_id.clone();
         if let Some(song_id) = package.song.id {
+            report_progress(0.72);
             alignment = snapshot
                 .ctx
                 .align_lyrics(song_id, &video_id)
@@ -502,10 +508,12 @@ pub fn resolve_video_chain(
         song = Some(package);
     }
 
+    report_progress(0.86);
     let stream_spec = snapshot.ctx.resolve_stream(
         &snapshot.url,
         snapshot.selected_format.as_deref(),
     )?;
+    report_progress(0.94);
 
     Ok(Box::new(move |model: &mut UiModel| {
         model.metadata = Some(metadata);
