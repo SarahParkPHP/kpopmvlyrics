@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import statistics
@@ -11,11 +12,27 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# Reduce CUDA memory fragmentation. Must be set before torch is imported anywhere.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # `python scripts/run_qwen_asr.py` puts scripts/ on sys.path[0], which can shadow
 # the installed `qwen_asr` package (especially if stale __pycache__ exists).
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if sys.path and Path(sys.path[0]).resolve() == Path(_SCRIPT_DIR).resolve():
     sys.path.pop(0)
+
+
+def free_cuda_memory() -> None:
+    """Release Python references and PyTorch's reserved-but-unallocated cache."""
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except ImportError:
+        pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,6 +140,7 @@ def vram_budget_gib() -> tuple[float, float]:
         return 0.0, 0.0
     free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
     free_gib = free_bytes / (1024**3)
+    # Headroom covers ASR autoregressive KV cache, FA activations, and OS/other-app overhead.
     headroom_gib = _env_float("KPOPMVLYRICS_ASR_VRAM_HEADROOM_GIB", 1.0)
     budget = max(0.0, free_gib - headroom_gib)
     return budget, free_gib
@@ -182,12 +200,50 @@ class AlignedToken:
     end: float
 
 
+_memory_hooks_installed = False
+
+
+def _install_memory_clearing_hooks(Qwen3ASRModel, Qwen3ForcedAligner) -> None:
+    """Hook into qwen-asr to release CUDA memory between ASR and FA phases.
+
+    The Qwen3-ASR model's `transcribe()` calls `_infer_asr` (autoregressive
+    generation) then immediately invokes the forced aligner on each chunk's
+    transcript. With both models GPU-resident, the FA's forward pass needs
+    ~400 MiB of activations - but PyTorch's reserved-but-unallocated cache
+    holds onto similar amounts from the ASR pass, causing OOM on 6 GiB GPUs.
+    Clearing cache between phases fixes this.
+    """
+    global _memory_hooks_installed
+    if _memory_hooks_installed:
+        return
+
+    original_infer_asr = Qwen3ASRModel._infer_asr
+
+    def patched_infer_asr(self, *args, **kwargs):
+        result = original_infer_asr(self, *args, **kwargs)
+        free_cuda_memory()
+        return result
+
+    Qwen3ASRModel._infer_asr = patched_infer_asr
+
+    original_align = Qwen3ForcedAligner.align
+
+    def patched_align(self, *args, **kwargs):
+        free_cuda_memory()
+        return original_align(self, *args, **kwargs)
+
+    Qwen3ForcedAligner.align = patched_align
+
+    _memory_hooks_installed = True
+
+
 def import_qwen_asr():
     try:
         from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner
     except ImportError:
         from qwen_asr.inference.qwen3_asr_model import Qwen3ASRModel  # type: ignore
         from qwen_asr.inference.qwen3_forced_aligner import Qwen3ForcedAligner  # type: ignore
+    _install_memory_clearing_hooks(Qwen3ASRModel, Qwen3ForcedAligner)
     return Qwen3ASRModel, Qwen3ForcedAligner
 
 
@@ -386,21 +442,50 @@ def choose_line_timings(
     return sequential if any(row.get("start_ms") is not None for row in sequential) else []
 
 
-def repair_zero_word_timestamps(tokens: list[AlignedToken]) -> None:
-    """Qwen bulk FA often leaves a run of 0.0s tokens before the first real timestamp."""
-    if not tokens:
-        return
+def repair_zero_word_timestamps(tokens: list[AlignedToken]) -> list[AlignedToken]:
+    """Repair or drop tokens with broken timestamps from FA failures.
 
+    Strategy:
+      - **Drop** a large leading run of near-zero-timestamp tokens followed
+        by a big gap. These represent ASR-recognised words the FA couldn't
+        time at all - inventing timestamps for them propagates wrong timing
+        through the whole song. Better to leave those lyric lines unsynced
+        in the script's output; Rust's caption baseline merge then fills
+        them in at approximately-right times.
+      - **Redistribute** a small leading cluster (<=4 tokens) backward
+        from the first real anchor, since this is usually just the FA
+        being uncertain about the first word or two.
+
+    Returns the cleaned tokens list (may be shorter than input).
+    """
+    if not tokens:
+        return tokens
+
+    # Find the first token with a credible START timestamp. End-only signals are
+    # unreliable on this FA output (the FA can emit token with start=0, end=0.04
+    # right before the real run starts).
     anchor_index = next(
-        (i for i, token in enumerate(tokens) if token.start > 0.05 or token.end > 0.05),
+        (i for i, t in enumerate(tokens) if t.start > 0.05),
         None,
     )
-    if anchor_index is not None and anchor_index > 0:
-        anchor = (
-            tokens[anchor_index].start
-            if tokens[anchor_index].start > 0.05
-            else tokens[anchor_index].end
-        )
+
+    leading_drop_threshold = 5
+    if anchor_index is not None and anchor_index >= leading_drop_threshold:
+        anchor_time = tokens[anchor_index].start
+        # A jump >= 5s after a long zero run means the FA failed completely;
+        # drop the leading zeros so Rust falls back to caption timings.
+        if anchor_time >= 5.0:
+            print(
+                f"dropping {anchor_index} leading zero-timestamp tokens "
+                f"(FA failed; anchor at {anchor_time:.2f}s)",
+                file=sys.stderr,
+            )
+            tokens = tokens[anchor_index:]
+            anchor_index = 0
+
+    # Small leading cluster: redistribute backward from the anchor.
+    if anchor_index is not None and 0 < anchor_index < leading_drop_threshold:
+        anchor = tokens[anchor_index].start
         if anchor > 0:
             step = min(0.25, anchor / max(anchor_index + 1, 1))
             for i in range(anchor_index):
@@ -408,6 +493,7 @@ def repair_zero_word_timestamps(tokens: list[AlignedToken]) -> None:
                 tokens[i].start = start
                 tokens[i].end = min(anchor, start + max(step, 0.08))
 
+    # Forward-fill: any remaining exact zeros in the middle inherit the previous start.
     last = 0.0
     for token in tokens:
         if token.start > 0.05:
@@ -415,6 +501,8 @@ def repair_zero_word_timestamps(tokens: list[AlignedToken]) -> None:
         elif last > 0:
             token.start = last
             token.end = max(token.end, last + 0.05)
+
+    return tokens
 
 
 def dedupe_clustered_line_timings(line_timings: list[dict], max_share: int = 3) -> None:
@@ -430,6 +518,50 @@ def dedupe_clustered_line_timings(line_timings: list[dict], max_share: int = 3) 
         if counts[start] > max_share:
             row["start_ms"] = None
             row["end_ms"] = None
+
+
+def filter_hallucinated_tokens(
+    tokens: list[AlignedToken],
+    lyrics_text: str,
+) -> list[AlignedToken]:
+    """Drop tokens whose text doesn't appear in the known lyrics.
+
+    The Qwen ASR sometimes emits English filler ("puncture", "bitchy") during
+    instrumental tails when biased by mixed-language lyrics. These hallucinated
+    tokens have plausible timestamps but their words aren't in the song, so
+    fuzzy DP alignment of CCL lines to them is misleading. Keep only tokens
+    that overlap (case-insensitive substring or trigram) with the lyrics.
+    """
+    if not lyrics_text or not tokens:
+        return tokens
+    norm_lyrics = "".join(c.lower() for c in lyrics_text if not c.isspace())
+    if not norm_lyrics:
+        return tokens
+    trigrams = {norm_lyrics[i : i + 3] for i in range(len(norm_lyrics) - 2)}
+
+    kept: list[AlignedToken] = []
+    dropped = 0
+    for token in tokens:
+        norm = "".join(c.lower() for c in token.text if not c.isspace())
+        if not norm:
+            kept.append(token)
+            continue
+        if norm in norm_lyrics:
+            kept.append(token)
+            continue
+        if len(norm) >= 3 and any(norm[i : i + 3] in trigrams for i in range(len(norm) - 2)):
+            kept.append(token)
+            continue
+        if len(norm) <= 2 and norm in norm_lyrics:
+            kept.append(token)
+            continue
+        dropped += 1
+    if dropped:
+        print(
+            f"filtered {dropped} hallucinated tokens not present in lyrics",
+            file=sys.stderr,
+        )
+    return kept
 
 
 def forced_items_to_tokens(items) -> list[AlignedToken]:
@@ -617,7 +749,7 @@ def align_lyrics_chunked(
                 file=sys.stderr,
             )
             continue
-        repair_zero_word_timestamps(tokens)
+        tokens = repair_zero_word_timestamps(tokens)
         chunk_timings = choose_line_timings(group, chunk_text, tokens)
         offset_line_timings(chunk_timings, offset_sec)
         for token in tokens:
@@ -671,32 +803,93 @@ def align_with_forced_aligner(
     return forced_items_to_tokens(results[0])
 
 
+_SMALL_FALLBACK_MODEL = "Qwen/Qwen3-ASR-0.6B"
+
+
+def _is_cuda_oom(err: Exception) -> bool:
+    if "out of memory" in str(err).lower():
+        return True
+    try:
+        import torch
+
+        return isinstance(err, torch.cuda.OutOfMemoryError)
+    except (ImportError, AttributeError):
+        return False
+
+
+def _release_model(model) -> None:
+    """Drop a loaded model and force GPU memory back to the pool."""
+    try:
+        del model
+    except Exception:
+        pass
+    free_cuda_memory()
+
+
 def transcribe_with_asr_model(
     model_id: str,
     aligner_model: str,
     audio_path: Path,
     language: str | None,
     device: str,
+    context: str = "",
 ):
+    """Run Qwen3-ASR transcription with optional lyrics context for biasing.
+
+    Passing the known CCL/Genius lyrics as `context` makes the model recognize
+    those lyrics in the audio rather than free-form transcribing — output text
+    closely mirrors the input lyrics, and the FA pass produces accurate
+    word-level timestamps spread across the song's actual sung timeline.
+
+    If the chosen model OOMs on this GPU, falls back to Qwen3-ASR-0.6B and
+    retries automatically.
+    """
     Qwen3ASRModel, _Qwen3ForcedAligner = import_qwen_asr()
-    # ASR (1.7B/0.6B) is larger than the aligner (0.6B); split the VRAM budget ~7:3.
-    asr_kwargs = torch_load_kwargs(device, budget_share=0.7)
-    aligner_kwargs = torch_load_kwargs(device, budget_share=0.3)
-    model = Qwen3ASRModel.from_pretrained(
-        model_id,
-        forced_aligner=aligner_model,
-        forced_aligner_kwargs=aligner_kwargs,
-        max_inference_batch_size=1,
-        max_new_tokens=512,
-        **asr_kwargs,
-    )
     language_arg = [language] if language else None
-    results = model.transcribe(
-        audio=str(audio_path),
-        language=language_arg,
-        return_time_stamps=True,
-    )
-    return results[0] if results else None
+    attempted_models: list[str] = []
+
+    def _try_with(target_model_id: str):
+        attempted_models.append(target_model_id)
+        # ASR (1.7B/0.6B) is larger than the aligner (0.6B); split the VRAM budget ~7:3.
+        asr_kwargs = torch_load_kwargs(device, budget_share=0.7)
+        aligner_kwargs = torch_load_kwargs(device, budget_share=0.3)
+        model = Qwen3ASRModel.from_pretrained(
+            target_model_id,
+            forced_aligner=aligner_model,
+            forced_aligner_kwargs=aligner_kwargs,
+            max_inference_batch_size=1,
+            max_new_tokens=512,
+            **asr_kwargs,
+        )
+        print(
+            f"ASR transcribe ({target_model_id}): "
+            f"context_chars={len(context)}, language={language_arg}",
+            file=sys.stderr,
+        )
+        try:
+            results = model.transcribe(
+                audio=str(audio_path),
+                context=context,
+                language=language_arg,
+                return_time_stamps=True,
+            )
+            return results[0] if results else None
+        finally:
+            _release_model(model)
+
+    try:
+        return _try_with(model_id)
+    except Exception as err:
+        if not _is_cuda_oom(err):
+            raise
+        if model_id == _SMALL_FALLBACK_MODEL:
+            raise
+        free_cuda_memory()
+        print(
+            f"ASR OOM on {model_id}; retrying with {_SMALL_FALLBACK_MODEL}",
+            file=sys.stderr,
+        )
+        return _try_with(_SMALL_FALLBACK_MODEL)
 
 
 def main() -> int:
@@ -730,58 +923,84 @@ def main() -> int:
     aligned_tokens: list[AlignedToken] = []
     line_timings: list[dict] = []
 
+    alignment_source = "none"
     try:
-        if align_text and line_specs:
-            aligner = load_forced_aligner(args.aligner_model, runtime_device)
+        if align_text:
+            # Primary path: ASR with the known lyrics as `context` bias.
+            # The model transcribes what it actually hears (biased toward the lyrics)
+            # and the FA pass times the transcript - giving accurate word-level
+            # timestamps spread across the song's true sung timeline. The CCL→ASR
+            # word mapping is handled in Rust via fuzzy DP (align_lyrics_to_timed_words),
+            # which tolerates the small text differences from ASR mis-recognitions.
             print(
-                f"Aligning {len(line_specs)} lyric lines in chunked mode (<=180s audio per chunk)...",
+                f"Transcribing with ASR + lyrics context ({len(align_text)} chars)...",
                 file=sys.stderr,
             )
-            aligned_tokens, line_timings = align_lyrics_chunked(
-                aligner,
-                args.audio,
-                line_specs,
-                align_language,
-            )
-            alignment_source = "lyrics-chunked"
-        elif align_text:
-            aligner = load_forced_aligner(args.aligner_model, runtime_device)
-            aligned_tokens = align_with_forced_aligner(
-                aligner,
-                args.audio,
-                align_text,
-                align_language,
-            )
-            alignment_source = "lyrics"
-            if line_specs and aligned_tokens:
-                line_timings = choose_line_timings(line_specs, align_text, aligned_tokens)
-        else:
             result = transcribe_with_asr_model(
                 args.model,
                 args.aligner_model,
                 args.audio,
-                language_code,
+                align_language,
                 runtime_device,
+                context=align_text,
             )
-            alignment_source = "asr"
             if result is not None:
                 detected_language = getattr(result, "language", None) or language_code
-                text = str(getattr(result, "text", "") or "").strip()
-                if text:
-                    segments_out.append(
-                        {
-                            "text": text,
-                            "start_ms": 0,
-                            "end_ms": 0,
-                            "words": [],
-                        }
-                    )
+                # We intentionally do NOT push a "full-text" segment into segments_out:
+                # the Rust side would then build a single caption_line of all the ASR text
+                # at 0-200ms, overwriting the multi-line YouTube captions. Letting
+                # segments stay empty makes asr_caption_lines fall through to word-chunked
+                # captions, which carry real timing.
                 stamps = getattr(result, "time_stamps", None)
                 if stamps is not None:
                     aligned_tokens = forced_items_to_tokens(stamps)
-                    align_text = " ".join(token.text for token in aligned_tokens)
-                if line_specs and aligned_tokens:
-                    line_timings = choose_line_timings(line_specs, align_text, aligned_tokens)
+                    aligned_tokens = filter_hallucinated_tokens(aligned_tokens, align_text)
+                    aligned_tokens = repair_zero_word_timestamps(aligned_tokens)
+                if aligned_tokens:
+                    alignment_source = "asr-context"
+                    print(
+                        f"ASR+context produced {len(aligned_tokens)} timestamped tokens",
+                        file=sys.stderr,
+                    )
+
+            # Fallback to chunked forced alignment if ASR-with-context yielded nothing
+            # (e.g. the model OOM'd or the audio was unrecognisable).
+            if not aligned_tokens and line_specs:
+                print(
+                    "ASR+context produced no tokens; falling back to chunked FA",
+                    file=sys.stderr,
+                )
+                aligner = load_forced_aligner(args.aligner_model, runtime_device)
+                aligned_tokens, line_timings = align_lyrics_chunked(
+                    aligner,
+                    args.audio,
+                    line_specs,
+                    align_language,
+                )
+                if aligned_tokens:
+                    alignment_source = "lyrics-chunked"
+        else:
+            # No known lyrics — pure ASR transcription.
+            result = transcribe_with_asr_model(
+                args.model,
+                args.aligner_model,
+                args.audio,
+                align_language,
+                runtime_device,
+            )
+            if result is not None:
+                detected_language = getattr(result, "language", None) or language_code
+                # We intentionally do NOT push a "full-text" segment into segments_out:
+                # the Rust side would then build a single caption_line of all the ASR text
+                # at 0-200ms, overwriting the multi-line YouTube captions. Letting
+                # segments stay empty makes asr_caption_lines fall through to word-chunked
+                # captions, which carry real timing.
+                stamps = getattr(result, "time_stamps", None)
+                if stamps is not None:
+                    aligned_tokens = forced_items_to_tokens(stamps)
+                    aligned_tokens = repair_zero_word_timestamps(aligned_tokens)
+                if aligned_tokens:
+                    alignment_source = "asr"
     except Exception as err:
         import traceback
 
