@@ -2,7 +2,6 @@ use std::process::Command;
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
-use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use url::Url;

@@ -11,24 +11,24 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gtk::gdk;
+use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, ComboBoxText, CssProvider,
-    Entry, Frame, Label, Orientation, Paned, Revealer, RevealerTransitionType, ScrolledWindow,
-    StyleContext, WindowPosition,
+    Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, CssProvider, Entry,
+    EventControllerKey, Frame, Label, Orientation, Paned, Revealer, RevealerTransitionType,
+    ScrolledWindow,
 };
-use gtk::gdk::keys::constants as keys;
-use gtk::gdk::Screen;
 
 use crate::align::has_playback_timing;
 use crate::app::{apply_member_profiles, format_ms, AppContext};
+use crate::asr::AsrModelSize;
 use crate::models::{
     AlignmentLine, CaptionLine, MemberProfile, SongPackage, StreamSpec, VideoFormat,
     VideoMetadata, VideoPosition,
 };
-use crate::player::PlaybackEvents;
 use crate::player::NativeLinuxPlayer;
-use crate::asr::AsrModelSize;
+use crate::player::PlaybackEvents;
 
 use editor::{build_editor_panel, connect_editor_handlers, pick_member_image, resolve_video_chain, EditorWidgets};
 use lyrics::{
@@ -37,6 +37,82 @@ use lyrics::{
 use video_overlay::{build_video_overlay, VideoOverlay};
 
 const APP_ID: &str = "com.kpopmvlyrics.desktop";
+
+/// `gtk::DropDown` driven by a parallel `Vec<String>` of option IDs so we can
+/// keep the "select by id, ignore display label" pattern that the deprecated
+/// `ComboBoxText` used to provide.
+pub(crate) struct IdDropDown {
+    pub widget: gtk::DropDown,
+    ids: Rc<RefCell<Vec<String>>>,
+    model: gtk::StringList,
+}
+
+impl IdDropDown {
+    pub fn new() -> Self {
+        let model = gtk::StringList::new(&[]);
+        let widget = gtk::DropDown::new(Some(model.clone()), gtk::Expression::NONE);
+        Self {
+            widget,
+            ids: Rc::new(RefCell::new(Vec::new())),
+            model,
+        }
+    }
+
+    pub fn clear(&self) {
+        while self.model.n_items() > 0 {
+            self.model.remove(0);
+        }
+        self.ids.borrow_mut().clear();
+    }
+
+    /// `id` is the stable key used to set/read selection; `label` is what the
+    /// user sees in the menu.
+    pub fn append(&self, id: &str, label: &str) {
+        self.model.append(label);
+        self.ids.borrow_mut().push(id.to_string());
+    }
+
+    pub fn set_active_id(&self, id: &str) {
+        if let Some(idx) = self.ids.borrow().iter().position(|x| x == id) {
+            self.widget.set_selected(idx as u32);
+        }
+    }
+
+    pub fn active_id(&self) -> Option<String> {
+        let idx = self.widget.selected();
+        if idx == gtk::INVALID_LIST_POSITION {
+            return None;
+        }
+        self.ids.borrow().get(idx as usize).cloned()
+    }
+
+    pub fn connect_changed<F>(&self, callback: F) -> glib::SignalHandlerId
+    where
+        F: Fn(&IdDropDown) + 'static,
+    {
+        let ids = Rc::clone(&self.ids);
+        let widget = self.widget.clone();
+        let model = self.model.clone();
+        self.widget.connect_selected_notify(move |_| {
+            let proxy = IdDropDown {
+                widget: widget.clone(),
+                ids: Rc::clone(&ids),
+                model: model.clone(),
+            };
+            callback(&proxy);
+        })
+    }
+}
+
+impl Clone for IdDropDown {
+    fn clone(&self) -> Self {
+        Self {
+            widget: self.widget.clone(),
+            ids: Rc::clone(&self.ids),
+            model: self.model.clone(),
+        }
+    }
+}
 
 pub fn run(args: Vec<String>) {
     let application = Application::builder().application_id(APP_ID).build();
@@ -108,10 +184,8 @@ struct UiModel {
 struct MemberButton {
     stage_name: String,
     color: String,
-    button: Button,
     border_wrap: GtkBox,
     portrait_frame: GtkBox,
-    image: gtk::Image,
     name_label: Label,
 }
 
@@ -181,18 +255,17 @@ enum MemberVisualState {
 }
 
 fn apply_member_visual(entry: &MemberButton, state: MemberVisualState) {
-    let context = entry.border_wrap.style_context();
-    context.remove_class("active");
-    context.remove_class("backing");
+    entry.border_wrap.remove_css_class("active");
+    entry.border_wrap.remove_css_class("backing");
     match state {
         MemberVisualState::Primary => {
-            context.add_class("active");
+            entry.border_wrap.add_css_class("active");
             entry.portrait_frame.set_opacity(1.0);
             entry.name_label.set_opacity(1.0);
             apply_member_name_style(&entry.name_label, &entry.color, true);
         }
         MemberVisualState::Backing => {
-            context.add_class("backing");
+            entry.border_wrap.add_css_class("backing");
             entry.portrait_frame.set_opacity(0.72);
             entry.name_label.set_opacity(0.78);
             apply_member_name_style(&entry.name_label, &entry.color, true);
@@ -211,12 +284,13 @@ struct UiView {
     window: ApplicationWindow,
     url_entry: Entry,
     url_progress_provider: Rc<CssProvider>,
+    member_card_css_provider: Rc<CssProvider>,
     status_label: Label,
     clock_label: Label,
     lyric_box: GtkBox,
     member_box: GtkBox,
-    quality_combo: ComboBoxText,
-    asr_model_combo: ComboBoxText,
+    quality_combo: IdDropDown,
+    asr_model_combo: IdDropDown,
     settings_revealer: Revealer,
     query_entry: Entry,
     original_toggle: CheckButton,
@@ -290,7 +364,6 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         .title("K-Pop MV Lyrics")
         .default_width(1280)
         .default_height(920)
-        .window_position(WindowPosition::Center)
         .build();
 
     let paned = Paned::new(Orientation::Vertical);
@@ -306,15 +379,25 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     url_entry.set_text(&model.borrow().url);
 
     let url_progress_provider = Rc::new(CssProvider::new());
-    url_entry
-        .style_context()
-        .add_provider(&*url_progress_provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+    let member_card_css_provider = Rc::new(CssProvider::new());
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &*url_progress_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_USER,
+        );
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &*member_card_css_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_USER,
+        );
+    }
 
     let (open_progress_tx, open_progress_rx) = std::sync::mpsc::channel::<f64>();
 
-    let quality_combo = ComboBoxText::new();
-    quality_combo.append(None, "Auto");
-    quality_combo.set_active(Some(0));
+    let quality_combo = IdDropDown::new();
+    quality_combo.append("auto", "Auto");
+    quality_combo.set_active_id("auto");
 
     let open_button = Button::with_label("Open");
     let stream_button = Button::with_label("Stream");
@@ -322,21 +405,21 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let editor_button = Button::with_label("Editor");
 
     let toolbar = GtkBox::new(Orientation::Horizontal, 6);
-    toolbar.pack_start(&url_entry, true, true, 0);
-    toolbar.pack_start(&quality_combo, false, false, 0);
-    toolbar.pack_start(&open_button, false, false, 0);
-    toolbar.pack_start(&settings_button, false, false, 0);
+    toolbar.append(&url_entry);
+    toolbar.append(&quality_combo.widget);
+    toolbar.append(&open_button);
+    toolbar.append(&settings_button);
 
-    let member_scroll = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    let member_scroll = ScrolledWindow::new();
     member_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
     member_scroll.set_hexpand(true);
     member_scroll.set_min_content_height(MEMBER_STRIP_HEIGHT);
-    member_scroll.style_context().add_class("member-strip");
+    member_scroll.add_css_class("member-strip");
     let member_box = GtkBox::new(Orientation::Horizontal, 10);
     member_box.set_homogeneous(true);
     member_box.set_margin_start(6);
     member_box.set_margin_end(6);
-    member_scroll.add(&member_box);
+    member_scroll.set_child(Some(&member_box));
 
     let lang_box = GtkBox::new(Orientation::Horizontal, 6);
     lang_box.set_margin_start(8);
@@ -348,9 +431,9 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let roman_toggle = CheckButton::with_label("Roman");
     let english_toggle = CheckButton::with_label("English");
     english_toggle.set_active(true);
-    lang_box.pack_start(&original_toggle, false, false, 0);
-    lang_box.pack_start(&roman_toggle, false, false, 0);
-    lang_box.pack_start(&english_toggle, false, false, 0);
+    lang_box.append(&original_toggle);
+    lang_box.append(&roman_toggle);
+    lang_box.append(&english_toggle);
 
     let clock_label = Label::new(None);
     clock_label.set_halign(gtk::Align::End);
@@ -359,8 +442,11 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     clock_label.set_markup("<span size='large'><b>0:00.000</b></span>");
 
     let stage_toolbar = GtkBox::new(Orientation::Horizontal, 8);
-    stage_toolbar.pack_start(&lang_box, false, false, 0);
-    stage_toolbar.pack_end(&clock_label, false, false, 0);
+    stage_toolbar.append(&lang_box);
+    let toolbar_spacer = GtkBox::new(Orientation::Horizontal, 0);
+    toolbar_spacer.set_hexpand(true);
+    stage_toolbar.append(&toolbar_spacer);
+    stage_toolbar.append(&clock_label);
 
     let lyric_box = GtkBox::new(Orientation::Vertical, 4);
     lyric_box.set_valign(gtk::Align::Start);
@@ -369,10 +455,9 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     lyric_box.set_margin_bottom(8);
 
     let lyric_frame = Frame::new(None);
-    lyric_frame.set_shadow_type(gtk::ShadowType::None);
-    lyric_frame.style_context().add_class("lyric-stage-panel");
+    lyric_frame.add_css_class("lyric-stage-panel");
     lyric_frame.set_vexpand(true);
-    lyric_frame.add(&lyric_box);
+    lyric_frame.set_child(Some(&lyric_box));
 
     let play_button = Button::with_label("Start Sync");
     let pause_button = Button::with_label("Pause Sync");
@@ -381,7 +466,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let status_label = Label::new(None);
     status_label.set_halign(gtk::Align::Start);
     status_label.set_xalign(0.0);
-    status_label.set_line_wrap(true);
+    status_label.set_wrap(true);
 
     let query_entry = Entry::new();
     query_entry.set_placeholder_text(Some("Artist and song title"));
@@ -390,62 +475,74 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let align_button = Button::with_label("Align");
     let save_button = Button::with_label("Save");
     let settings_panel = GtkBox::new(Orientation::Vertical, 6);
-    settings_panel.pack_start(&query_entry, false, false, 0);
+    settings_panel.append(&query_entry);
 
     let asr_model_row = GtkBox::new(Orientation::Horizontal, 8);
-    asr_model_row.pack_start(&Label::new(Some("ASR model")), false, false, 0);
-    let asr_model_combo = ComboBoxText::new();
-    asr_model_combo.append(Some("small"), AsrModelSize::Small.label());
-    asr_model_combo.append(Some("large"), AsrModelSize::Large.label());
-    asr_model_combo.set_active_id(Some(initial_asr_model.as_storage()));
-    asr_model_row.pack_start(&asr_model_combo, false, false, 0);
-    settings_panel.pack_start(&asr_model_row, false, false, 0);
+    asr_model_row.append(&Label::new(Some("ASR model")));
+    let asr_model_combo = IdDropDown::new();
+    asr_model_combo.append(
+        AsrModelSize::Disabled.as_storage(),
+        AsrModelSize::Disabled.label(),
+    );
+    asr_model_combo.append(
+        AsrModelSize::Small.as_storage(),
+        AsrModelSize::Small.label(),
+    );
+    asr_model_combo.append(
+        AsrModelSize::Large.as_storage(),
+        AsrModelSize::Large.label(),
+    );
+    asr_model_combo.set_active_id(initial_asr_model.as_storage());
+    asr_model_row.append(&asr_model_combo.widget);
+    settings_panel.append(&asr_model_row);
 
     let settings_actions = GtkBox::new(Orientation::Horizontal, 6);
-    settings_actions.pack_start(&fetch_lyrics_button, false, false, 0);
-    settings_actions.pack_start(&fetch_captions_button, false, false, 0);
-    settings_actions.pack_start(&align_button, false, false, 0);
-    settings_actions.pack_start(&save_button, false, false, 0);
-    settings_panel.pack_start(&settings_actions, false, false, 0);
+    settings_actions.append(&fetch_lyrics_button);
+    settings_actions.append(&fetch_captions_button);
+    settings_actions.append(&align_button);
+    settings_actions.append(&save_button);
+    settings_panel.append(&settings_actions);
 
     let settings_tools = GtkBox::new(Orientation::Horizontal, 6);
-    settings_tools.pack_start(&stream_button, false, false, 0);
-    settings_tools.pack_start(&editor_button, false, false, 0);
-    settings_panel.pack_start(&settings_tools, false, false, 0);
+    settings_tools.append(&stream_button);
+    settings_tools.append(&editor_button);
+    settings_panel.append(&settings_tools);
 
     let sync_controls = GtkBox::new(Orientation::Horizontal, 6);
-    sync_controls.pack_start(&play_button, false, false, 0);
-    sync_controls.pack_start(&pause_button, false, false, 0);
-    sync_controls.pack_start(&reset_button, false, false, 0);
-    settings_panel.pack_start(&sync_controls, false, false, 0);
-    settings_panel.pack_start(&status_label, false, false, 0);
+    sync_controls.append(&play_button);
+    sync_controls.append(&pause_button);
+    sync_controls.append(&reset_button);
+    settings_panel.append(&sync_controls);
+    settings_panel.append(&status_label);
 
     let editor_build = build_editor_panel();
     let editor_revealer = editor_build.revealer.clone();
     let settings_revealer = Revealer::new();
     settings_revealer.set_transition_type(RevealerTransitionType::SlideDown);
     settings_revealer.set_reveal_child(false);
-    settings_revealer.add(&settings_panel);
+    settings_revealer.set_child(Some(&settings_panel));
 
-    top.pack_start(&toolbar, false, false, 0);
-    top.pack_start(&member_scroll, false, false, 0);
-    top.pack_start(&stage_toolbar, false, false, 0);
-    top.pack_start(&lyric_frame, true, true, 0);
-    top.pack_start(&settings_revealer, false, false, 0);
-    top.pack_start(&editor_revealer, false, false, 0);
+    top.append(&toolbar);
+    top.append(&member_scroll);
+    top.append(&stage_toolbar);
+    top.append(&lyric_frame);
+    top.append(&settings_revealer);
+    top.append(&editor_revealer);
 
     let video_box = player.borrow().video_widget().clone();
     video_box.set_vexpand(true);
     let video_overlay = Rc::new(build_video_overlay(video_box.upcast_ref()));
 
     let video_pane = GtkBox::new(Orientation::Vertical, 0);
-    video_pane.pack_start(&video_overlay.overlay, true, true, 0);
+    video_overlay.overlay.set_hexpand(true);
+    video_overlay.overlay.set_vexpand(true);
+    video_pane.append(&video_overlay.overlay);
 
-    paned.add1(&top);
-    paned.add2(&video_pane);
+    paned.set_start_child(Some(&top));
+    paned.set_end_child(Some(&video_pane));
     paned.set_position(420);
 
-    window.add(&paned);
+    window.set_child(Some(&paned));
 
     let (work_tx, work_rx) = std::sync::mpsc::channel::<BackgroundUpdate>();
     let (member_image_tx, member_image_rx) =
@@ -459,12 +556,15 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         window: window.clone(),
         url_entry: url_entry.clone(),
         url_progress_provider: Rc::clone(&url_progress_provider),
+        member_card_css_provider: Rc::clone(&member_card_css_provider),
         status_label: status_label.clone(),
         clock_label: clock_label.clone(),
         lyric_box: lyric_box.clone(),
         member_box: member_box.clone(),
         quality_combo: quality_combo.clone(),
         asr_model_combo: asr_model_combo.clone(),
+        // NB: IdDropDown::clone copies the same underlying StringList + ids so
+        // updates from anywhere reflect everywhere - it's a cheap Rc-style clone.
         settings_revealer: settings_revealer.clone(),
         query_entry: query_entry.clone(),
         original_toggle: original_toggle.clone(),
@@ -492,7 +592,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     let work_tx_for_tick = work_tx.clone();
     let view_for_tick = Rc::clone(&view);
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         if catch_unwind(AssertUnwindSafe(|| {
             let mut needs_full_refresh = false;
             while let Ok(position) = position_rx.try_recv() {
@@ -604,7 +704,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                     .and_then(|mut model| model.pending_stream.take());
                 if let Some(spec) = pending_spec {
                     let view = Rc::clone(&view_for_tick);
-                    gtk::glib::idle_add_local_once(move || {
+                    glib::idle_add_local_once(move || {
                         spawn_player_load(view, spec);
                     });
                 }
@@ -620,7 +720,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         {
             eprintln!("kpopmvlyrics: UI refresh tick panicked");
         }
-        gtk::glib::ControlFlow::Continue
+        glib::ControlFlow::Continue
     });
 
     connect_view_handlers(
@@ -657,20 +757,23 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     {
         let view = Rc::clone(&view);
-        window.connect_key_press_event(move |window, event| {
-            if event.keyval() != keys::space {
-                return gtk::glib::Propagation::Proceed;
+        let key_controller = EventControllerKey::new();
+        let window_for_key = window.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _keycode, _state| {
+            if keyval != gdk::Key::space {
+                return glib::Propagation::Proceed;
             }
-            if focus_is_text_widget(window) {
-                return gtk::glib::Propagation::Proceed;
+            if focus_is_text_widget(&window_for_key) {
+                return glib::Propagation::Proceed;
             }
             spawn_toggle_play_pause(Rc::clone(&view));
-            gtk::glib::Propagation::Stop
+            glib::Propagation::Stop
         });
+        window.add_controller(key_controller);
     }
 
     view.refresh();
-    window.show_all();
+    window.present();
     Ok(())
 }
 
@@ -787,7 +890,7 @@ impl UiView {
         let target = model.asr_model_size.as_storage();
         if self.asr_model_combo.active_id().as_deref() != Some(target) {
             self.suppress_asr_model_reload.set(true);
-            self.asr_model_combo.set_active_id(Some(target));
+            self.asr_model_combo.set_active_id(target);
             self.suppress_asr_model_reload.set(false);
         }
     }
@@ -816,7 +919,6 @@ impl UiView {
         *self.lyric_build_key.borrow_mut() = content_key.clone();
 
         let song = model.song.clone();
-        let alignment = model.alignment.clone();
         let show_original = model.show_original;
         let show_romanization = model.show_romanization;
         let show_english = model.show_english;
@@ -824,7 +926,6 @@ impl UiView {
         std::thread::spawn(move || {
             let content = compute_lyric_stage_content(
                 song,
-                &alignment,
                 show_original,
                 show_romanization,
                 show_english,
@@ -849,8 +950,8 @@ fn connect_view_handlers(
     work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
     open_progress_tx: std::sync::mpsc::Sender<f64>,
     url_entry: &Entry,
-    quality_combo: &ComboBoxText,
-    asr_model_combo: &ComboBoxText,
+    quality_combo: &IdDropDown,
+    asr_model_combo: &IdDropDown,
     open_button: &Button,
     stream_button: &Button,
     settings_button: &Button,
@@ -912,7 +1013,6 @@ fn connect_view_handlers(
 
     {
         let view = Rc::clone(view);
-        let asr_model_combo = asr_model_combo.clone();
         let suppress = Rc::clone(&view.suppress_asr_model_reload);
         asr_model_combo.connect_changed(move |combo| {
             if suppress.get() {
@@ -947,10 +1047,10 @@ fn connect_view_handlers(
     {
         let view = Rc::clone(view);
         let url_entry = url_entry.clone();
-        let quality_combo = quality_combo.clone();
+        let quality_combo_for_handler = quality_combo.clone();
         let work_tx = work_tx.clone();
         let suppress = view.suppress_quality_reload.clone();
-        quality_combo.clone().connect_changed(move |combo| {
+        quality_combo.connect_changed(move |combo| {
             if suppress.get() {
                 return;
             }
@@ -964,7 +1064,12 @@ fn connect_view_handlers(
                 .ok()
                 .is_some_and(|model| model.metadata.is_some());
             if has_video {
-                spawn_stream_reload(Rc::clone(&view), work_tx.clone(), url_entry.clone(), quality_combo.clone());
+                spawn_stream_reload(
+                    Rc::clone(&view),
+                    work_tx.clone(),
+                    url_entry.clone(),
+                    quality_combo_for_handler.clone(),
+                );
             }
         });
     }
@@ -1187,18 +1292,16 @@ fn spawn_open_work(
 
 fn apply_url_entry_progress(view: &UiView, progress: Option<f64>) {
     let entry = &view.url_entry;
-    let context = entry.style_context();
 
     let Some(fraction) = progress else {
-        context.remove_class("url-loading");
+        entry.remove_css_class("url-loading");
         entry.set_sensitive(true);
-        let _ = view.url_progress_provider.load_from_data(
-            b"entry.url-loading { background-image: none; background-color: inherit; }",
-        );
+        view.url_progress_provider
+            .load_from_string("entry.url-loading { background-image: none; background-color: inherit; }");
         return;
     };
 
-    context.add_class("url-loading");
+    entry.add_css_class("url-loading");
     entry.set_sensitive(false);
     let pct = (fraction.clamp(0.0, 1.0) * 100.0).round();
     let css = format!(
@@ -1207,7 +1310,7 @@ fn apply_url_entry_progress(view: &UiView, progress: Option<f64>) {
             background-color: #ffffff; \
         }}"
     );
-    let _ = view.url_progress_provider.load_from_data(css.as_bytes());
+    view.url_progress_provider.load_from_string(&css);
 }
 
 fn spawn_member_profiles_in_background(
@@ -1257,7 +1360,7 @@ fn spawn_stream_reload(
     view: Rc<UiView>,
     work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
     url_entry: Entry,
-    quality_combo: ComboBoxText,
+    quality_combo: IdDropDown,
 ) {
     let (position_ms, was_playing, volume) = view
         .model
@@ -1300,7 +1403,7 @@ fn spawn_toggle_play_pause(view: Rc<UiView>) {
 }
 
 fn focus_is_text_widget(window: &ApplicationWindow) -> bool {
-    window.focused_widget().is_some_and(|widget| {
+    gtk::prelude::GtkWindowExt::focus(window).is_some_and(|widget| {
         widget.downcast_ref::<Entry>().is_some() || widget.downcast_ref::<gtk::TextView>().is_some()
     })
 }
@@ -1375,7 +1478,7 @@ fn spawn_player_load(view: Rc<UiView>, spec: StreamSpec) {
         }
     }
 
-    gtk::glib::idle_add_local_once(move || {
+    glib::idle_add_local_once(move || {
         view.refresh();
     });
 }
@@ -1421,15 +1524,14 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     "unknown panic".to_string()
 }
 
-fn selected_format_id(combo: &ComboBoxText) -> Option<String> {
+fn selected_format_id(combo: &IdDropDown) -> Option<String> {
     combo
         .active_id()
         .filter(|id| id.as_str() != "auto")
-        .map(|id| id.to_string())
 }
 
 fn clear_children(container: &GtkBox) {
-    for child in container.children() {
+    while let Some(child) = container.first_child() {
         container.remove(&child);
     }
 }
@@ -1507,15 +1609,15 @@ fn render_formats(view: &UiView, model: &UiModel) {
 
     view.suppress_quality_reload.set(true);
     let combo = &view.quality_combo;
-    combo.remove_all();
-    combo.append(None, "Auto");
+    combo.clear();
+    combo.append("auto", "Auto");
     for format in &model.formats {
-        combo.append(Some(&format.format_id), &format.label);
+        combo.append(&format.format_id, &format.label);
     }
     if let Some(selected) = &model.selected_format {
-        combo.set_active_id(Some(selected));
+        combo.set_active_id(selected);
     } else {
-        combo.set_active(Some(0));
+        combo.set_active_id("auto");
     }
     view.suppress_quality_reload.set(false);
 }
@@ -1523,14 +1625,14 @@ fn render_formats(view: &UiView, model: &UiModel) {
 fn icon_media_button(icon_name: &str, label: &str) -> Button {
     let button = Button::new();
     let row = GtkBox::new(Orientation::Horizontal, 4);
-    if gtk::IconTheme::default()
-        .is_some_and(|theme| theme.has_icon(icon_name))
+    if gtk::IconTheme::for_display(&gtk::gdk::Display::default().expect("default display"))
+        .has_icon(icon_name)
     {
-        let icon = gtk::Image::from_icon_name(Some(icon_name), gtk::IconSize::Button);
-        row.pack_start(&icon, false, false, 0);
+        let icon = gtk::Image::from_icon_name(icon_name);
+        row.append(&icon);
     }
-    row.pack_start(&Label::new(Some(label)), false, false, 0);
-    button.add(&row);
+    row.append(&Label::new(Some(label)));
+    button.set_child(Some(&row));
     button.set_tooltip_text(Some(label));
     button
 }
@@ -1635,15 +1737,10 @@ const MEMBER_STRIP_HEIGHT: i32 = 280;
 
 fn load_stage_css() {
     let provider = CssProvider::new();
-    if provider
-        .load_from_data(include_bytes!("stage.css"))
-        .is_err()
-    {
-        return;
-    }
-    if let Some(screen) = Screen::default() {
-        StyleContext::add_provider_for_screen(
-            &screen,
+    provider.load_from_string(include_str!("stage.css"));
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
@@ -1660,15 +1757,15 @@ fn apply_member_name_style(label: &Label, color: &str, active: bool) {
 }
 
 fn scaled_portrait_pixbuf(
-    pixbuf: &gtk::gdk_pixbuf::Pixbuf,
+    pixbuf: &gdk_pixbuf::Pixbuf,
     width: i32,
     height: i32,
-) -> gtk::gdk_pixbuf::Pixbuf {
+) -> gdk_pixbuf::Pixbuf {
     let scale = (width as f64 / pixbuf.width() as f64).max(height as f64 / pixbuf.height() as f64);
     let scaled_w = (pixbuf.width() as f64 * scale).round().max(1.0) as i32;
     let scaled_h = (pixbuf.height() as f64 * scale).round().max(1.0) as i32;
     let scaled = pixbuf
-        .scale_simple(scaled_w, scaled_h, gtk::gdk_pixbuf::InterpType::Bilinear)
+        .scale_simple(scaled_w, scaled_h, gdk_pixbuf::InterpType::Bilinear)
         .unwrap_or_else(|| pixbuf.clone());
     let x = ((scaled_w - width) / 2).max(0);
     let y = ((scaled_h - height) / 2).max(0);
@@ -1680,38 +1777,41 @@ fn scaled_portrait_pixbuf(
     scaled
 }
 
-fn member_portrait_pixbuf(
+fn member_portrait_texture(
     member: &MemberProfile,
     image_cache: &HashMap<String, String>,
-) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+) -> Option<gdk::Texture> {
     let path = member_image_path(member, image_cache)?;
-    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file(&path).ok()?;
-    Some(scaled_portrait_pixbuf(
-        &pixbuf,
-        MEMBER_PORTRAIT_WIDTH,
-        MEMBER_PORTRAIT_HEIGHT,
-    ))
+    let pixbuf = gdk_pixbuf::Pixbuf::from_file(&path).ok()?;
+    let scaled = scaled_portrait_pixbuf(&pixbuf, MEMBER_PORTRAIT_WIDTH, MEMBER_PORTRAIT_HEIGHT);
+    Some(gdk::Texture::for_pixbuf(&scaled))
 }
 
-fn attach_member_card_css(widget: &impl IsA<gtk::Widget>, stage_name: &str, color: &str) {
-    let slug = stage_name.to_lowercase().replace(' ', "-");
-    let css = format!(
-        "#member-card-{slug}.active {{
-            box-shadow: inset 0 0 0 4px {color};
-            border-radius: 8px;
-        }}
-        #member-card-{slug}.backing {{
-            box-shadow: inset 0 0 0 2px {color};
-            border-radius: 8px;
-        }}"
-    );
-    let provider = CssProvider::new();
-    if provider.load_from_data(css.as_bytes()).is_ok() {
-        widget
-            .style_context()
-            .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+fn member_card_slug(stage_name: &str) -> String {
+    stage_name.to_lowercase().replace(' ', "-")
+}
+
+fn name_member_card(widget: &impl IsA<gtk::Widget>, stage_name: &str) {
+    widget.set_widget_name(&format!("member-card-{}", member_card_slug(stage_name)));
+}
+
+fn rebuild_member_card_css(provider: &CssProvider, members: &[MemberProfile]) {
+    let mut css = String::new();
+    for member in members {
+        let slug = member_card_slug(&member.stage_name);
+        let color = &member.color;
+        css.push_str(&format!(
+            "#member-card-{slug}.active {{
+                box-shadow: inset 0 0 0 4px {color};
+                border-radius: 8px;
+            }}
+            #member-card-{slug}.backing {{
+                box-shadow: inset 0 0 0 2px {color};
+                border-radius: 8px;
+            }}"
+        ));
     }
-    widget.set_widget_name(&format!("member-card-{slug}"));
+    provider.load_from_string(&css);
 }
 
 fn render_members(view: &UiView, model: &UiModel) {
@@ -1731,12 +1831,12 @@ fn render_members(view: &UiView, model: &UiModel) {
     let Some(song) = &model.song else {
         let empty = Label::new(Some("Members appear after lyrics are loaded"));
         empty.set_opacity(0.7);
-        container.pack_start(&empty, false, false, 0);
-        container.show_all();
+        container.append(&empty);
         return;
     };
 
     prefetch_member_images(view, &song.members);
+    rebuild_member_card_css(&view.member_card_css_provider, &song.members);
 
     let Some(view_rc) = view.this.try_borrow().ok().and_then(|this| this.clone()) else {
         return;
@@ -1745,7 +1845,7 @@ fn render_members(view: &UiView, model: &UiModel) {
     let mut stage_buttons = Vec::new();
     for member in &song.members {
         let button = Button::new();
-        button.set_relief(gtk::ReliefStyle::None);
+        button.add_css_class("flat");
         button.set_focus_on_click(false);
         button.set_hexpand(true);
         button.set_halign(gtk::Align::Fill);
@@ -1753,8 +1853,8 @@ fn render_members(view: &UiView, model: &UiModel) {
         let member_color = member.color.clone();
 
         let border_wrap = GtkBox::new(Orientation::Vertical, 0);
-        border_wrap.style_context().add_class("member-card");
-        attach_member_card_css(&border_wrap, &stage_name, &member_color);
+        border_wrap.add_css_class("member-card");
+        name_member_card(&border_wrap, &stage_name);
         border_wrap.set_margin_start(4);
         border_wrap.set_margin_end(4);
         border_wrap.set_margin_top(2);
@@ -1767,18 +1867,21 @@ fn render_members(view: &UiView, model: &UiModel) {
         inner.set_margin_top(4);
         inner.set_margin_bottom(4);
 
-        let portrait_pixbuf = member_portrait_pixbuf(member, &image_cache);
+        let portrait_texture = member_portrait_texture(member, &image_cache);
 
         let portrait_frame = GtkBox::new(Orientation::Vertical, 0);
         portrait_frame.set_size_request(MEMBER_PORTRAIT_WIDTH, MEMBER_PORTRAIT_HEIGHT);
-        portrait_frame.style_context().add_class("member-portrait");
+        portrait_frame.add_css_class("member-portrait");
         portrait_frame.set_opacity(0.42);
 
-        let image = gtk::Image::new();
-        if let Some(pixbuf) = portrait_pixbuf.as_ref() {
-            image.set_from_pixbuf(Some(pixbuf));
+        if let Some(texture) = portrait_texture.as_ref() {
+            // GtkPicture (not GtkImage) is required here: GtkImage renders a
+            // paintable at icon size, which shrinks the portrait to a thumbnail.
+            let image = gtk::Picture::new();
+            image.set_paintable(Some(texture));
+            image.set_content_fit(gtk::ContentFit::Cover);
             image.set_size_request(MEMBER_PORTRAIT_WIDTH, MEMBER_PORTRAIT_HEIGHT);
-            portrait_frame.pack_start(&image, true, true, 0);
+            portrait_frame.append(&image);
         } else {
             let placeholder = Label::new(None);
             placeholder.set_size_request(MEMBER_PORTRAIT_WIDTH, MEMBER_PORTRAIT_HEIGHT);
@@ -1787,17 +1890,17 @@ fn render_members(view: &UiView, model: &UiModel) {
                 glib::markup_escape_text(&initials(&stage_name))
             ));
             placeholder.set_valign(gtk::Align::Center);
-            portrait_frame.pack_start(&placeholder, true, true, 0);
+            portrait_frame.append(&placeholder);
         }
-        inner.pack_start(&portrait_frame, false, false, 0);
+        inner.append(&portrait_frame);
 
         let name = Label::new(Some(&stage_name));
-        name.style_context().add_class("member-name");
+        name.add_css_class("member-name");
         apply_member_name_style(&name, &member_color, false);
-        inner.pack_start(&name, false, false, 0);
+        inner.append(&name);
 
-        border_wrap.pack_start(&inner, true, true, 0);
-        button.add(&border_wrap);
+        border_wrap.append(&inner);
+        button.set_child(Some(&border_wrap));
 
         let member = member.clone();
         let group_name = song
@@ -1816,19 +1919,16 @@ fn render_members(view: &UiView, model: &UiModel) {
             );
         });
 
-        container.pack_start(&button, true, true, 0);
+        container.append(&button);
         stage_buttons.push(MemberButton {
             stage_name,
             color: member_color,
-            button,
             border_wrap,
             portrait_frame,
-            image,
             name_label: name,
         });
     }
     view.member_stage.borrow_mut().buttons = stage_buttons;
-    container.show_all();
 }
 
 fn initials(name: &str) -> String {

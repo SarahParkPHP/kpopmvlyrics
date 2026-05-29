@@ -32,6 +32,14 @@ pub mod tauri_player {
 
     struct MainThreadPlayer(PlatformPlayer);
 
+    // SAFETY: `PlatformPlayer` wraps a `PlaybackEngine` that holds `!Send` data
+    // (`Rc<Cell<bool>>` and a glib `SourceId` bound to the main thread's
+    // GLib context). Tauri managed state must be `Send + Sync`, but the inner
+    // player is only ever constructed and accessed on the main thread: every
+    // access goes through `run_on_player_thread` (which dispatches via
+    // `AppHandle::run_on_main_thread`) or `defer_window_setup` (invoked from the
+    // Tauri `setup` hook, also on the main thread). The `Mutex` serializes those
+    // accesses, so the value is never used from another thread.
     unsafe impl Send for MainThreadPlayer {}
     unsafe impl Sync for MainThreadPlayer {}
 

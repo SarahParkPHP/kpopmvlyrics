@@ -3,17 +3,18 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gtk::gio;
 use gtk::prelude::*;
 use gtk::{
-    ApplicationWindow, Box as GtkBox, Button, ComboBoxText, Grid, Label, Orientation, Revealer,
-    ScrolledWindow, SpinButton, TextView,
+    ApplicationWindow, Box as GtkBox, Button, Grid, Label, Orientation, Revealer, ScrolledWindow,
+    SpinButton, TextView,
 };
 
-use crate::app::{apply_member_profiles, shift_alignment, DEFAULT_MANUAL_CAPTIONS, DEFAULT_MANUAL_LYRICS};
-use crate::log::{progress, PhaseGuard, verbose};
+use crate::app::{shift_alignment, DEFAULT_MANUAL_CAPTIONS, DEFAULT_MANUAL_LYRICS};
+use crate::log::{progress, verbose, PhaseGuard};
 use crate::models::{AlignmentLine, MemberProfile};
 
-use super::{spawn_work, BackgroundUpdate, UiModel, UiView, WorkerSnapshot};
+use super::{spawn_work, BackgroundUpdate, IdDropDown, UiModel, UiView, WorkerSnapshot};
 
 pub struct EditorWidgets {
     pub revealer: Revealer,
@@ -37,33 +38,33 @@ pub fn build_editor_panel() -> EditorBuild {
     let panel = GtkBox::new(Orientation::Vertical, 8);
 
     let import_row = GtkBox::new(Orientation::Horizontal, 8);
+    import_row.set_homogeneous(true);
+
     let lyrics_frame = GtkBox::new(Orientation::Vertical, 4);
-    lyrics_frame.pack_start(&Label::new(Some("Manual lyrics")), false, false, 0);
-    let lyrics_scroll = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    lyrics_frame.set_hexpand(true);
+    lyrics_frame.append(&Label::new(Some("Manual lyrics")));
+    let lyrics_scroll = ScrolledWindow::new();
     lyrics_scroll.set_min_content_height(100);
+    lyrics_scroll.set_vexpand(true);
     let lyrics_view = TextView::new();
-    lyrics_view
-        .buffer()
-        .expect("lyrics text buffer")
-        .set_text(DEFAULT_MANUAL_LYRICS);
-    lyrics_scroll.add(&lyrics_view);
-    lyrics_frame.pack_start(&lyrics_scroll, true, true, 0);
+    lyrics_view.buffer().set_text(DEFAULT_MANUAL_LYRICS);
+    lyrics_scroll.set_child(Some(&lyrics_view));
+    lyrics_frame.append(&lyrics_scroll);
 
     let captions_frame = GtkBox::new(Orientation::Vertical, 4);
-    captions_frame.pack_start(&Label::new(Some("Manual captions")), false, false, 0);
-    let captions_scroll = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    captions_frame.set_hexpand(true);
+    captions_frame.append(&Label::new(Some("Manual captions")));
+    let captions_scroll = ScrolledWindow::new();
     captions_scroll.set_min_content_height(100);
+    captions_scroll.set_vexpand(true);
     let captions_view = TextView::new();
-    captions_view
-        .buffer()
-        .expect("captions text buffer")
-        .set_text(DEFAULT_MANUAL_CAPTIONS);
-    captions_scroll.add(&captions_view);
-    captions_frame.pack_start(&captions_scroll, true, true, 0);
+    captions_view.buffer().set_text(DEFAULT_MANUAL_CAPTIONS);
+    captions_scroll.set_child(Some(&captions_view));
+    captions_frame.append(&captions_scroll);
 
-    import_row.pack_start(&lyrics_frame, true, true, 0);
-    import_row.pack_start(&captions_frame, true, true, 0);
-    panel.pack_start(&import_row, false, false, 0);
+    import_row.append(&lyrics_frame);
+    import_row.append(&captions_frame);
+    panel.append(&import_row);
 
     let import_actions = GtkBox::new(Orientation::Horizontal, 6);
     let import_lyrics_button = Button::with_label("Import Lyrics");
@@ -71,23 +72,24 @@ pub fn build_editor_panel() -> EditorBuild {
     let shift_back_button = Button::with_label("-0.5s");
     let shift_forward_button = Button::with_label("+0.5s");
     let save_button = Button::with_label("Save Alignment");
-    import_actions.pack_start(&import_lyrics_button, false, false, 0);
-    import_actions.pack_start(&import_captions_button, false, false, 0);
-    import_actions.pack_start(&shift_back_button, false, false, 0);
-    import_actions.pack_start(&shift_forward_button, false, false, 0);
-    import_actions.pack_start(&save_button, false, false, 0);
-    panel.pack_start(&import_actions, false, false, 0);
+    import_actions.append(&import_lyrics_button);
+    import_actions.append(&import_captions_button);
+    import_actions.append(&shift_back_button);
+    import_actions.append(&shift_forward_button);
+    import_actions.append(&save_button);
+    panel.append(&import_actions);
 
-    let table_scroll = ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    let table_scroll = ScrolledWindow::new();
     table_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
     table_scroll.set_min_content_height(180);
+    table_scroll.set_vexpand(true);
     let table_box = GtkBox::new(Orientation::Vertical, 2);
-    table_scroll.add(&table_box);
-    panel.pack_start(&table_scroll, true, true, 0);
+    table_scroll.set_child(Some(&table_box));
+    panel.append(&table_scroll);
 
     let revealer = Revealer::new();
     revealer.set_reveal_child(false);
-    revealer.add(&panel);
+    revealer.set_child(Some(&panel));
 
     EditorBuild {
         revealer: revealer.clone(),
@@ -130,12 +132,9 @@ pub fn connect_editor_handlers(
         let lyrics_view = build.lyrics_view.clone();
         let work_tx = work_tx.clone();
         build.import_lyrics_button.connect_clicked(move |_| {
-            let buffer = lyrics_view.buffer().expect("lyrics text buffer");
+            let buffer = lyrics_view.buffer();
             let (start, end) = buffer.bounds();
-            let text = buffer
-                .text(&start, &end, true)
-                .map(|value| value.to_string())
-                .unwrap_or_default();
+            let text = buffer.text(&start, &end, true).to_string();
             let query = view.model.borrow().query.clone();
             let title = if query.is_empty() {
                 "Imported Song".to_string()
@@ -163,12 +162,9 @@ pub fn connect_editor_handlers(
         let captions_view = build.captions_view.clone();
         let work_tx = work_tx.clone();
         build.import_captions_button.connect_clicked(move |_| {
-            let buffer = captions_view.buffer().expect("captions text buffer");
+            let buffer = captions_view.buffer();
             let (start, end) = buffer.bounds();
-            let text = buffer
-                .text(&start, &end, true)
-                .map(|value| value.to_string())
-                .unwrap_or_default();
+            let text = buffer.text(&start, &end, true).to_string();
             let view = Rc::clone(&view);
             spawn_work(work_tx.clone(), view, "Caption import", move |snapshot| {
                 let video_id = snapshot
@@ -259,7 +255,6 @@ impl UiView {
         clear_box(&self.editor.table_box);
         render_alignment_table(&self.editor.table_box, &model, Rc::clone(&self.model));
         drop(model);
-        self.editor.table_box.show_all();
         if let Ok(mut model) = self.model.try_borrow_mut() {
             model.editor_table_dirty = false;
         }
@@ -293,19 +288,14 @@ fn editor_render_key(model: &UiModel) -> String {
 }
 
 fn clear_box(container: &GtkBox) {
-    for child in container.children() {
+    while let Some(child) = container.first_child() {
         container.remove(&child);
     }
 }
 
 fn render_alignment_table(container: &GtkBox, model: &UiModel, model_rc: Rc<RefCell<UiModel>>) {
     let Some(song) = &model.song else {
-        container.pack_start(
-            &Label::new(Some("Load lyrics to edit alignment timing.")),
-            false,
-            false,
-            0,
-        );
+        container.append(&Label::new(Some("Load lyrics to edit alignment timing.")));
         return;
     };
 
@@ -320,7 +310,7 @@ fn render_alignment_table(container: &GtkBox, model: &UiModel, model_rc: Rc<RefC
         label.set_markup(&format!("<b>{title}</b>"));
         header.attach(&label, col as i32, 0, 1, 1);
     }
-    container.pack_start(&header, false, false, 0);
+    container.append(&header);
 
     for (row_idx, line) in song.lines.iter().enumerate() {
         let timing = alignment_for_line(&model.alignment, line.index);
@@ -330,21 +320,21 @@ fn render_alignment_table(container: &GtkBox, model: &UiModel, model_rc: Rc<RefC
 
         let text = Label::new(Some(&line.original));
         text.set_xalign(0.0);
-        text.set_line_wrap(true);
+        text.set_wrap(true);
         text.set_max_width_chars(40);
         grid.attach(&text, 0, 0, 1, 1);
 
-        let member_combo = ComboBoxText::new();
-        member_combo.append(None, "All");
+        let member_combo = IdDropDown::new();
+        member_combo.append("", "All");
         for member in &song.members {
-            member_combo.append(Some(&member.stage_name), &member.stage_name);
+            member_combo.append(&member.stage_name, &member.stage_name);
         }
         if let Some(name) = &line.member {
-            member_combo.set_active_id(Some(name));
+            member_combo.set_active_id(name);
         } else {
-            member_combo.set_active(Some(0));
+            member_combo.set_active_id("");
         }
-        grid.attach(&member_combo, 1, 0, 1, 1);
+        grid.attach(&member_combo.widget, 1, 0, 1, 1);
 
         let start = SpinButton::with_range(0.0, 3_600_000.0, 100.0);
         start.set_value(timing.start_ms as f64);
@@ -360,8 +350,7 @@ fn render_alignment_table(container: &GtkBox, model: &UiModel, model_rc: Rc<RefC
             member_combo.connect_changed(move |combo| {
                 let member = combo
                     .active_id()
-                    .filter(|id| !id.is_empty())
-                    .map(|id| id.to_string());
+                    .filter(|id| !id.is_empty());
                 if let Ok(mut model) = model_rc.try_borrow_mut() {
                     model.set_line_member(line_index, member);
                 }
@@ -398,9 +387,9 @@ fn render_alignment_table(container: &GtkBox, model: &UiModel, model_rc: Rc<RefC
         )));
         grid.attach(&confidence, 4, 0, 1, 1);
 
-        container.pack_start(&grid, false, false, 0);
+        container.append(&grid);
         if row_idx + 1 < song.lines.len() {
-            container.pack_start(&gtk::Separator::new(Orientation::Horizontal), false, false, 0);
+            container.append(&gtk::Separator::new(Orientation::Horizontal));
         }
     }
 }
@@ -426,24 +415,28 @@ pub fn pick_member_image(
     member: MemberProfile,
     group_name: String,
 ) {
-    let dialog = gtk::FileChooserNative::new(
-        Some("Choose member image"),
-        Some(window),
-        gtk::FileChooserAction::Open,
-        Some("_Open"),
-        Some("_Cancel"),
-    );
+    let dialog = gtk::FileDialog::builder()
+        .title("Choose member image")
+        .accept_label("_Open")
+        .modal(true)
+        .build();
+
     let filter = gtk::FileFilter::new();
     filter.set_name(Some("Images"));
     filter.add_mime_type("image/jpeg");
     filter.add_mime_type("image/png");
     filter.add_mime_type("image/gif");
     filter.add_mime_type("image/webp");
-    dialog.add_filter(filter);
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+    dialog.set_filters(Some(&filters));
+    dialog.set_default_filter(Some(&filter));
 
-    dialog.connect_response(move |dialog, response| {
-        if response == gtk::ResponseType::Accept {
-            if let Some(file) = dialog.file() {
+    dialog.open(
+        Some(window),
+        None::<&gio::Cancellable>,
+        move |result| {
+            if let Ok(file) = result {
                 if let Some(path) = file.path() {
                     let mut updated = member.clone();
                     updated.local_image_path = Some(path.to_string_lossy().into_owned());
@@ -463,10 +456,8 @@ pub fn pick_member_image(
                     });
                 }
             }
-        }
-        dialog.destroy();
-    });
-    dialog.show();
+        },
+    );
 }
 
 pub fn resolve_video_chain(
@@ -501,7 +492,7 @@ pub fn resolve_video_chain(
     if !query.is_empty() {
         report_progress(0.38);
         progress("open fetch_lyrics", 0.38);
-        let mut package = {
+        let package = {
             let _phase = PhaseGuard::begin("fetch_lyrics");
             snapshot.ctx.fetch_lyrics(&query)?
         };

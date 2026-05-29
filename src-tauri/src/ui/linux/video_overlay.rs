@@ -2,10 +2,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
+use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    Adjustment, Align, Box as GtkBox, Button, EventBox, Label, Orientation, Overlay, Revealer,
-    RevealerTransitionType, Scale, Widget,
+    Adjustment, Align, Box as GtkBox, Button, EventControllerMotion, GestureClick, Label,
+    Orientation, Overlay, Revealer, RevealerTransitionType, Scale, Widget,
 };
 
 use super::{icon_media_button, spawn_player_work, UiView};
@@ -19,29 +20,24 @@ pub struct VideoOverlay {
     pub replay_button: Button,
     pub seek_scale: Scale,
     pub seek_adjustment: Adjustment,
-    pub     volume_scale: Scale,
-    seek_dragging: Rc<Cell<bool>>,
+    pub volume_scale: Scale,
     pending_seek_ms: Rc<Cell<Option<u64>>>,
-    hide_source: Rc<RefCell<Option<gtk::glib::SourceId>>>,
+    hide_source: Rc<RefCell<Option<glib::SourceId>>>,
 }
 
 pub fn build_video_overlay(video_widget: &Widget) -> VideoOverlay {
     let overlay = Overlay::new();
-    overlay.add(video_widget);
-
-    let event_box = EventBox::new();
-    event_box.set_hexpand(true);
-    event_box.set_vexpand(true);
-    overlay.add_overlay(&event_box);
+    overlay.set_child(Some(video_widget));
 
     let controls_revealer = Revealer::new();
     controls_revealer.set_transition_type(RevealerTransitionType::Crossfade);
     controls_revealer.set_reveal_child(false);
     controls_revealer.set_halign(Align::Fill);
     controls_revealer.set_valign(Align::End);
+    controls_revealer.set_can_target(true);
 
     let card = GtkBox::new(Orientation::Vertical, 6);
-    card.style_context().add_class("video-controls-card");
+    card.add_css_class("video-controls-card");
     card.set_margin_start(12);
     card.set_margin_end(12);
     card.set_margin_bottom(12);
@@ -60,22 +56,26 @@ pub fn build_video_overlay(video_widget: &Widget) -> VideoOverlay {
     let replay_button = icon_media_button("media-playback-start", "Replay");
 
     let volume_label = Label::new(Some("Vol"));
-    volume_label.style_context().add_class("video-controls-label");
+    volume_label.add_css_class("video-controls-label");
     let volume_scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
     volume_scale.set_value(100.0);
     volume_scale.set_size_request(90, -1);
     volume_scale.set_draw_value(false);
 
-    controls_row.pack_start(&play_button, false, false, 0);
-    controls_row.pack_start(&pause_button, false, false, 0);
-    controls_row.pack_start(&stop_button, false, false, 0);
-    controls_row.pack_start(&replay_button, false, false, 0);
-    controls_row.pack_end(&volume_scale, false, false, 0);
-    controls_row.pack_end(&volume_label, false, false, 0);
+    controls_row.append(&play_button);
+    controls_row.append(&pause_button);
+    controls_row.append(&stop_button);
+    controls_row.append(&replay_button);
+    // Right-aligned: spacer + volume on the right.
+    let spacer = GtkBox::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    controls_row.append(&spacer);
+    controls_row.append(&volume_label);
+    controls_row.append(&volume_scale);
 
-    card.pack_start(&seek_scale, false, false, 0);
-    card.pack_start(&controls_row, false, false, 0);
-    controls_revealer.add(&card);
+    card.append(&seek_scale);
+    card.append(&controls_row);
+    controls_revealer.set_child(Some(&card));
     overlay.add_overlay(&controls_revealer);
 
     VideoOverlay {
@@ -88,7 +88,6 @@ pub fn build_video_overlay(video_widget: &Widget) -> VideoOverlay {
         seek_scale,
         seek_adjustment,
         volume_scale,
-        seek_dragging: Rc::new(Cell::new(false)),
         pending_seek_ms: Rc::new(Cell::new(None)),
         hide_source: Rc::new(RefCell::new(None)),
     }
@@ -96,7 +95,6 @@ pub fn build_video_overlay(video_widget: &Widget) -> VideoOverlay {
 
 impl VideoOverlay {
     pub fn connect_handlers(self: &Rc<Self>, view: &Rc<UiView>) {
-        let overlay = self.overlay.clone();
         let controls_revealer = self.controls_revealer.clone();
         let hide_source = Rc::clone(&self.hide_source);
 
@@ -121,43 +119,42 @@ impl VideoOverlay {
                 let controls_revealer = controls_revealer.clone();
                 let hide_source = Rc::clone(&hide_source);
                 let hide_source_for_timeout = Rc::clone(&hide_source);
-                let source = gtk::glib::timeout_add_local(Duration::from_millis(2500), move || {
+                let source = glib::timeout_add_local(Duration::from_millis(2500), move || {
                     controls_revealer.set_reveal_child(false);
                     hide_source_for_timeout.borrow_mut().take();
-                    gtk::glib::ControlFlow::Break
+                    glib::ControlFlow::Break
                 });
                 *hide_source.borrow_mut() = Some(source);
             }
         };
 
+        // Hover: show controls on enter, schedule hide on leave.
+        let motion = EventControllerMotion::new();
         {
             let show_controls = show_controls.clone();
-            overlay.connect_enter_notify_event(move |_, _| {
-                show_controls();
-                gtk::glib::Propagation::Proceed
-            });
+            motion.connect_enter(move |_, _, _| show_controls());
         }
-
         {
             let schedule_hide = schedule_hide.clone();
-            overlay.connect_leave_notify_event(move |_, _| {
-                schedule_hide();
-                gtk::glib::Propagation::Proceed
-            });
+            motion.connect_leave(move |_| schedule_hide());
         }
+        self.overlay.add_controller(motion);
 
+        // Click to toggle controls visibility.
+        let click = GestureClick::new();
         {
             let show_controls = show_controls.clone();
             let schedule_hide = schedule_hide.clone();
-            overlay.connect_button_press_event(move |_, _| {
+            let controls_revealer = self.controls_revealer.clone();
+            click.connect_pressed(move |_, _, _, _| {
                 if controls_revealer.reveals_child() {
                     schedule_hide();
                 } else {
                     show_controls();
                 }
-                gtk::glib::Propagation::Proceed
             });
         }
+        self.overlay.add_controller(click);
 
         {
             let view = Rc::clone(view);
@@ -195,35 +192,22 @@ impl VideoOverlay {
         }
 
         {
+            // Seek bar. In GTK4 a GtkScale drives its own pointer interaction
+            // through an internal gesture that claims the event sequence, which
+            // cancels any GestureClick we attach to the scale. So we seek from
+            // the `change-value` signal instead — it fires reliably whenever the
+            // user moves the slider (drag, trough click, keyboard or scroll).
             let view = Rc::clone(view);
             let pending_seek_ms = Rc::clone(&self.pending_seek_ms);
-            let seek_adjustment = self.seek_adjustment.clone();
-            let seek_dragging_press = Rc::clone(&self.seek_dragging);
-            let seek_dragging_release = Rc::clone(&self.seek_dragging);
-            let seek_dragging_change = Rc::clone(&self.seek_dragging);
-            self.seek_scale.connect_button_press_event(move |_, _| {
-                seek_dragging_press.set(true);
-                gtk::glib::Propagation::Proceed
-            });
-            self.seek_scale.connect_button_release_event(move |scale, _| {
-                let ms = scale.value().max(0.0) as u64;
-                seek_dragging_release.set(false);
-                pending_seek_ms.set(Some(ms));
-                seek_adjustment.set_value(ms as f64);
-                spawn_player_work(Rc::clone(&view), move |player| player.seek(ms));
-                gtk::glib::Propagation::Proceed
-            });
-            self.seek_scale.connect_change_value(move |_, scroll_type, _new_value| {
-                if matches!(
-                    scroll_type,
-                    gtk::ScrollType::Jump
-                        | gtk::ScrollType::StepForward
-                        | gtk::ScrollType::StepBackward
-                ) {
-                    seek_dragging_change.set(true);
-                }
-                gtk::glib::Propagation::Proceed
-            });
+            self.seek_scale
+                .connect_change_value(move |scale, _scroll_type, new_value| {
+                    let upper = scale.adjustment().upper();
+                    let max = if upper > 0.0 { upper } else { new_value.max(0.0) };
+                    let ms = new_value.clamp(0.0, max) as u64;
+                    pending_seek_ms.set(Some(ms));
+                    spawn_player_work(Rc::clone(&view), move |player| player.seek(ms));
+                    glib::Propagation::Proceed
+                });
         }
 
         {
@@ -239,10 +223,6 @@ impl VideoOverlay {
     }
 
     pub fn update_seek_bar(&self, current_ms: i64, duration_ms: Option<u64>) {
-        if self.seek_dragging.get() {
-            return;
-        }
-
         if let Some(pending) = self.pending_seek_ms.get() {
             let current = current_ms.max(0) as u64;
             if current.abs_diff(pending) > 1_500 {

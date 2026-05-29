@@ -1,20 +1,17 @@
 use std::cell::Cell;
 
+use gtk::glib;
 use gtk::prelude::*;
 use gtk::{Box as GtkBox, Label, Orientation};
 
-use crate::align::has_playback_timing;
-use crate::app::format_ms;
 use crate::models::{AlignmentLine, LyricLine, MemberProfile, SongPackage};
 
 #[derive(Clone, Debug, Default)]
 pub struct LyricRowContent {
     pub line_index: usize,
-    pub member: String,
     pub original_markup: Option<String>,
     pub roman_markup: Option<String>,
     pub english_markup: Option<String>,
-    pub time_text: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -80,7 +77,6 @@ pub fn lyric_content_key(
 
 pub fn compute_lyric_stage_content(
     song: Option<SongPackage>,
-    alignment: &[AlignmentLine],
     show_original: bool,
     show_romanization: bool,
     show_english: bool,
@@ -99,10 +95,8 @@ pub fn compute_lyric_stage_content(
         .lines
         .iter()
         .map(|line| {
-            let timing = alignment.iter().find(|item| item.lyric_index == line.index);
             LyricRowContent {
                 line_index: line.index,
-                member: line.member.clone().unwrap_or_else(|| "All".to_string()),
                 original_markup: show_original
                     .then(|| {
                         (!line.original.trim().is_empty())
@@ -117,10 +111,6 @@ pub fn compute_lyric_stage_content(
                     .then(|| line.english.as_ref())
                     .flatten()
                     .map(|text| colored_markup(line, "english", text, members)),
-                time_text: timing
-                    .filter(|item| has_playback_timing(item))
-                    .map(|item| format_ms(item.start_ms))
-                    .unwrap_or_else(|| "Unaligned".to_string()),
             }
         })
         .collect();
@@ -172,7 +162,7 @@ impl LyricStage {
             return;
         }
 
-        for child in container.children() {
+        while let Some(child) = container.first_child() {
             container.remove(&child);
         }
         self.widgets = None;
@@ -184,32 +174,32 @@ impl LyricStage {
         let panel = GtkBox::new(Orientation::Vertical, 6);
         panel.set_halign(gtk::Align::Fill);
         panel.set_valign(gtk::Align::Start);
-        panel.style_context().add_class("lyric-current-panel");
+        panel.add_css_class("lyric-current-panel");
 
         let empty_label = Label::new(None);
-        empty_label.set_line_wrap(true);
+        empty_label.set_wrap(true);
         empty_label.set_xalign(0.5);
         empty_label.set_halign(gtk::Align::Center);
         empty_label.set_margin_top(24);
         empty_label.set_margin_bottom(24);
-        empty_label.style_context().add_class("lyric-empty-message");
+        empty_label.add_css_class("lyric-empty-message");
 
         let text_box = GtkBox::new(Orientation::Vertical, 8);
         text_box.set_halign(gtk::Align::Center);
         text_box.set_valign(gtk::Align::Center);
-        text_box.style_context().add_class("lyric-current-line");
+        text_box.add_css_class("lyric-current-line");
 
         let original_label = markup_label("");
         let roman_label = markup_label("");
         let english_label = markup_label("");
 
-        text_box.pack_start(&original_label, false, false, 0);
-        text_box.pack_start(&roman_label, false, false, 0);
-        text_box.pack_start(&english_label, false, false, 0);
+        text_box.append(&original_label);
+        text_box.append(&roman_label);
+        text_box.append(&english_label);
 
-        panel.pack_start(&empty_label, false, false, 0);
-        panel.pack_start(&text_box, false, false, 0);
-        container.pack_start(&panel, false, false, 0);
+        panel.append(&empty_label);
+        panel.append(&text_box);
+        container.append(&panel);
 
         self.widgets = Some(LyricStageWidgets {
             empty_label,
@@ -225,8 +215,6 @@ impl LyricStage {
             self.show_line_display();
             self.render_active_line(None);
         }
-
-        container.show_all();
     }
 
     pub fn set_active(&self, active_index: usize) {
@@ -248,17 +236,17 @@ impl LyricStage {
             widgets.empty_label.set_markup(&format!(
                 "<span size='large' foreground='#666666'>{message}</span>"
             ));
-            widgets.empty_label.show();
+            widgets.empty_label.set_visible(true);
         }
-        widgets.text_box.hide();
+        widgets.text_box.set_visible(false);
     }
 
     fn show_line_display(&self) {
         let Some(widgets) = &self.widgets else {
             return;
         };
-        widgets.empty_label.hide();
-        widgets.text_box.show();
+        widgets.empty_label.set_visible(false);
+        widgets.text_box.set_visible(true);
     }
 
     fn render_active_line(&self, active_index: Option<usize>) {
@@ -275,9 +263,9 @@ impl LyricStage {
         });
 
         let Some(row) = row else {
-            widgets.original_label.hide();
-            widgets.roman_label.hide();
-            widgets.english_label.hide();
+            widgets.original_label.set_visible(false);
+            widgets.roman_label.set_visible(false);
+            widgets.english_label.set_visible(false);
             return;
         };
 
@@ -293,9 +281,9 @@ fn set_markup_label(label: &Label, markup: Option<&str>) {
     match markup.filter(|value| !value.is_empty()) {
         Some(markup) => {
             label.set_markup(&wrap_lyric_display_markup(markup));
-            label.show();
+            label.set_visible(true);
         }
-        None => label.hide(),
+        None => label.set_visible(false),
     }
 }
 
@@ -306,10 +294,10 @@ fn wrap_lyric_display_markup(inner: &str) -> String {
 }
 
 fn configure_lyric_label(label: &Label) {
-    label.style_context().add_class("lyric-current-text");
+    label.add_css_class("lyric-current-text");
     label.set_xalign(0.5);
     label.set_justify(gtk::Justification::Center);
-    label.set_line_wrap(true);
+    label.set_wrap(true);
     label.set_max_width_chars(52);
 }
 
@@ -556,7 +544,7 @@ mod tests {
             provider: "test".into(),
         };
 
-        let content = compute_lyric_stage_content(Some(song), &[], true, true, true);
+        let content = compute_lyric_stage_content(Some(song), true, true, true);
         let row = &content.rows[0];
         let english = row.english_markup.as_deref().unwrap();
         assert!(english.contains("special star"));
@@ -626,7 +614,7 @@ mod tests {
             provider: "test".into(),
         };
 
-        let content = compute_lyric_stage_content(Some(song.clone()), &[], true, true, true);
+        let content = compute_lyric_stage_content(Some(song.clone()), true, true, true);
         assert_eq!(content.rows.len(), 1);
         let row = &content.rows[0];
         assert_eq!(row.line_index, 16);

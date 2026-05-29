@@ -232,7 +232,8 @@ impl AppContext {
             best_alignment.len()
         ));
 
-        if prefer_asr {
+        let configured_model = self.effective_asr_model();
+        if prefer_asr && configured_model.is_enabled() {
             report_progress(0.78);
             progress("align asr branch", 0.78);
             let _phase = PhaseGuard::begin("align asr_available check");
@@ -240,7 +241,7 @@ impl AppContext {
             verbose(format!("align asr_available={asr_ok}"));
             drop(_phase);
             if asr_ok {
-                let model_size = self.effective_asr_model();
+                let model_size = configured_model;
                 verbose(format!("align asr model={}", model_size.model_filename()));
                 let primary_align_language =
                     forced_align_language(asr_use_original, asr_language);
@@ -320,6 +321,8 @@ impl AppContext {
                 );
                 eprintln!("kpopmvlyrics: {summary}");
             }
+        } else if prefer_asr && !configured_model.is_enabled() {
+            verbose("align asr disabled by user setting; using caption alignment only");
         }
 
         report_progress(0.84);
@@ -352,24 +355,6 @@ impl AppContext {
         let mut repo = self.repo.lock().map_err(to_string)?;
         repo.upsert_alignment(song_id, video_id, lines)
             .map_err(to_string)
-    }
-
-    pub fn load_playback_cache(
-        &self,
-        song_id: i64,
-        video_id: &str,
-        lyric_count: usize,
-    ) -> Option<(Vec<AlignmentLine>, Vec<CaptionLine>)> {
-        let repo = self.repo.lock().ok()?;
-        let alignment = repo.alignment_lines(song_id, video_id).ok()?;
-        if alignment.is_empty() || alignment.len() != lyric_count {
-            return None;
-        }
-        let captions = repo.caption_lines(video_id).ok()?;
-        if captions.is_empty() {
-            return None;
-        }
-        Some((alignment, captions))
     }
 
     pub fn search_member_profiles(&self, group_name: &str) -> Result<Vec<MemberProfile>, String> {

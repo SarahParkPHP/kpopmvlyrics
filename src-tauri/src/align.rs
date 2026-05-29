@@ -380,25 +380,6 @@ fn significant_token_match_score(lyric_tokens: &[String], caption_tokens: &[Stri
     matched as f64 / lyric_tokens.len() as f64
 }
 
-fn token_overlap_score(a: &str, b: &str) -> f64 {
-    let ta: HashSet<&str> = a.split_whitespace().collect();
-    let tb: HashSet<&str> = b.split_whitespace().collect();
-    if ta.is_empty() || tb.is_empty() {
-        return 0.0;
-    }
-
-    let shared = ta.intersection(&tb).count();
-    if shared == 0 {
-        return 0.0;
-    }
-
-    let min_len = ta.len().min(tb.len());
-    let max_len = ta.len().max(tb.len());
-    let overlap = shared as f64 / min_len as f64;
-    let coverage = shared as f64 / max_len as f64;
-    overlap * 0.75 + coverage * 0.25
-}
-
 fn containment_score(lyric_text: &str, caption_text: &str) -> f64 {
     let (longer, shorter) = if lyric_text.len() >= caption_text.len() {
         (lyric_text, caption_text)
@@ -435,14 +416,6 @@ static NORMALIZE_WHITESPACE: LazyLock<Regex> =
 
 pub fn is_synced_line(line: &AlignmentLine) -> bool {
     line.caption_index.is_some() && line.start_ms >= 0
-}
-
-pub fn alignment_quality(lines: &[AlignmentLine]) -> f64 {
-    lines
-        .iter()
-        .filter(|line| is_synced_line(line))
-        .map(|line| 1.0 + f64::from(line.confidence))
-        .sum()
 }
 
 pub fn alignment_playback_quality(lines: &[AlignmentLine]) -> f64 {
@@ -484,17 +457,6 @@ pub fn lyric_line_for_forced_alignment(line: &LyricLine, use_original: bool) -> 
         return None;
     }
     Some(text)
-}
-
-pub fn build_lyrics_forced_alignment_text(lyrics: &[LyricLine], use_original: bool) -> String {
-    build_lyrics_forced_alignment_bundle(lyrics, use_original).0
-}
-
-pub fn build_lyrics_forced_alignment_bundle(
-    lyrics: &[LyricLine],
-    use_original: bool,
-) -> (String, Vec<crate::asr::ForcedAlignLine>) {
-    build_lyrics_forced_alignment_bundle_with_hints(lyrics, use_original, &[])
 }
 
 pub fn build_lyrics_forced_alignment_bundle_with_hints(

@@ -516,15 +516,6 @@ pub fn strip_member_line_tag(text: &str) -> (String, MemberLineTag) {
     (cleaned, MemberLineTag { parts, with_all })
 }
 
-pub fn strip_member_singer_tag(text: &str) -> (String, Option<String>, bool) {
-    let (cleaned, tag) = strip_member_line_tag(text);
-    if tag.parts.is_empty() {
-        return (cleaned, None, false);
-    }
-    let primary = tag.parts.first().cloned();
-    (cleaned, primary, tag.with_all)
-}
-
 pub fn normalize_line_member_tags(line: &mut LyricLine) {
     let mut with_all = line.with_all;
     let mut named_parts = Vec::new();
@@ -1056,10 +1047,6 @@ fn inherit_members_on_segments(line: &mut LyricLine) {
     }
 }
 
-fn select_best_colorcodedlyrics_link(document: &Html, query: &str) -> Option<String> {
-    rank_best_colorcodedlyrics_link(document, query).map(|(_, href)| href)
-}
-
 fn rank_best_colorcodedlyrics_link(document: &Html, query: &str) -> Option<(f64, String)> {
     let selector = Selector::parse("h2 a, article a, .entry-title a").ok()?;
 
@@ -1423,38 +1410,6 @@ fn parsed_column_is_all_members(line: &ParsedColumnLine) -> bool {
     line.segments.iter().all(|segment| segment.color.is_none())
 }
 
-fn push_lyric_line(
-    lines: &mut Vec<LyricLine>,
-    member: Option<String>,
-    text: String,
-    language: Option<&str>,
-) {
-    let text = text.trim();
-    if text.is_empty() || looks_like_metadata(text) {
-        return;
-    }
-    let mut line = LyricLine {
-        id: None,
-        song_id: None,
-        index: lines.len(),
-        member,
-        original: String::new(),
-        romanization: None,
-        english: None,
-        with_all: false,
-        segments: Vec::new(),
-    };
-    match language {
-        Some("english") => line.english = Some(text.to_string()),
-        Some("romanization") => line.romanization = Some(text.to_string()),
-        _ => line.original = text.to_string(),
-    }
-    lines.push(line);
-    if let Some(line) = lines.last_mut() {
-        normalize_line_member_tags(line);
-    }
-}
-
 fn strip_tags(html: &str) -> String {
     let br_re = Regex::new(r#"(?i)<br\s*/?>"#).expect("valid regex");
     let tag_re = Regex::new(r#"(?is)<[^>]+>"#).expect("valid regex");
@@ -1549,8 +1504,7 @@ mod tests {
         lyric_language_toggles, lyrics_search_queries, member_highlight_for_line, members_for_lines,
         normalize_line_member_tags, parse_colorcodedlyrics_html, parse_genius_html,
         parse_manual_lyrics, rank_best_colorcodedlyrics_link, resolve_member_name,
-        score_colorcodedlyrics_match, select_best_colorcodedlyrics_link, song_search_tokens,
-        strip_member_line_tag, strip_member_singer_tag, LyricsProvider,
+        score_colorcodedlyrics_match, song_search_tokens, strip_member_line_tag, LyricsProvider,
     };
     use crate::models::{LyricLine, MemberProfile};
     use scraper::Html;
@@ -1801,8 +1755,8 @@ mod tests {
             <article><h2><a href="https://colorcodedlyrics.com/2026/05/17/nmixx-heavy-serenade/">NMIXX - Heavy Serenade</a></h2></article>
         "#;
         let document = Html::parse_document(html);
-        let link =
-            select_best_colorcodedlyrics_link(&document, "NMIXX(엔믹스) Heavy Serenade").unwrap();
+        let (_, link) =
+            rank_best_colorcodedlyrics_link(&document, "NMIXX(엔믹스) Heavy Serenade").unwrap();
         assert!(link.ends_with("/nmixx-heavy-serenade/"));
     }
 
@@ -1813,8 +1767,8 @@ mod tests {
             <article><h2><a href="https://colorcodedlyrics.com/2023/06/01/stray-kids-s-class-teug/">Stray Kids - S-Class (특)</a></h2></article>
         "#;
         let document = Html::parse_document(html);
-        let link =
-            select_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)").unwrap();
+        let (_, link) =
+            rank_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)").unwrap();
         assert!(link.ends_with("/stray-kids-s-class-teug/"));
     }
 
@@ -1878,15 +1832,6 @@ mod tests {
             .members
             .iter()
             .any(|member| member.stage_name.contains("방찬")));
-    }
-
-    #[test]
-    fn strips_member_singer_all_tag_from_line_text() {
-        let (cleaned, tag, with_all) =
-            strip_member_singer_tag("[LK/All] bitkkal ppeonjjeok bitkkal ppeonjjeok");
-        assert!(with_all);
-        assert_eq!(tag.as_deref(), Some("LK"));
-        assert_eq!(cleaned, "bitkkal ppeonjjeok bitkkal ppeonjjeok");
     }
 
     #[test]

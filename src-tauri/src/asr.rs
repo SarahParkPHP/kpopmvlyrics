@@ -16,29 +16,37 @@ pub const ALIGNER_MODEL: &str = "Qwen/Qwen3-ForcedAligner-0.6B";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AsrModelSize {
+    /// Skip the ASR pipeline entirely - rely solely on YouTube caption alignment.
+    Disabled,
     #[default]
     Small,
     Large,
 }
 
 impl AsrModelSize {
-    pub fn hf_model_id(self) -> &'static str {
+    pub fn hf_model_id(self) -> Option<&'static str> {
         match self {
-            Self::Small => SMALL_ASR_MODEL,
-            Self::Large => LARGE_ASR_MODEL,
+            Self::Disabled => None,
+            Self::Small => Some(SMALL_ASR_MODEL),
+            Self::Large => Some(LARGE_ASR_MODEL),
         }
     }
 
     pub fn model_filename(self) -> &'static str {
-        self.hf_model_id()
+        self.hf_model_id().unwrap_or("(none)")
     }
 
     pub fn backend(self) -> &'static str {
         "qwen-asr"
     }
 
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
+            Self::Disabled => "No ASR (captions only)",
             Self::Small => "Qwen3-ASR 0.6B (faster)",
             Self::Large => "Qwen3-ASR 1.7B (more accurate)",
         }
@@ -46,6 +54,7 @@ impl AsrModelSize {
 
     pub fn from_storage(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            "disabled" | "none" | "off" => Self::Disabled,
             "large" | "large-v3" | "1.7b" | "qwen3-1.7b" | "qwen3-asr-1.7b" => Self::Large,
             _ => Self::Small,
         }
@@ -53,6 +62,7 @@ impl AsrModelSize {
 
     pub fn as_storage(self) -> &'static str {
         match self {
+            Self::Disabled => "disabled",
             Self::Small => "small",
             Self::Large => "large",
         }
@@ -123,18 +133,14 @@ pub struct ForcedAlignLine {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct AsrSegment {
+pub(crate) struct AsrSegment {
     text: String,
     start_ms: i64,
     end_ms: i64,
-    #[serde(default)]
-    words: Vec<AsrWord>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsrTranscript {
-    pub language: Option<String>,
-    pub model: Option<String>,
     pub backend: Option<String>,
     pub device: Option<String>,
     pub words: Vec<AsrWord>,
@@ -257,9 +263,12 @@ pub fn transcribe_audio(
         .filter(|lines| !lines.is_empty())
         .map(|_| TempFileGuard(lyrics_lines_path.clone()));
 
+    let model_id = model_size
+        .hf_model_id()
+        .ok_or_else(|| anyhow!("Qwen3 ASR is disabled in settings"))?;
     verbose(format!(
         "asr model={} aligner={} device={} align_language={:?}",
-        model_size.hf_model_id(),
+        model_id,
         ALIGNER_MODEL,
         effective_asr_device(),
         align_language
@@ -274,7 +283,7 @@ pub fn transcribe_audio(
         .arg("--output")
         .arg(&output_path)
         .arg("--model")
-        .arg(model_size.hf_model_id())
+        .arg(model_id)
         .arg("--aligner-model")
         .arg(ALIGNER_MODEL)
         .arg("--device")
@@ -472,9 +481,18 @@ mod tests {
     fn asr_model_size_round_trips_storage() {
         assert_eq!(AsrModelSize::Small.as_storage(), "small");
         assert_eq!(AsrModelSize::Large.as_storage(), "large");
+        assert_eq!(AsrModelSize::Disabled.as_storage(), "disabled");
         assert_eq!(AsrModelSize::from_storage("large"), AsrModelSize::Large);
         assert_eq!(AsrModelSize::from_storage("small"), AsrModelSize::Small);
-        assert_eq!(AsrModelSize::Small.hf_model_id(), SMALL_ASR_MODEL);
+        assert_eq!(
+            AsrModelSize::from_storage("disabled"),
+            AsrModelSize::Disabled
+        );
+        assert_eq!(AsrModelSize::from_storage("none"), AsrModelSize::Disabled);
+        assert_eq!(AsrModelSize::Small.hf_model_id(), Some(SMALL_ASR_MODEL));
+        assert!(AsrModelSize::Disabled.hf_model_id().is_none());
+        assert!(!AsrModelSize::Disabled.is_enabled());
+        assert!(AsrModelSize::Small.is_enabled());
     }
 
     #[test]

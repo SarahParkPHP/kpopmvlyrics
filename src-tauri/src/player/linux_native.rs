@@ -1,25 +1,35 @@
-use gtk::prelude::*;
+use gdk_pixbuf as _; // ensure crate is linked
 use gstreamer as gst;
-use gstreamer::prelude::Cast;
 use gstreamer::prelude::ObjectExt;
+use gtk::gdk;
+use gtk::prelude::*;
+
 use crate::models::{StreamSpec, VideoPosition};
 use crate::player::events::PlaybackEvents;
-use crate::player::pipeline::{ensure_gstreamer, set_video_overlay_handle, PlaybackEngine};
+use crate::player::pipeline::{ensure_gstreamer, PlaybackEngine};
 
 pub struct NativeLinuxPlayer {
     engine: PlaybackEngine,
     video_box: gtk::Box,
+    picture: gtk::Picture,
     video_sink: Option<gst::Element>,
-    uses_embedded_widget: bool,
 }
 
 impl NativeLinuxPlayer {
     pub fn new(events: PlaybackEvents) -> Self {
+        let video_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        video_box.set_hexpand(true);
+        video_box.set_vexpand(true);
+        let picture = gtk::Picture::new();
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        video_box.append(&picture);
         Self {
             engine: PlaybackEngine::new(events),
-            video_box: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            video_box,
+            picture,
             video_sink: None,
-            uses_embedded_widget: false,
         }
     }
 
@@ -62,69 +72,47 @@ impl NativeLinuxPlayer {
 
     fn release_video_sink(&mut self) {
         self.video_sink.take();
-        for child in self.video_box.children() {
-            self.video_box.remove(&child);
-        }
-        self.uses_embedded_widget = false;
+        self.picture.set_paintable(None::<&gdk::Paintable>);
     }
 
     fn build_video_sink(&mut self) -> Result<gst::Element, String> {
         let sink = create_platform_sink()?;
         configure_video_sink(&sink);
-        if let Ok(widget) = gtk_widget_from_gtk_sink(&sink) {
-            self.video_box.pack_start(&widget, true, true, 0);
-            widget.show_all();
-            self.video_box.show_all();
-            self.uses_embedded_widget = true;
-        } else if let Some(window) = self.video_box.window() {
-            set_video_overlay_handle(sink.upcast_ref(), window.as_ptr() as usize)?;
+        if let Ok(paintable) = paintable_from_sink(&sink) {
+            self.picture.set_paintable(Some(&paintable));
         }
         Ok(sink)
     }
 }
 
 fn configure_video_sink(sink: &gst::Element) {
-    let _ = sink.set_property("sync", true);
-    let _ = sink.set_property("async", true);
+    if sink.has_property("sync") {
+        sink.set_property("sync", true);
+    }
+    if sink.has_property("async") {
+        sink.set_property("async", true);
+    }
 }
 
 fn create_platform_sink() -> Result<gst::Element, String> {
-    if is_wayland_session() {
-        gst::ElementFactory::make("gtksink")
-            .name("video-sink")
-            .build()
-            .or_else(|_| gst::ElementFactory::make("waylandsink").name("video-sink").build())
-            .map_err(|err| {
-                format!("Could not create a Wayland video sink (install gst-plugin-gtk): {err}")
-            })
-    } else {
-        gst::ElementFactory::make("gtksink")
-            .name("video-sink")
-            .build()
-            .or_else(|_| gst::ElementFactory::make("glimagesink").name("video-sink").build())
-            .or_else(|_| gst::ElementFactory::make("xvimagesink").name("video-sink").build())
-            .or_else(|_| gst::ElementFactory::make("autovideosink").name("video-sink").build())
-            .map_err(|err| format!("Could not create an X11 video sink: {err}"))
-    }
+    // gtk4paintablesink (from gst-plugin-gtk4) works on both X11 and Wayland and
+    // hands us a GdkPaintable we can attach to a gtk::Picture.
+    gst::ElementFactory::make("gtk4paintablesink")
+        .name("video-sink")
+        .build()
+        .or_else(|_| {
+            gst::ElementFactory::make("autovideosink")
+                .name("video-sink")
+                .build()
+        })
+        .map_err(|err| {
+            format!("Could not create a video sink (install gst-plugin-gtk4): {err}")
+        })
 }
 
-fn gtk_widget_from_gtk_sink(sink: &gst::Element) -> Result<gtk::Widget, String> {
-    use gstreamer::glib::translate::ToGlibPtr;
-    use gstreamer::prelude::ObjectExt;
-    use gtk::glib::translate::FromGlibPtrNone;
-
-    let object: gstreamer::glib::Object = sink.property("widget");
-    let widget_ptr: *mut gtk::ffi::GtkWidget = {
-        let stash = ToGlibPtr::<*mut gstreamer::glib::gobject_ffi::GObject>::to_glib_none(&object);
-        stash.0 as *mut gtk::ffi::GtkWidget
-    };
-    if widget_ptr.is_null() {
-        return Err("gtksink returned a null widget".to_string());
+fn paintable_from_sink(sink: &gst::Element) -> Result<gdk::Paintable, String> {
+    if !sink.has_property("paintable") {
+        return Err("sink does not expose a paintable property".to_string());
     }
-    // SAFETY: gtksink's widget property is a valid GtkWidget pointer.
-    Ok(unsafe { gtk::Widget::from_glib_none(widget_ptr) })
-}
-
-fn is_wayland_session() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
+    Ok(sink.property::<gdk::Paintable>("paintable"))
 }

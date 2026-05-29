@@ -8,7 +8,9 @@ use gstreamer as gst;
 use gstreamer::bus::BusWatchGuard;
 use gstreamer::prelude::*;
 use gstreamer::prelude::ObjectExt;
+#[cfg(not(target_os = "linux"))]
 use gstreamer_video as gst_video;
+#[cfg(not(target_os = "linux"))]
 use gstreamer_video::prelude::VideoOverlayExtManual;
 
 use crate::models::{StreamSpec, VideoPosition};
@@ -441,28 +443,25 @@ fn try_pipeline_seek(
 }
 
 fn perform_seek(pipeline: &gst::Pipeline, ms: u64, resume_playback: bool) -> Result<(), String> {
+    // Make sure the pipeline has settled into at least PAUSED before seeking;
+    // this is normally instant (even at EOS the state is already reached).
     let _ = pipeline.state(Some(gst::ClockTime::from_seconds(2)));
     let position = gst::ClockTime::from_mseconds(ms);
     let flags = seek_flags_for(ms);
     let adaptive = pipeline.by_name("video-decode").is_some();
-    let replay = ms == 0;
 
-    if adaptive && replay {
-        let _ = pipeline.set_state(gst::State::Paused);
-        let _ = pipeline.state(Some(gst::ClockTime::from_seconds(3)));
-    }
-
-    let ok = if adaptive && replay {
+    // A flushing seek on the whole pipeline is the reliable way to reposition,
+    // including restarting after EOS (replay): GStreamer coordinates the FLUSH
+    // across every branch and resets the running time, so audio and video stay
+    // in sync and play at the correct rate. Seeking the decodebin branches
+    // individually skips that coordination, so use it only as a fallback when
+    // the pipeline-level seek is refused.
+    let ok = if try_pipeline_seek(pipeline, position, flags) {
+        true
+    } else if adaptive {
         seek_adaptive_branches(pipeline, position, flags)
     } else {
-        let pipeline_ok = try_pipeline_seek(pipeline, position, flags);
-        if pipeline_ok {
-            true
-        } else if adaptive {
-            seek_adaptive_branches(pipeline, position, flags)
-        } else {
-            false
-        }
+        false
     };
 
     if !ok {
@@ -473,7 +472,6 @@ fn perform_seek(pipeline: &gst::Pipeline, ms: u64, resume_playback: bool) -> Res
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|err| err.to_string())?;
-        let _ = pipeline.state(Some(gst::ClockTime::from_seconds(3)));
     }
 
     Ok(())
@@ -546,23 +544,6 @@ fn element_state_diagnostics(pipeline: &gst::Pipeline) -> String {
     } else {
         details.join("; ")
     }
-}
-
-fn wait_for_state(
-    pipeline: &gst::Pipeline,
-    target: gst::State,
-    timeout: gst::ClockTime,
-) -> Result<(), String> {
-    let (result, state, pending) = pipeline.state(Some(timeout));
-    if let Err(err) = result {
-        return Err(err.to_string());
-    }
-    if state < target {
-        return Err(format!(
-            "Timed out waiting for pipeline to reach {target:?} (currently {state:?}, pending {pending:?})"
-        ));
-    }
-    Ok(())
 }
 
 fn build_adaptive_pipeline(
@@ -774,8 +755,13 @@ fn connect_decodebin_to_queue(decode: &gst::Element, queue: &gst::Element, prefi
     });
 }
 
+#[cfg(not(target_os = "linux"))]
 pub fn set_video_overlay_handle(sink: &gst::Element, handle: usize) -> Result<(), String> {
     if let Ok(video_sink) = sink.clone().dynamic_cast::<gst_video::VideoOverlay>() {
+        // SAFETY: `set_window_handle` is unsafe because it cannot validate the
+        // raw handle. `handle` is a live native window handle obtained from the
+        // current platform window (HWND on Windows, NSView pointer on macOS),
+        // which outlives the embedded video sink.
         unsafe {
             video_sink.set_window_handle(handle);
         }
@@ -783,6 +769,8 @@ pub fn set_video_overlay_handle(sink: &gst::Element, handle: usize) -> Result<()
     }
 
     if let Some(video_sink) = find_video_overlay(sink) {
+        // SAFETY: see above — `handle` is a live native window handle for the
+        // current platform window that outlives the embedded video sink.
         unsafe {
             video_sink.set_window_handle(handle);
         }
@@ -792,6 +780,7 @@ pub fn set_video_overlay_handle(sink: &gst::Element, handle: usize) -> Result<()
     Err("Video sink does not support window embedding".into())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn find_video_overlay(element: &gst::Element) -> Option<gst_video::VideoOverlay> {
     if let Ok(overlay) = element.clone().dynamic_cast::<gst_video::VideoOverlay>() {
         return Some(overlay);

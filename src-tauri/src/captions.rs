@@ -335,13 +335,6 @@ fn prioritize_tracks(mut tracks: Vec<CaptionTrack>) -> Vec<CaptionTrack> {
     tracks
 }
 
-fn innertube_api_key(html: &str) -> Option<String> {
-    Regex::new(r#""INNERTUBE_API_KEY":"([^"]+)""#)
-        .ok()?
-        .captures(html)
-        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-}
-
 fn with_caption_format(base_url: &str, fmt: &str) -> Result<String> {
     let mut url = Url::parse(base_url)?;
     let pairs: Vec<(String, String)> = url
@@ -524,7 +517,7 @@ fn strip_tags(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_caption_tracks, innertube_api_key, is_wanted_language, parse_caption_text,
+        discover_caption_tracks, is_wanted_language, parse_caption_text,
         pick_default_caption_track, pick_subtitle_url, prioritize_tracks, CaptionProvider,
         CaptionTrackSet, YouTubeCaptionProvider,
     };
@@ -603,12 +596,6 @@ mod tests {
         assert!(is_wanted_language("ko"));
         assert!(!is_wanted_language("ta"));
         assert!(!is_wanted_language("en-zh"));
-    }
-
-    #[test]
-    fn reads_innertube_api_key() {
-        let html = r#"{"INNERTUBE_API_KEY":"abc123"}"#;
-        assert_eq!(innertube_api_key(html).as_deref(), Some("abc123"));
     }
 
     #[test]
