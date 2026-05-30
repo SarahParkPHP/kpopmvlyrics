@@ -357,6 +357,13 @@ impl AppContext {
             .map_err(to_string)
     }
 
+    /// Persist edited lyric lines (text, member, layer, and created/deleted lines).
+    /// Replaces the song's stored lines via the full upsert path, mirroring import.
+    pub fn save_lyric_lines(&self, package: &mut SongPackage) -> Result<(), String> {
+        let mut repo = self.repo.lock().map_err(to_string)?;
+        repo.upsert_song_package(package).map_err(to_string)
+    }
+
     pub fn search_member_profiles(&self, group_name: &str) -> Result<Vec<MemberProfile>, String> {
         let providers: Vec<Box<dyn MemberProfileProvider>> = vec![
             Box::new(KpoppingProvider::default()),
@@ -630,6 +637,7 @@ mod tests {
             romanization: None,
             english: None,
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: Vec::new(),
         }
     }
@@ -684,6 +692,7 @@ mod tests {
             romanization: None,
             english: None,
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: Vec::new(),
         }];
         let members = vec![profile("Felix")];
@@ -720,6 +729,7 @@ mod tests {
             romanization: None,
             english: None,
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: Vec::new(),
         }];
         let profiles = vec![profile("HAN"), profile("Felix"), profile("Woojin")];

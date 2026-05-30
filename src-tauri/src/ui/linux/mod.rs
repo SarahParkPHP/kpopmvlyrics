@@ -2,6 +2,7 @@
 
 mod editor;
 mod lyrics;
+mod timeline;
 mod video_overlay;
 
 use std::cell::{Cell, RefCell};
@@ -494,25 +495,30 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     );
     asr_model_combo.set_active_id(initial_asr_model.as_storage());
     asr_model_row.append(&asr_model_combo.widget);
-    settings_panel.append(&asr_model_row);
 
-    let settings_actions = GtkBox::new(Orientation::Horizontal, 6);
-    settings_actions.append(&fetch_lyrics_button);
-    settings_actions.append(&fetch_captions_button);
-    settings_actions.append(&align_button);
-    settings_actions.append(&save_button);
-    settings_panel.append(&settings_actions);
-
-    let settings_tools = GtkBox::new(Orientation::Horizontal, 6);
-    settings_tools.append(&stream_button);
-    settings_tools.append(&editor_button);
-    settings_panel.append(&settings_tools);
-
-    let sync_controls = GtkBox::new(Orientation::Horizontal, 6);
-    sync_controls.append(&play_button);
-    sync_controls.append(&pause_button);
-    sync_controls.append(&reset_button);
-    settings_panel.append(&sync_controls);
+    // All settings controls share a FlowBox so they collapse onto a single line
+    // when the pane is wide enough and wrap to additional lines only when space
+    // runs out, instead of being permanently stacked in fixed rows.
+    let controls_flow = gtk::FlowBox::new();
+    controls_flow.set_orientation(Orientation::Horizontal);
+    controls_flow.set_selection_mode(gtk::SelectionMode::None);
+    controls_flow.set_min_children_per_line(1);
+    controls_flow.set_max_children_per_line(32);
+    controls_flow.set_column_spacing(6);
+    controls_flow.set_row_spacing(6);
+    controls_flow.set_homogeneous(false);
+    controls_flow.set_halign(gtk::Align::Start);
+    controls_flow.append(&asr_model_row);
+    controls_flow.append(&fetch_lyrics_button);
+    controls_flow.append(&fetch_captions_button);
+    controls_flow.append(&align_button);
+    controls_flow.append(&save_button);
+    controls_flow.append(&stream_button);
+    controls_flow.append(&editor_button);
+    controls_flow.append(&play_button);
+    controls_flow.append(&pause_button);
+    controls_flow.append(&reset_button);
+    settings_panel.append(&controls_flow);
     settings_panel.append(&status_label);
 
     let editor_build = build_editor_panel();
@@ -572,7 +578,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         english_toggle: english_toggle.clone(),
         editor: EditorWidgets {
             revealer: editor_build.widgets.revealer.clone(),
-            table_box: editor_build.widgets.table_box.clone(),
+            timeline: Rc::clone(&editor_build.widgets.timeline),
             render_key: Rc::new(RefCell::new(String::new())),
         },
         lyric_stage: Rc::new(RefCell::new(LyricStage::new())),
@@ -848,6 +854,7 @@ impl UiView {
         render_status(&self.status_label, &model);
         self.video_overlay
             .update_seek_bar(model.current_ms, model.duration_ms);
+        self.editor.timeline.set_playhead(model.current_ms);
         self.sync_active_line(&model);
     }
 

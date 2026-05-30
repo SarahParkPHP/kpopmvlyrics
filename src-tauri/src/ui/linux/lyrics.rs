@@ -526,6 +526,7 @@ mod tests {
                 romanization: Some("teukbyeore byeore".into()),
                 english: Some("The most special star".into()),
                 with_all: false,
+                layer: crate::models::LyricLayer::default(),
                 segments: vec![
                     LyricSegment {
                         language: "original".into(),
@@ -562,6 +563,7 @@ mod tests {
             romanization: None,
             english: None,
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: Vec::new(),
         };
         let names = crate::lyrics::referenced_member_names(std::slice::from_ref(&line));
@@ -590,6 +592,7 @@ mod tests {
                 ),
                 english: Some("The most special star, star, star, star, star, star".into()),
                 with_all: false,
+                layer: crate::models::LyricLayer::default(),
                 segments: vec![
                     LyricSegment {
                         language: "original".into(),
@@ -647,6 +650,7 @@ mod tests {
             romanization: None,
             english: Some("Then this your song so turn it up (Turn it up for me uh uh)".into()),
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: vec![
                 LyricSegment {
                     language: "english".into(),

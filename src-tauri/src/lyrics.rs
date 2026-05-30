@@ -206,6 +206,7 @@ fn parse_plain_lines(raw: &str) -> Vec<LyricLine> {
                 romanization: None,
                 english: None,
                 with_all: false,
+                layer: crate::models::LyricLayer::default(),
                 segments: Vec::new(),
             }
         })
@@ -791,6 +792,7 @@ fn parse_colorcodedlyrics_columns(
                     .map(|line| line.text.trim().to_string())
                     .filter(|text| !text.is_empty()),
                 with_all,
+                layer: crate::models::LyricLayer::default(),
                 segments: lyric_segments(roman, korean, english, color_to_member),
             });
             if let Some(line) = lines.last_mut() {
@@ -1390,6 +1392,7 @@ fn push_parsed_lyric_line(
         romanization: None,
         english: None,
         with_all,
+        layer: crate::models::LyricLayer::default(),
         segments,
     };
     match language {
@@ -1872,6 +1875,7 @@ mod tests {
             romanization: Some("[H/FL] yeogi modeun goseul balkhyeo".into()),
             english: Some("Shine a light here everywhere".into()),
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: Vec::new(),
         };
         normalize_line_member_tags(&mut line);
@@ -1902,6 +1906,7 @@ mod tests {
             romanization: Some("[LK/All] bitkkal ppeonjjeok".into()),
             english: Some("Flashy, flashy".into()),
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: Vec::new(),
         };
         normalize_line_member_tags(&mut line);
@@ -1935,6 +1940,7 @@ mod tests {
                 romanization: Some("Counting stars".into()),
                 english: None,
                 with_all: false,
+                layer: crate::models::LyricLayer::default(),
                 segments: Vec::new(),
             },
             LyricLine {
@@ -1946,6 +1952,7 @@ mod tests {
                 romanization: Some("Everyday".into()),
                 english: None,
                 with_all: false,
+                layer: crate::models::LyricLayer::default(),
                 segments: Vec::new(),
             },
         ];
@@ -1958,6 +1965,7 @@ mod tests {
             romanization: Some("[H/FL] yeogi modeun goseul balkhyeo".into()),
             english: Some("Shine a light here everywhere".into()),
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: Vec::new(),
         };
         normalize_line_member_tags(&mut duet);

@@ -75,3 +75,40 @@ label.lyric-current-text {
   background-color: rgba(255, 255, 255, 0.22);
 }
 
+.timeline-headers {
+  background-color: #161616;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.timeline-track-header {
+  color: #cfcfcf;
+  font-weight: 700;
+  font-size: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.timeline-ruler-label {
+  color: #8a8a8a;
+  font-size: 10px;
+}
+
+.timeline-clip {
+  background-color: rgba(90, 120, 200, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 4px;
+  color: #ffffff;
+  font-size: 11px;
+}
+
+.timeline-clip:hover {
+  border-color: rgba(255, 255, 255, 0.55);
+}
+
+.timeline-clip.selected {
+  border: 2px solid #ffd24d;
+}
+
+.timeline-inspector {
+  padding: 6px 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}

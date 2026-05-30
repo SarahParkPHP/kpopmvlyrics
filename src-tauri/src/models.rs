@@ -56,6 +56,45 @@ pub struct Song {
     pub source_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LyricLayer {
+    #[default]
+    Lead,
+    Backing,
+    Adlib,
+}
+
+impl LyricLayer {
+    /// Timeline track order, top to bottom.
+    pub const ALL: [LyricLayer; 3] = [LyricLayer::Lead, LyricLayer::Backing, LyricLayer::Adlib];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LyricLayer::Lead => "lead",
+            LyricLayer::Backing => "backing",
+            LyricLayer::Adlib => "adlib",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "lead" => Some(LyricLayer::Lead),
+            "backing" => Some(LyricLayer::Backing),
+            "adlib" => Some(LyricLayer::Adlib),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LyricLayer::Lead => "Lead vocals",
+            LyricLayer::Backing => "Backing vocals",
+            LyricLayer::Adlib => "Adlibs",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LyricLine {
@@ -68,6 +107,8 @@ pub struct LyricLine {
     pub english: Option<String>,
     #[serde(default)]
     pub with_all: bool,
+    #[serde(default)]
+    pub layer: LyricLayer,
     #[serde(default)]
     pub segments: Vec<LyricSegment>,
 }

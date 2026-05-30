@@ -1007,6 +1007,7 @@ mod tests {
             romanization: Some(text.to_string()),
             english: None,
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: Vec::new(),
         }
     }
@@ -1131,6 +1132,7 @@ mod tests {
                 romanization: Some("eorin mamsok hemaedeon cosmos".to_string()),
                 english: Some("My childish heart once lost in the cosmos".to_string()),
                 with_all: false,
+                layer: crate::models::LyricLayer::default(),
                 segments: Vec::new(),
             }],
             captions: vec![caption(
@@ -1163,6 +1165,7 @@ mod tests {
             romanization: None,
             english: Some(text.to_string()),
             with_all: false,
+            layer: crate::models::LyricLayer::default(),
             segments: Vec::new(),
         }
     }

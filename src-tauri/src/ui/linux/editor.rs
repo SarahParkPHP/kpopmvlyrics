@@ -6,19 +6,20 @@ use std::rc::Rc;
 use gtk::gio;
 use gtk::prelude::*;
 use gtk::{
-    ApplicationWindow, Box as GtkBox, Button, Grid, Label, Orientation, Revealer, ScrolledWindow,
-    SpinButton, TextView,
+    ApplicationWindow, Box as GtkBox, Button, Label, Orientation, Revealer, ScrolledWindow,
+    TextView,
 };
 
 use crate::app::{shift_alignment, DEFAULT_MANUAL_CAPTIONS, DEFAULT_MANUAL_LYRICS};
 use crate::log::{progress, verbose, PhaseGuard};
-use crate::models::{AlignmentLine, MemberProfile};
+use crate::models::{AlignmentLine, LyricLayer, LyricLine, MemberProfile};
 
-use super::{spawn_work, BackgroundUpdate, IdDropDown, UiModel, UiView, WorkerSnapshot};
+use super::timeline::Timeline;
+use super::{spawn_work, BackgroundUpdate, UiModel, UiView, WorkerSnapshot};
 
 pub struct EditorWidgets {
     pub revealer: Revealer,
-    pub table_box: GtkBox,
+    pub timeline: Rc<Timeline>,
     pub render_key: Rc<RefCell<String>>,
 }
 
@@ -79,13 +80,8 @@ pub fn build_editor_panel() -> EditorBuild {
     import_actions.append(&save_button);
     panel.append(&import_actions);
 
-    let table_scroll = ScrolledWindow::new();
-    table_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
-    table_scroll.set_min_content_height(180);
-    table_scroll.set_vexpand(true);
-    let table_box = GtkBox::new(Orientation::Vertical, 2);
-    table_scroll.set_child(Some(&table_box));
-    panel.append(&table_scroll);
+    let timeline = Timeline::new();
+    panel.append(&timeline.root);
 
     let revealer = Revealer::new();
     revealer.set_reveal_child(false);
@@ -95,7 +91,7 @@ pub fn build_editor_panel() -> EditorBuild {
         revealer: revealer.clone(),
         widgets: EditorWidgets {
             revealer,
-            table_box,
+            timeline,
             render_key: Rc::new(RefCell::new(String::new())),
         },
         import_lyrics_button,
@@ -115,6 +111,10 @@ pub fn connect_editor_handlers(
     build: &EditorBuild,
     editor_button: &Button,
 ) {
+    // Wire the timeline interactions (need the live view).
+    build.widgets.timeline.connect(view);
+    build.widgets.timeline.connect_seek(view);
+
     {
         let view = Rc::clone(view);
         let revealer = build.widgets.revealer.clone();
@@ -209,20 +209,28 @@ pub fn connect_editor_handlers(
             let alignment = view.model.borrow().alignment.clone();
             let view = Rc::clone(&view);
             spawn_work(work_tx.clone(), view, "Save", move |snapshot| {
-                let song_id = snapshot
+                let mut package = snapshot
                     .song
-                    .as_ref()
-                    .and_then(|song| song.song.id)
+                    .clone()
                     .ok_or_else(|| "Load lyrics first".to_string())?;
                 let video_id = snapshot
                     .metadata
                     .as_ref()
                     .map(|meta| meta.video_id.clone())
                     .ok_or_else(|| "Resolve a YouTube URL first".to_string())?;
+                // Persist lyric edits (text, member, layer, created/deleted lines) first
+                // so the song id exists, then persist the alignment timing.
+                snapshot.ctx.save_lyric_lines(&mut package)?;
+                let song_id = package
+                    .song
+                    .id
+                    .ok_or_else(|| "Could not determine song id".to_string())?;
                 snapshot
                     .ctx
                     .save_alignment_edits(song_id, &video_id, &alignment)?;
-                Ok(Box::new(|_model: &mut UiModel| {}) as Box<dyn FnOnce(&mut UiModel) + Send>)
+                Ok(Box::new(move |model: &mut UiModel| {
+                    model.song = Some(package);
+                }) as Box<dyn FnOnce(&mut UiModel) + Send>)
             });
         });
     }
@@ -231,10 +239,15 @@ pub fn connect_editor_handlers(
 }
 
 impl UiView {
+    /// Relayout the timeline editor when its contents changed. Named
+    /// `render_editor_table` for historical call sites (the tick loop, editor open).
     pub fn render_editor_table(&self) {
         if !self.editor.revealer.reveals_child() {
             return;
         }
+        let Some(view) = self.this.borrow().clone() else {
+            return;
+        };
 
         let should_render = {
             let Ok(model) = self.model.try_borrow() else {
@@ -247,20 +260,23 @@ impl UiView {
             return;
         }
 
-        let Ok(model) = self.model.try_borrow() else {
-            return;
-        };
-        let key = editor_render_key(&model);
-        *self.editor.render_key.borrow_mut() = key;
-        clear_box(&self.editor.table_box);
-        render_alignment_table(&self.editor.table_box, &model, Rc::clone(&self.model));
-        drop(model);
+        {
+            let Ok(model) = self.model.try_borrow() else {
+                return;
+            };
+            *self.editor.render_key.borrow_mut() = editor_render_key(&model);
+        }
+
+        self.editor.timeline.relayout(&view);
+
         if let Ok(mut model) = self.model.try_borrow_mut() {
             model.editor_table_dirty = false;
         }
     }
 }
 
+/// Cheap fingerprint of everything the timeline layout depends on (excluding zoom,
+/// which is applied directly): line set, member, layer, and each clip's timing.
 fn editor_render_key(model: &UiModel) -> String {
     let lines = model
         .song
@@ -268,7 +284,14 @@ fn editor_render_key(model: &UiModel) -> String {
         .map(|song| {
             song.lines
                 .iter()
-                .map(|line| format!("{}:{}", line.index, line.member.as_deref().unwrap_or("")))
+                .map(|line| {
+                    format!(
+                        "{}:{}:{}",
+                        line.index,
+                        line.member.as_deref().unwrap_or(""),
+                        line.layer.as_str()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("|")
         })
@@ -285,128 +308,6 @@ fn editor_render_key(model: &UiModel) -> String {
         .collect::<Vec<_>>()
         .join("|");
     format!("{lines}::{alignment}")
-}
-
-fn clear_box(container: &GtkBox) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
-}
-
-fn render_alignment_table(container: &GtkBox, model: &UiModel, model_rc: Rc<RefCell<UiModel>>) {
-    let Some(song) = &model.song else {
-        container.append(&Label::new(Some("Load lyrics to edit alignment timing.")));
-        return;
-    };
-
-    let header = Grid::new();
-    header.set_column_spacing(8);
-    header.set_row_spacing(4);
-    for (col, title) in ["Line", "Member", "Start", "End", "Confidence"]
-        .into_iter()
-        .enumerate()
-    {
-        let label = Label::new(Some(title));
-        label.set_markup(&format!("<b>{title}</b>"));
-        header.attach(&label, col as i32, 0, 1, 1);
-    }
-    container.append(&header);
-
-    for (row_idx, line) in song.lines.iter().enumerate() {
-        let timing = alignment_for_line(&model.alignment, line.index);
-        let grid = Grid::new();
-        grid.set_column_spacing(8);
-        grid.set_row_spacing(4);
-
-        let text = Label::new(Some(&line.original));
-        text.set_xalign(0.0);
-        text.set_wrap(true);
-        text.set_max_width_chars(40);
-        grid.attach(&text, 0, 0, 1, 1);
-
-        let member_combo = IdDropDown::new();
-        member_combo.append("", "All");
-        for member in &song.members {
-            member_combo.append(&member.stage_name, &member.stage_name);
-        }
-        if let Some(name) = &line.member {
-            member_combo.set_active_id(name);
-        } else {
-            member_combo.set_active_id("");
-        }
-        grid.attach(&member_combo.widget, 1, 0, 1, 1);
-
-        let start = SpinButton::with_range(0.0, 3_600_000.0, 100.0);
-        start.set_value(timing.start_ms as f64);
-        grid.attach(&start, 2, 0, 1, 1);
-
-        let end = SpinButton::with_range(0.0, 3_600_000.0, 100.0);
-        end.set_value(timing.end_ms as f64);
-        grid.attach(&end, 3, 0, 1, 1);
-
-        {
-            let model_rc = Rc::clone(&model_rc);
-            let line_index = line.index;
-            member_combo.connect_changed(move |combo| {
-                let member = combo
-                    .active_id()
-                    .filter(|id| !id.is_empty());
-                if let Ok(mut model) = model_rc.try_borrow_mut() {
-                    model.set_line_member(line_index, member);
-                }
-            });
-        }
-        {
-            let model_rc = Rc::clone(&model_rc);
-            let line_index = line.index;
-            start.connect_value_changed(move |spin| {
-                if let Ok(mut model) = model_rc.try_borrow_mut() {
-                    model.update_alignment(line_index, |line| {
-                        line.start_ms = spin.value() as i64;
-                        line.needs_review = true;
-                    });
-                }
-            });
-        }
-        {
-            let model_rc = Rc::clone(&model_rc);
-            let line_index = line.index;
-            end.connect_value_changed(move |spin| {
-                if let Ok(mut model) = model_rc.try_borrow_mut() {
-                    model.update_alignment(line_index, |line| {
-                        line.end_ms = spin.value() as i64;
-                        line.needs_review = true;
-                    });
-                }
-            });
-        }
-        let confidence = Label::new(Some(&format!(
-            "{}%{}",
-            (timing.confidence * 100.0).round() as i32,
-            if timing.needs_review { " review" } else { "" }
-        )));
-        grid.attach(&confidence, 4, 0, 1, 1);
-
-        container.append(&grid);
-        if row_idx + 1 < song.lines.len() {
-            container.append(&gtk::Separator::new(Orientation::Horizontal));
-        }
-    }
-}
-
-fn alignment_for_line(alignment: &[AlignmentLine], lyric_index: usize) -> AlignmentLine {
-    alignment
-        .iter()
-        .find(|line| line.lyric_index == lyric_index)
-        .cloned()
-        .unwrap_or(AlignmentLine {
-            lyric_index,
-            caption_index: None,
-            start_ms: 0,
-            end_ms: 1200,
-            confidence: 0.0,
-            needs_review: true,
-        })
 }
 
 pub fn pick_member_image(
@@ -601,4 +502,73 @@ impl UiModel {
         update(&mut line);
         self.alignment.push(line);
     }
+
+    pub fn set_line_layer(&mut self, line_index: usize, layer: LyricLayer) {
+        if let Some(song) = &mut self.song {
+            if let Some(line) = song.lines.iter_mut().find(|line| line.index == line_index) {
+                line.layer = layer;
+            }
+        }
+    }
+
+    pub fn set_line_text(
+        &mut self,
+        line_index: usize,
+        original: String,
+        romanization: Option<String>,
+        english: Option<String>,
+    ) {
+        if let Some(song) = &mut self.song {
+            if let Some(line) = song.lines.iter_mut().find(|line| line.index == line_index) {
+                line.original = original;
+                line.romanization = romanization.filter(|text| !text.is_empty());
+                line.english = english.filter(|text| !text.is_empty());
+            }
+        }
+    }
+
+    /// Create a new lyric line on `layer` spanning `[start_ms, start_ms + DEFAULT_CLIP_MS]`.
+    /// Returns the new line's stable `index` (max existing + 1), or `None` if no song loaded.
+    pub fn add_lyric_line(&mut self, layer: LyricLayer, start_ms: i64) -> Option<usize> {
+        let song = self.song.as_mut()?;
+        let new_index = song
+            .lines
+            .iter()
+            .map(|line| line.index)
+            .max()
+            .map(|max| max + 1)
+            .unwrap_or(0);
+        let start_ms = start_ms.max(0);
+        song.lines.push(LyricLine {
+            id: None,
+            song_id: song.song.id,
+            index: new_index,
+            member: None,
+            original: String::new(),
+            romanization: None,
+            english: None,
+            with_all: false,
+            layer,
+            segments: Vec::new(),
+        });
+        self.alignment.push(AlignmentLine {
+            lyric_index: new_index,
+            caption_index: None,
+            start_ms,
+            end_ms: start_ms + DEFAULT_CLIP_MS,
+            confidence: 1.0,
+            needs_review: true,
+        });
+        Some(new_index)
+    }
+
+    pub fn delete_lyric_line(&mut self, line_index: usize) {
+        if let Some(song) = &mut self.song {
+            song.lines.retain(|line| line.index != line_index);
+        }
+        self.alignment.retain(|line| line.lyric_index != line_index);
+    }
 }
+
+/// Default length of a freshly created clip.
+pub const DEFAULT_CLIP_MS: i64 = 1_500;
