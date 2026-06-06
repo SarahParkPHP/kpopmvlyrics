@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { AlertCircle, Check, Clock, Download, FileVideo, Languages, Link, Loader2, Pause, Pencil, Play, RotateCcw, Save, Search, Settings, Upload } from "lucide-react";
+import { AlertCircle, Check, Clock, Download, FileJson, FileVideo, Languages, Link, Loader2, Pause, Pencil, Play, RotateCcw, Save, Search, Settings, Upload } from "lucide-react";
 import { api } from "./tauri";
 import type { AlignmentLine, CaptionLine, LanguageKey, LyricLine, LyricSegment, MemberProfile, SongPackage, VideoFormat, VideoMetadata } from "./types";
 
@@ -256,6 +256,25 @@ export function App() {
     await run("Save", () => api.saveAlignmentEdits(songId, videoId, alignment));
   }
 
+  function exportJson() {
+    if (!metadata || !songPackage) {
+      setError("Load lyrics and resolve a video first");
+      return;
+    }
+    const payload = buildJsonExport(metadata, songPackage, alignment);
+    const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: "application/json" });
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = `${safeFilename(songPackage.song.artist)}-${safeFilename(songPackage.song.title)}-${metadata.videoId}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(href);
+    setMessage("JSON export complete");
+    setError(null);
+  }
+
   async function pickMemberImage(member: MemberProfile) {
     const selected = await open({
       multiple: false,
@@ -381,6 +400,9 @@ export function App() {
               </button>
               <button onClick={() => setAlignment(shiftAlignment(alignment, -500))}>-0.5s</button>
               <button onClick={() => setAlignment(shiftAlignment(alignment, 500))}>+0.5s</button>
+              <button onClick={exportJson}>
+                <FileJson size={17} /> Export JSON
+              </button>
             </div>
           </div>
           <AlignmentTable
@@ -640,6 +662,57 @@ function mergeMembers(primary: MemberProfile[], secondary: MemberProfile[]) {
     byName.set(existing.stageName.toLowerCase(), merged);
   }
   return [...byName.values()];
+}
+
+export function buildJsonExport(metadata: VideoMetadata, songPackage: SongPackage, alignment: AlignmentLine[]) {
+  const timings = new Map(alignment.map((line) => [line.lyricIndex, line]));
+  return {
+    version: 1,
+    video: {
+      platform: platformFromUrl(metadata.originalUrl),
+      videoId: metadata.videoId,
+      url: metadata.originalUrl,
+    },
+    members: songPackage.members.map((member) => ({
+      name: member.stageName,
+      color: member.color,
+      imageUrl: member.imageUrl ?? null,
+      localImagePath: member.localImagePath ?? null,
+    })),
+    lyrics: songPackage.lines.map((line) => {
+      const timing = timings.get(line.index);
+      return {
+        index: line.index,
+        startMs: timing?.startMs ?? null,
+        endMs: timing?.endMs ?? null,
+        layer: line.layer ?? "lead",
+        member: line.member ?? null,
+        original: line.original,
+        ...(line.romanization ? { romanization: line.romanization } : {}),
+        ...(line.english ? { english: line.english } : {}),
+      };
+    }),
+  };
+}
+
+function platformFromUrl(rawUrl: string) {
+  try {
+    const host = new URL(rawUrl).hostname.replace(/^www\./, "");
+    if (host === "youtube.com" || host === "youtu.be" || host.endsWith(".youtube.com")) {
+      return "youtube";
+    }
+    return host;
+  } catch {
+    return "unknown";
+  }
+}
+
+function safeFilename(value: string) {
+  return value
+    .trim()
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "export";
 }
 
 function namesMatch(left: string, right: string) {

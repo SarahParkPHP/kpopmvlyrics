@@ -46,6 +46,7 @@ export interface LyricLine {
   original: string;
   romanization?: string | null;
   english?: string | null;
+  layer?: "lead" | "backing" | "adlib" | string;
   segments?: LyricSegment[];
 }
 

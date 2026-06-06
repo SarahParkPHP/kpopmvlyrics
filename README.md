@@ -53,18 +53,32 @@ cd src-tauri && cargo test
 
 ## Package
 
-Linux tarball and Flatpak:
+Debian/Ubuntu `.deb`, Fedora/openSUSE-style `.rpm`, and AppImage bundles:
+
+```bash
+npm run package:deb-rpm
+npm run package:appimage
+```
+
+Arch/CachyOS tarball and Flatpak:
 
 ```bash
 npm run package:tar
 npm run package:flatpak
 ```
 
-Windows/macOS `.deb` / `.rpm` (via Tauri):
+All Linux packages:
 
 ```bash
 npm run package:linux
 ```
+
+Native Linux runtime packages are GTK 4, GStreamer playback plugins,
+GDK Pixbuf, `yt-dlp`, and CA certificates. ASR/STT is optional: install
+Python, FFmpeg, and the packages in `requirements-asr.txt` via
+`scripts/setup-asr.sh` for local Qwen ASR and optional Demucs vocal stem
+separation. External STT providers use the bundled Python bridge plus the API
+key entered in app settings.
 
 ## Current Capabilities
 

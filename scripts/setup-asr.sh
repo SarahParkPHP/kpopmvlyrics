@@ -81,6 +81,7 @@ Qwen3 ASR (official PyTorch) is ready.
   Models:  downloaded from Hugging Face on first use
            - Qwen/Qwen3-ASR-0.6B or Qwen/Qwen3-ASR-1.7B
            - Qwen/Qwen3-ForcedAligner-0.6B
+           - Demucs htdemucs for optional vocal stem separation
 
 GPU: uses PyTorch CUDA when available (python-pytorch-opt-cuda on Arch).
 Set KPOPMVLYRICS_ASR_DEVICE=cpu to force CPU inference.

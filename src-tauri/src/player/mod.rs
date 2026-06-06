@@ -1,22 +1,33 @@
 mod events;
 mod pipeline;
 
-#[cfg(target_os = "linux")]
+#[cfg(desktop_unix)]
 mod hw_decode;
 
 pub use events::PlaybackEvents;
 
-#[cfg(target_os = "linux")]
+// Building blocks the reusable native player thread drives directly.
+#[cfg(native_frontend)]
+pub(crate) use pipeline::{
+    ensure_gstreamer, set_video_overlay_handle, set_video_overlay_rectangle, PlaybackEngine,
+};
+
+#[cfg(native_frontend)]
+mod native_player;
+#[cfg(native_frontend)]
+pub use native_player::NativePlayer;
+
+#[cfg(desktop_unix)]
 mod linux_native;
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 mod macos;
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 mod windows;
 
-#[cfg(target_os = "linux")]
+#[cfg(desktop_unix)]
 pub use linux_native::NativeLinuxPlayer;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 pub mod tauri_player {
     use std::sync::Mutex;
 
@@ -335,7 +346,7 @@ pub mod tauri_player {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 pub use tauri_player::{
     defer_window_setup, player_load, player_pause, player_play, player_seek, player_set_quality,
     resolve_stream, PlayerState,

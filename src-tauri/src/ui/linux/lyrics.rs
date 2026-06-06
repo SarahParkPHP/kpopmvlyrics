@@ -70,9 +70,7 @@ pub fn lyric_content_key(
             )
         })
         .unwrap_or_default();
-    format!(
-        "{lines}::{show_original}:{show_romanization}:{show_english}"
-    )
+    format!("{lines}::{show_original}:{show_romanization}:{show_english}")
 }
 
 pub fn compute_lyric_stage_content(
@@ -94,24 +92,22 @@ pub fn compute_lyric_stage_content(
     let rows = song
         .lines
         .iter()
-        .map(|line| {
-            LyricRowContent {
-                line_index: line.index,
-                original_markup: show_original
-                    .then(|| {
-                        (!line.original.trim().is_empty())
-                            .then(|| colored_markup(line, "original", &line.original, members))
-                    })
-                    .flatten(),
-                roman_markup: show_romanization
-                    .then(|| line.romanization.as_ref())
-                    .flatten()
-                    .map(|text| colored_markup(line, "romanization", text, members)),
-                english_markup: show_english
-                    .then(|| line.english.as_ref())
-                    .flatten()
-                    .map(|text| colored_markup(line, "english", text, members)),
-            }
+        .map(|line| LyricRowContent {
+            line_index: line.index,
+            original_markup: show_original
+                .then(|| {
+                    (!line.original.trim().is_empty())
+                        .then(|| colored_markup(line, "original", &line.original, members))
+                })
+                .flatten(),
+            roman_markup: show_romanization
+                .then(|| line.romanization.as_ref())
+                .flatten()
+                .map(|text| colored_markup(line, "romanization", text, members)),
+            english_markup: show_english
+                .then(|| line.english.as_ref())
+                .flatten()
+                .map(|text| colored_markup(line, "english", text, members)),
         })
         .collect();
 
@@ -288,9 +284,7 @@ fn set_markup_label(label: &Label, markup: Option<&str>) {
 }
 
 fn wrap_lyric_display_markup(inner: &str) -> String {
-    format!(
-        "<span size='{LYRIC_DISPLAY_PANGO_SIZE}' weight='heavy'>{inner}</span>"
-    )
+    format!("<span size='{LYRIC_DISPLAY_PANGO_SIZE}' weight='heavy'>{inner}</span>")
 }
 
 fn configure_lyric_label(label: &Label) {
@@ -587,9 +581,7 @@ mod tests {
                 index: 16,
                 member: Some("Hyunjin".into()),
                 original: "특별의 별의 별의 별의 별의 별의 별의".into(),
-                romanization: Some(
-                    "teukbyeore byeore byeore byeore byeore byeore byeore".into(),
-                ),
+                romanization: Some("teukbyeore byeore byeore byeore byeore byeore byeore".into()),
                 english: Some("The most special star, star, star, star, star, star".into()),
                 with_all: false,
                 layer: crate::models::LyricLayer::default(),
@@ -666,10 +658,7 @@ mod tests {
                 },
             ],
         };
-        let members = vec![
-            profile("Chaeyoung", "ff1744"),
-            profile("Mina", "1af0af"),
-        ];
+        let members = vec![profile("Chaeyoung", "ff1744"), profile("Mina", "1af0af")];
         let markup = colored_markup(&line, "english", line.english.as_deref().unwrap(), &members);
         assert!(markup.contains("foreground='#"));
         assert!(markup.matches("foreground=").count() >= 2);

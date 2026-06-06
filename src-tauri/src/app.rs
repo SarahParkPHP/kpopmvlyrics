@@ -10,15 +10,15 @@ use crate::asr::{
     asr_available, asr_caption_lines, asr_setup_hint, effective_asr_model, forced_align_language,
     transcribe_video, AsrModelSize, AsrTranscript,
 };
-use crate::log::{progress, PhaseGuard, verbose};
-use crate::lyrics::lyric_language_toggles;
-use rayon::prelude::*;
 use crate::captions::{parse_caption_text, CaptionProvider, YouTubeCaptionProvider};
 use crate::db::Repository;
+use crate::log::{progress, verbose, PhaseGuard};
+use crate::lyrics::lyric_language_toggles;
 use crate::lyrics::{ColorCodedLyricsProvider, GeniusProvider, LyricsProvider};
 use crate::members::{KpopFandomProvider, KpoppingProvider, MemberProfileProvider};
 use crate::models::*;
 use crate::video;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct AlignResult {
@@ -32,6 +32,9 @@ pub struct AppContext {
 }
 
 const ASR_MODEL_SETTING: &str = "whisper_model";
+const ASR_DEMUCS_SETTING: &str = "asr_demucs_enabled";
+const ASR_API_KEY_PREFIX: &str = "asr_api_key_";
+const ASR_BASE_URL_PREFIX: &str = "asr_base_url_";
 
 impl AppContext {
     pub fn open() -> Result<Self, String> {
@@ -61,6 +64,49 @@ impl AppContext {
 
     pub fn effective_asr_model(&self) -> AsrModelSize {
         effective_asr_model(self.asr_model_size())
+    }
+
+    pub fn asr_demucs_enabled(&self) -> bool {
+        if let Ok(value) = std::env::var("KPOPMVLYRICS_ASR_DEMUCS") {
+            return setting_is_enabled(&value);
+        }
+        self.user_setting(ASR_DEMUCS_SETTING)
+            .is_some_and(|value| setting_is_enabled(&value))
+    }
+
+    pub fn set_asr_demucs_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.set_user_setting(ASR_DEMUCS_SETTING, if enabled { "1" } else { "0" })
+    }
+
+    pub fn asr_api_key(&self, provider: &str) -> String {
+        self.user_setting(&format!("{ASR_API_KEY_PREFIX}{provider}"))
+            .unwrap_or_default()
+    }
+
+    pub fn set_asr_api_key(&self, provider: &str, value: &str) -> Result<(), String> {
+        self.set_user_setting(&format!("{ASR_API_KEY_PREFIX}{provider}"), value)
+    }
+
+    pub fn asr_base_url(&self, provider: &str) -> String {
+        self.user_setting(&format!("{ASR_BASE_URL_PREFIX}{provider}"))
+            .unwrap_or_default()
+    }
+
+    pub fn set_asr_base_url(&self, provider: &str, value: &str) -> Result<(), String> {
+        self.set_user_setting(&format!("{ASR_BASE_URL_PREFIX}{provider}"), value)
+    }
+
+    fn user_setting(&self, key: &str) -> Option<String> {
+        self.repo
+            .lock()
+            .ok()
+            .and_then(|repo| repo.get_user_setting(key).ok())
+            .flatten()
+    }
+
+    fn set_user_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        let repo = self.repo.lock().map_err(to_string)?;
+        repo.set_user_setting(key, value).map_err(to_string)
     }
 
     pub fn resolve_video_metadata(&self, url: &str) -> Result<VideoMetadata, String> {
@@ -130,11 +176,7 @@ impl AppContext {
         Ok(captions)
     }
 
-    pub fn align_lyrics(
-        &self,
-        song_id: i64,
-        video_id: &str,
-    ) -> Result<AlignResult, String> {
+    pub fn align_lyrics(&self, song_id: i64, video_id: &str) -> Result<AlignResult, String> {
         self.align_lyrics_with_progress(song_id, video_id, |_| {})
     }
 
@@ -178,8 +220,7 @@ impl AppContext {
         };
         verbose(format!("align caption tracks={}", track_sets.len()));
         let (has_original, has_romanization, has_english) = lyric_language_toggles(&lyrics);
-        let prefer_asr =
-            has_original || (has_english && !has_original && !has_romanization);
+        let prefer_asr = has_original || (has_english && !has_original && !has_romanization);
         let asr_use_original = has_original;
         let asr_language = if has_original {
             Some(detect_original_language(&lyrics).unwrap_or("ko"))
@@ -236,15 +277,48 @@ impl AppContext {
         if prefer_asr && configured_model.is_enabled() {
             report_progress(0.78);
             progress("align asr branch", 0.78);
-            let _phase = PhaseGuard::begin("align asr_available check");
-            let asr_ok = asr_available();
-            verbose(format!("align asr_available={asr_ok}"));
-            drop(_phase);
+            let asr_ok = if configured_model.is_local() {
+                let _phase = PhaseGuard::begin("align asr_available check");
+                let available = asr_available();
+                verbose(format!("align asr_available={available}"));
+                drop(_phase);
+                available
+            } else {
+                true
+            };
             if asr_ok {
                 let model_size = configured_model;
                 verbose(format!("align asr model={}", model_size.model_filename()));
-                let primary_align_language =
-                    forced_align_language(asr_use_original, asr_language);
+                let provider = model_size.provider_id();
+                let api_key = provider
+                    .map(|provider| self.asr_api_key(provider))
+                    .unwrap_or_default();
+                let base_url = provider
+                    .map(|provider| self.asr_base_url(provider))
+                    .unwrap_or_default();
+                if provider.is_some() && api_key.trim().is_empty() {
+                    summary = format!(
+                        "{} API key is not set; kept YouTube caption alignment",
+                        model_size.backend()
+                    );
+                    eprintln!("kpopmvlyrics: {summary}");
+                    report_progress(0.84);
+                    progress("align persist", 0.84);
+                    if best_alignment.is_empty() {
+                        return Err("No caption tracks available for alignment".into());
+                    }
+                    let mut repo = self.repo.lock().map_err(to_string)?;
+                    repo.upsert_caption_lines(video_id, &best_captions)
+                        .map_err(to_string)?;
+                    repo.upsert_alignment(song_id, video_id, &best_alignment)
+                        .map_err(to_string)?;
+                    return Ok(AlignResult {
+                        alignment: best_alignment,
+                        captions: best_captions,
+                        summary,
+                    });
+                }
+                let primary_align_language = forced_align_language(asr_use_original, asr_language);
                 let (lyrics_text, forced_lines) =
                     crate::align::build_lyrics_forced_alignment_bundle_with_hints(
                         &lyrics,
@@ -257,6 +331,9 @@ impl AppContext {
                         video_id,
                         asr_language,
                         model_size,
+                        self.asr_demucs_enabled(),
+                        Some(&api_key),
+                        Some(&base_url),
                         Some(&lyrics_text),
                         Some(&forced_lines),
                         Some(primary_align_language),
@@ -271,11 +348,8 @@ impl AppContext {
                             transcript.line_timings.len()
                         ));
                         let asr_captions = asr_caption_lines(video_id, &transcript);
-                        let mut asr_alignment = alignment_from_transcript(
-                            &lyrics,
-                            &transcript,
-                            asr_use_original,
-                        );
+                        let mut asr_alignment =
+                            alignment_from_transcript(&lyrics, &transcript, asr_use_original);
                         merge_caption_baseline(&mut asr_alignment, &best_alignment);
                         let asr_score = alignment_playback_quality(&asr_alignment);
                         let timing_quality = forced_line_timing_quality(&asr_alignment);
@@ -290,7 +364,7 @@ impl AppContext {
                                 .as_deref()
                                 .unwrap_or(model_size.backend());
                             summary = format!(
-                                "Aligned with Qwen3 ASR ({}, {} words, {})",
+                                "Aligned with ASR ({}, {} words, {})",
                                 backend,
                                 transcript.words.len(),
                                 runtime_device_label(&transcript)
@@ -298,19 +372,19 @@ impl AppContext {
                             eprintln!("kpopmvlyrics: {summary}");
                         } else {
                             summary = format!(
-                                "Qwen3 ASR alignment quality={timing_quality:.2} score={asr_score:.2} \
+                                "ASR alignment quality={timing_quality:.2} score={asr_score:.2} \
                                  was not better than captions (score={best_score:.2}); kept caption alignment"
                             );
                             eprintln!("kpopmvlyrics: {summary}");
                         }
                     }
                     Ok(_) => {
-                        summary = "Qwen3 ASR returned no words; kept YouTube caption alignment"
-                            .into();
+                        summary =
+                            "ASR returned no timed words; kept YouTube caption alignment".into();
                         eprintln!("kpopmvlyrics: {summary}");
                     }
                     Err(err) => {
-                        summary = format!("Qwen3 ASR failed ({err}); kept YouTube caption alignment");
+                        summary = format!("ASR failed ({err}); kept YouTube caption alignment");
                         eprintln!("kpopmvlyrics: {summary}");
                     }
                 }
@@ -401,8 +475,10 @@ impl AppContext {
 /// baseline keeps those lines highlighted at approximately the right time.
 fn merge_caption_baseline(asr: &mut [AlignmentLine], baseline: &[AlignmentLine]) {
     use std::collections::HashMap;
-    let baseline_by_index: HashMap<usize, &AlignmentLine> =
-        baseline.iter().map(|line| (line.lyric_index, line)).collect();
+    let baseline_by_index: HashMap<usize, &AlignmentLine> = baseline
+        .iter()
+        .map(|line| (line.lyric_index, line))
+        .collect();
     for line in asr.iter_mut() {
         if crate::align::is_synced_line(line) {
             continue;
@@ -486,7 +562,8 @@ pub fn shift_alignment(lines: &[AlignmentLine], delta: i64) -> Vec<AlignmentLine
         .collect()
 }
 
-pub const DEFAULT_MANUAL_LYRICS: &str = "Nayeon: Tell me what you want\nMomo: Tell me what you need\nSana: A to Z da malhaebwa";
+pub const DEFAULT_MANUAL_LYRICS: &str =
+    "Nayeon: Tell me what you want\nMomo: Tell me what you need\nSana: A to Z da malhaebwa";
 
 pub const DEFAULT_MANUAL_CAPTIONS: &str = "WEBVTT\n\n00:00:01.000 --> 00:00:02.400\nTell me what you want\n\n00:00:02.500 --> 00:00:03.900\nTell me what you need\n\n00:00:04.000 --> 00:00:05.600\nA to Z da malhaebwa";
 
@@ -495,17 +572,16 @@ pub fn query_from_metadata(metadata: &VideoMetadata) -> String {
 }
 
 pub fn clean_video_title(title: &str) -> String {
-    let cleaned = title
-        .replace(" - YouTube", "")
-        .replace(" - youtube", "");
+    let cleaned = title.replace(" - YouTube", "").replace(" - youtube", "");
     let cleaned = regex::Regex::new(r"(?i)\s*\[[^\]]*(official|mv|m/v|music video)[^\]]*\]\s*")
         .ok()
         .map(|re| re.replace_all(&cleaned, " ").to_string())
         .unwrap_or(cleaned);
-    let cleaned = regex::Regex::new(r"(?i)\s*\((official\s*)?(mv|m/v|music video|official video)\)\s*")
-        .ok()
-        .map(|re| re.replace_all(&cleaned, " ").to_string())
-        .unwrap_or(cleaned);
+    let cleaned =
+        regex::Regex::new(r"(?i)\s*\((official\s*)?(mv|m/v|music video|official video)\)\s*")
+            .ok()
+            .map(|re| re.replace_all(&cleaned, " ").to_string())
+            .unwrap_or(cleaned);
     let cleaned = regex::Regex::new(r"(?i)\s+(official\s*)?(mv|m/v|music video|official video)$")
         .ok()
         .map(|re| re.replace_all(&cleaned, "").to_string())
@@ -618,6 +694,13 @@ fn app_data_dir() -> Result<PathBuf, String> {
 
 fn to_string<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
+}
+
+fn setting_is_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(test)]

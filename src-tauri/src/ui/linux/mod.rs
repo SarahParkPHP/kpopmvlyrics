@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(desktop_unix)]
 
 mod editor;
 mod lyrics;
@@ -25,16 +25,17 @@ use crate::align::has_playback_timing;
 use crate::app::{apply_member_profiles, format_ms, AppContext};
 use crate::asr::AsrModelSize;
 use crate::models::{
-    AlignmentLine, CaptionLine, MemberProfile, SongPackage, StreamSpec, VideoFormat,
-    VideoMetadata, VideoPosition,
+    AlignmentLine, CaptionLine, MemberProfile, SongPackage, StreamSpec, VideoFormat, VideoMetadata,
+    VideoPosition,
 };
 use crate::player::NativeLinuxPlayer;
 use crate::player::PlaybackEvents;
 
-use editor::{build_editor_panel, connect_editor_handlers, pick_member_image, resolve_video_chain, EditorWidgets};
-use lyrics::{
-    compute_lyric_stage_content, lyric_content_key, LyricStage, LyricStageContent,
+use editor::{
+    build_editor_panel, connect_editor_handlers, pick_member_image, resolve_video_chain,
+    EditorWidgets,
 };
+use lyrics::{compute_lyric_stage_content, lyric_content_key, LyricStage, LyricStageContent};
 use video_overlay::{build_video_overlay, VideoOverlay};
 
 const APP_ID: &str = "com.kpopmvlyrics.desktop";
@@ -172,6 +173,7 @@ struct UiModel {
     show_romanization: bool,
     show_english: bool,
     asr_model_size: AsrModelSize,
+    asr_demucs_enabled: bool,
     busy: Option<String>,
     message: Option<String>,
     error: Option<String>,
@@ -316,6 +318,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     load_stage_css();
     let ctx = Arc::new(AppContext::open()?);
     let initial_asr_model = ctx.asr_model_size();
+    let initial_asr_provider = initial_asr_model.provider_id();
+    let initial_asr_demucs_enabled = ctx.asr_demucs_enabled();
 
     let (position_tx, position_rx) = std::sync::mpsc::channel::<VideoPosition>();
     let (error_tx, error_rx) = std::sync::mpsc::channel::<String>();
@@ -350,6 +354,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         show_romanization: false,
         show_english: true,
         asr_model_size: initial_asr_model,
+        asr_demucs_enabled: initial_asr_demucs_enabled,
         busy: None,
         message: None,
         error: None,
@@ -410,6 +415,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     toolbar.append(&quality_combo.widget);
     toolbar.append(&open_button);
     toolbar.append(&settings_button);
+    toolbar.append(&editor_button);
 
     let member_scroll = ScrolledWindow::new();
     member_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
@@ -493,8 +499,60 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         AsrModelSize::Large.as_storage(),
         AsrModelSize::Large.label(),
     );
+    asr_model_combo.append(
+        AsrModelSize::OpenAiGpt4oTranscribe.as_storage(),
+        AsrModelSize::OpenAiGpt4oTranscribe.label(),
+    );
+    asr_model_combo.append(
+        AsrModelSize::OpenAiWhisper1.as_storage(),
+        AsrModelSize::OpenAiWhisper1.label(),
+    );
+    asr_model_combo.append(
+        AsrModelSize::ElevenLabsScribeV2.as_storage(),
+        AsrModelSize::ElevenLabsScribeV2.label(),
+    );
+    asr_model_combo.append(
+        AsrModelSize::MistralVoxtralMini.as_storage(),
+        AsrModelSize::MistralVoxtralMini.label(),
+    );
+    asr_model_combo.append(
+        AsrModelSize::GeminiFlash.as_storage(),
+        AsrModelSize::GeminiFlash.label(),
+    );
+    asr_model_combo.append(
+        AsrModelSize::SonioxAsyncV4.as_storage(),
+        AsrModelSize::SonioxAsyncV4.label(),
+    );
+    asr_model_combo.append(
+        AsrModelSize::AlibabaQwenFlash.as_storage(),
+        AsrModelSize::AlibabaQwenFlash.label(),
+    );
     asr_model_combo.set_active_id(initial_asr_model.as_storage());
     asr_model_row.append(&asr_model_combo.widget);
+
+    let asr_demucs_toggle = CheckButton::with_label("Demucs vocals");
+    asr_demucs_toggle.set_active(initial_asr_demucs_enabled);
+
+    let asr_api_key_row = GtkBox::new(Orientation::Horizontal, 8);
+    asr_api_key_row.append(&Label::new(Some("ASR API key")));
+    let asr_api_key_entry = Entry::new();
+    asr_api_key_entry.set_hexpand(true);
+    asr_api_key_entry.set_visibility(false);
+    asr_api_key_entry.set_placeholder_text(Some("Saved for the selected external provider"));
+    if let Some(provider) = initial_asr_provider {
+        asr_api_key_entry.set_text(&model.borrow().ctx.asr_api_key(provider));
+    }
+    asr_api_key_row.append(&asr_api_key_entry);
+
+    let asr_base_url_row = GtkBox::new(Orientation::Horizontal, 8);
+    asr_base_url_row.append(&Label::new(Some("ASR API URL")));
+    let asr_base_url_entry = Entry::new();
+    asr_base_url_entry.set_hexpand(true);
+    asr_base_url_entry.set_placeholder_text(Some("Optional endpoint/region override"));
+    if let Some(provider) = initial_asr_provider {
+        asr_base_url_entry.set_text(&model.borrow().ctx.asr_base_url(provider));
+    }
+    asr_base_url_row.append(&asr_base_url_entry);
 
     // All settings controls share a FlowBox so they collapse onto a single line
     // when the pane is wide enough and wrap to additional lines only when space
@@ -509,16 +567,18 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     controls_flow.set_homogeneous(false);
     controls_flow.set_halign(gtk::Align::Start);
     controls_flow.append(&asr_model_row);
+    controls_flow.append(&asr_demucs_toggle);
     controls_flow.append(&fetch_lyrics_button);
     controls_flow.append(&fetch_captions_button);
     controls_flow.append(&align_button);
     controls_flow.append(&save_button);
     controls_flow.append(&stream_button);
-    controls_flow.append(&editor_button);
     controls_flow.append(&play_button);
     controls_flow.append(&pause_button);
     controls_flow.append(&reset_button);
     settings_panel.append(&controls_flow);
+    settings_panel.append(&asr_api_key_row);
+    settings_panel.append(&asr_base_url_row);
     settings_panel.append(&status_label);
 
     let editor_build = build_editor_panel();
@@ -551,8 +611,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     window.set_child(Some(&paned));
 
     let (work_tx, work_rx) = std::sync::mpsc::channel::<BackgroundUpdate>();
-    let (member_image_tx, member_image_rx) =
-        std::sync::mpsc::channel::<(String, Option<String>)>();
+    let (member_image_tx, member_image_rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
     let (lyric_build_tx, lyric_build_rx) =
         std::sync::mpsc::channel::<(String, LyricStageContent)>();
 
@@ -623,10 +682,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                 apply_url_entry_progress(&view_for_tick, Some(progress));
             }
             while let Ok((url, path)) = member_image_rx.try_recv() {
-                view_for_tick
-                    .member_image_pending
-                    .borrow_mut()
-                    .remove(&url);
+                view_for_tick.member_image_pending.borrow_mut().remove(&url);
                 if let Some(path) = path {
                     view_for_tick
                         .member_image_cache
@@ -656,7 +712,10 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                     Ok(apply) => {
                         if let Ok(mut model) = view_for_tick.model.try_borrow_mut() {
                             apply(&mut model);
-                            if update.label != "Alignment" && !is_background_members && update.label != "Open" {
+                            if update.label != "Alignment"
+                                && !is_background_members
+                                && update.label != "Open"
+                            {
                                 model.message = Some(format!("{} complete", update.label));
                             }
                             if is_open {
@@ -665,16 +724,12 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                         }
                         if is_open {
                             apply_url_entry_progress(&view_for_tick, Some(0.96));
-                            let group = view_for_tick
-                                .model
-                                .try_borrow()
-                                .ok()
-                                .and_then(|model| {
-                                    model
-                                        .song
-                                        .as_ref()
-                                        .and_then(|song| song.song.group_name.clone())
-                                });
+                            let group = view_for_tick.model.try_borrow().ok().and_then(|model| {
+                                model
+                                    .song
+                                    .as_ref()
+                                    .and_then(|song| song.song.group_name.clone())
+                            });
                             if let Some(group) = group {
                                 spawn_member_profiles_in_background(
                                     work_tx_for_tick.clone(),
@@ -736,6 +791,9 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         &url_entry,
         &quality_combo,
         &asr_model_combo,
+        &asr_demucs_toggle,
+        &asr_api_key_entry,
+        &asr_base_url_entry,
         &open_button,
         &stream_button,
         &settings_button,
@@ -753,13 +811,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     video_overlay.connect_handlers(&view);
 
-    connect_editor_handlers(
-        &view,
-        &window,
-        work_tx,
-        &editor_build,
-        &editor_button,
-    );
+    connect_editor_handlers(&view, &window, work_tx, &editor_build, &editor_button);
 
     {
         let view = Rc::clone(&view);
@@ -854,7 +906,9 @@ impl UiView {
         render_status(&self.status_label, &model);
         self.video_overlay
             .update_seek_bar(model.current_ms, model.duration_ms);
-        self.editor.timeline.set_playhead(model.current_ms);
+        if self.editor.revealer.reveals_child() {
+            self.editor.timeline.set_playhead(model.current_ms);
+        }
         self.sync_active_line(&model);
     }
 
@@ -873,9 +927,7 @@ impl UiView {
                 primary: Vec::new(),
                 backing: Vec::new(),
             });
-        self.member_stage
-            .borrow()
-            .set_member_highlight(&highlight);
+        self.member_stage.borrow().set_member_highlight(&highlight);
     }
 
     fn sync_language_toggles(&self, model: &UiModel) {
@@ -931,12 +983,8 @@ impl UiView {
         let show_english = model.show_english;
         let tx = self.lyric_build_tx.clone();
         std::thread::spawn(move || {
-            let content = compute_lyric_stage_content(
-                song,
-                show_original,
-                show_romanization,
-                show_english,
-            );
+            let content =
+                compute_lyric_stage_content(song, show_original, show_romanization, show_english);
             let _ = tx.send((content_key, content));
         });
     }
@@ -959,6 +1007,9 @@ fn connect_view_handlers(
     url_entry: &Entry,
     quality_combo: &IdDropDown,
     asr_model_combo: &IdDropDown,
+    asr_demucs_toggle: &CheckButton,
+    asr_api_key_entry: &Entry,
+    asr_base_url_entry: &Entry,
     open_button: &Button,
     stream_button: &Button,
     settings_button: &Button,
@@ -1007,10 +1058,9 @@ fn connect_view_handlers(
             });
             let view = Rc::clone(&view);
             spawn_work(stream_work_tx.clone(), view, "Stream", move |snapshot| {
-                let spec = snapshot.ctx.resolve_stream(
-                    &snapshot.url,
-                    snapshot.selected_format.as_deref(),
-                )?;
+                let spec = snapshot
+                    .ctx
+                    .resolve_stream(&snapshot.url, snapshot.selected_format.as_deref())?;
                 Ok(Box::new(move |model: &mut UiModel| {
                     model.pending_stream = Some(spec);
                 }) as Box<dyn FnOnce(&mut UiModel) + Send>)
@@ -1021,6 +1071,8 @@ fn connect_view_handlers(
     {
         let view = Rc::clone(view);
         let suppress = Rc::clone(&view.suppress_asr_model_reload);
+        let asr_api_key_entry = asr_api_key_entry.clone();
+        let asr_base_url_entry = asr_base_url_entry.clone();
         asr_model_combo.connect_changed(move |combo| {
             if suppress.get() {
                 return;
@@ -1034,10 +1086,69 @@ fn connect_view_handlers(
                 if let Err(err) = model.ctx.set_asr_model_size(size) {
                     model.error = Some(err);
                 } else {
-                    model.message = Some(format!(
-                        "ASR model set to {}",
-                        size.label()
-                    ));
+                    if let Some(provider) = size.provider_id() {
+                        asr_api_key_entry.set_text(&model.ctx.asr_api_key(provider));
+                        asr_base_url_entry.set_text(&model.ctx.asr_base_url(provider));
+                    } else {
+                        asr_api_key_entry.set_text("");
+                        asr_base_url_entry.set_text("");
+                    }
+                    model.message = Some(format!("ASR model set to {}", size.label()));
+                }
+            });
+        });
+    }
+
+    {
+        let view = Rc::clone(view);
+        asr_demucs_toggle.connect_toggled(move |toggle| {
+            let enabled = toggle.is_active();
+            view.refresh_mut(|model| {
+                model.asr_demucs_enabled = enabled;
+                if let Err(err) = model.ctx.set_asr_demucs_enabled(enabled) {
+                    model.error = Some(err);
+                } else {
+                    model.message = Some(if enabled {
+                        "Demucs vocal separation enabled".to_string()
+                    } else {
+                        "Demucs vocal separation disabled".to_string()
+                    });
+                }
+            });
+        });
+    }
+
+    {
+        let view = Rc::clone(view);
+        asr_api_key_entry.connect_changed(move |entry| {
+            let value = entry.text().to_string();
+            view.refresh_mut(|model| {
+                let Some(provider) = model.asr_model_size.provider_id() else {
+                    return;
+                };
+                if let Err(err) = model.ctx.set_asr_api_key(provider, &value) {
+                    model.error = Some(err);
+                } else {
+                    model.message =
+                        Some(format!("Saved {} API key", model.asr_model_size.backend()));
+                }
+            });
+        });
+    }
+
+    {
+        let view = Rc::clone(view);
+        asr_base_url_entry.connect_changed(move |entry| {
+            let value = entry.text().to_string();
+            view.refresh_mut(|model| {
+                let Some(provider) = model.asr_model_size.provider_id() else {
+                    return;
+                };
+                if let Err(err) = model.ctx.set_asr_base_url(provider, &value) {
+                    model.error = Some(err);
+                } else {
+                    model.message =
+                        Some(format!("Saved {} API URL", model.asr_model_size.backend()));
                 }
             });
         });
@@ -1275,7 +1386,9 @@ fn spawn_open_work(
                 }
                 let fraction = f64::from_bits(last.load(Ordering::Relaxed));
                 if fraction > 0.0 {
-                    verbose(format!("open heartbeat still running at progress {fraction:.2}"));
+                    verbose(format!(
+                        "open heartbeat still running at progress {fraction:.2}"
+                    ));
                 } else {
                     verbose("open heartbeat still running (no progress yet)");
                 }
@@ -1303,8 +1416,9 @@ fn apply_url_entry_progress(view: &UiView, progress: Option<f64>) {
     let Some(fraction) = progress else {
         entry.remove_css_class("url-loading");
         entry.set_sensitive(true);
-        view.url_progress_provider
-            .load_from_string("entry.url-loading { background-image: none; background-color: inherit; }");
+        view.url_progress_provider.load_from_string(
+            "entry.url-loading { background-image: none; background-color: inherit; }",
+        );
         return;
     };
 
@@ -1331,8 +1445,7 @@ fn spawn_member_profiles_in_background(
             let profiles = snapshot.ctx.search_member_profiles(&group)?;
             Ok(Box::new(move |model: &mut UiModel| {
                 if let Some(song) = &mut model.song {
-                    song.members =
-                        apply_member_profiles(&song.members, &profiles, &song.lines);
+                    song.members = apply_member_profiles(&song.members, &profiles, &song.lines);
                     model.editor_table_dirty = true;
                 }
             }) as Box<dyn FnOnce(&mut UiModel) + Send>)
@@ -1349,8 +1462,7 @@ fn spawn_work<F>(
     view: Rc<UiView>,
     label: &'static str,
     work: F,
-)
-where
+) where
     F: FnOnce(WorkerSnapshot) -> Result<Box<dyn FnOnce(&mut UiModel) + Send>, String>
         + Send
         + 'static,
@@ -1388,10 +1500,9 @@ fn spawn_stream_reload(
     });
 
     spawn_work(work_tx, view, "Stream", move |snapshot| {
-        let spec = snapshot.ctx.resolve_stream(
-            &snapshot.url,
-            snapshot.selected_format.as_deref(),
-        )?;
+        let spec = snapshot
+            .ctx
+            .resolve_stream(&snapshot.url, snapshot.selected_format.as_deref())?;
         Ok(Box::new(move |model: &mut UiModel| {
             model.pending_stream = Some(spec);
         }) as Box<dyn FnOnce(&mut UiModel) + Send>)
@@ -1532,9 +1643,7 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn selected_format_id(combo: &IdDropDown) -> Option<String> {
-    combo
-        .active_id()
-        .filter(|id| id.as_str() != "auto")
+    combo.active_id().filter(|id| id.as_str() != "auto")
 }
 
 fn clear_children(container: &GtkBox) {
@@ -1664,7 +1773,10 @@ fn member_content_key(model: &UiModel, image_cache: &HashMap<String, String>) ->
         .unwrap_or_default()
 }
 
-fn member_image_path(member: &MemberProfile, image_cache: &HashMap<String, String>) -> Option<String> {
+fn member_image_path(
+    member: &MemberProfile,
+    image_cache: &HashMap<String, String>,
+) -> Option<String> {
     member.local_image_path.clone().or_else(|| {
         member
             .image_url

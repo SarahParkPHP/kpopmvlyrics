@@ -202,7 +202,11 @@ impl VideoOverlay {
             self.seek_scale
                 .connect_change_value(move |scale, _scroll_type, new_value| {
                     let upper = scale.adjustment().upper();
-                    let max = if upper > 0.0 { upper } else { new_value.max(0.0) };
+                    let max = if upper > 0.0 {
+                        upper
+                    } else {
+                        new_value.max(0.0)
+                    };
                     let ms = new_value.clamp(0.0, max) as u64;
                     pending_seek_ms.set(Some(ms));
                     spawn_player_work(Rc::clone(&view), move |player| player.seek(ms));

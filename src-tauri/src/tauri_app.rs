@@ -1,27 +1,27 @@
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 use tauri::Manager;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 use crate::app::AppContext;
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 use crate::models::*;
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 use crate::player::{
     defer_window_setup, player_load, player_pause, player_play, player_seek, player_set_quality,
     resolve_stream, PlayerState,
 };
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 struct TauriAppState {
     ctx: AppContext,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 pub fn run_with_args(_args: Vec<String>) {
     run();
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -54,12 +54,12 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(desktop_unix)]
 pub fn run_with_args(args: Vec<String>) {
     crate::ui::run(args);
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn resolve_video_metadata(
     url: String,
@@ -68,7 +68,7 @@ fn resolve_video_metadata(
     state.ctx.resolve_video_metadata(&url)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn list_video_formats(
     url: String,
@@ -77,13 +77,13 @@ fn list_video_formats(
     state.ctx.list_video_formats(&url)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn fetch_lyrics(query: String, state: tauri::State<'_, TauriAppState>) -> Result<SongPackage, String> {
     state.ctx.fetch_lyrics(&query)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn import_lyrics(
     raw_text: String,
@@ -94,7 +94,7 @@ fn import_lyrics(
     state.ctx.import_lyrics(&raw_text, &title, &artist)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn fetch_captions(
     video_id: String,
@@ -103,7 +103,7 @@ fn fetch_captions(
     state.ctx.fetch_captions(&video_id)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn import_captions(
     video_id: String,
@@ -113,7 +113,7 @@ fn import_captions(
     state.ctx.import_captions(&video_id, &raw_text)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn align_lyrics(
     song_id: i64,
@@ -126,7 +126,7 @@ fn align_lyrics(
         .map(|result| result.alignment)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn save_alignment_edits(
     song_id: i64,
@@ -137,7 +137,7 @@ fn save_alignment_edits(
     state.ctx.save_alignment_edits(song_id, &video_id, &lines)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn search_member_profiles(
     group_name: String,
@@ -146,7 +146,7 @@ fn search_member_profiles(
     state.ctx.search_member_profiles(&group_name)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(tauri_shell)]
 #[tauri::command]
 fn save_member_override(
     group_name: String,

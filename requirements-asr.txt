@@ -1,3 +1,4 @@
 qwen-asr>=0.0.6
+demucs>=4.0.1
 soynlp>=0.0.493
 numpy>=1.20

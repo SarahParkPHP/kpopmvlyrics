@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import gc
 import json
+import mimetypes
 import os
+import re
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request
 
 # Reduce CUDA memory fragmentation. Must be set before torch is imported anywhere.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -40,15 +46,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio", required=True, type=Path, help="Input audio file")
     parser.add_argument("--output", required=True, type=Path, help="Output JSON path")
     parser.add_argument(
+        "--provider",
+        default="local",
+        choices=["local", "openai", "elevenlabs", "mistral", "gemini", "soniox", "alibaba"],
+        help="ASR provider backend",
+    )
+    parser.add_argument(
         "--model",
         required=True,
-        help="Hugging Face model id, e.g. Qwen/Qwen3-ASR-0.6B",
+        help="Provider model id",
     )
     parser.add_argument(
         "--aligner-model",
-        required=True,
+        default="Qwen/Qwen3-ForcedAligner-0.6B",
         help="Hugging Face forced aligner id, e.g. Qwen/Qwen3-ForcedAligner-0.6B",
     )
+    parser.add_argument("--api-key", default=None, help="External provider API key")
+    parser.add_argument("--base-url", default=None, help="External provider base URL override")
     parser.add_argument(
         "--language",
         default=None,
@@ -198,6 +212,433 @@ class AlignedToken:
     text: str
     start: float
     end: float
+
+
+@dataclass
+class ExternalTranscript:
+    language: str | None
+    words: list[AlignedToken]
+    segments: list[dict]
+    raw_text: str
+    alignment_source: str
+
+
+def audio_mime_type(path: Path) -> str:
+    return mimetypes.guess_type(path.name)[0] or "audio/mpeg"
+
+
+def http_json(url: str, headers: dict[str, str], payload: bytes | dict, timeout: int = 600) -> dict:
+    if isinstance(payload, dict):
+        body = json.dumps(payload).encode("utf-8")
+        headers = {**headers, "Content-Type": "application/json"}
+    else:
+        body = payload
+    req = request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="replace")
+    except urlerror.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{url} failed with HTTP {err.code}: {detail}") from err
+    return json.loads(data) if data.strip() else {}
+
+
+def http_get_json(url: str, headers: dict[str, str], timeout: int = 120) -> dict:
+    req = request.Request(url, headers=headers, method="GET")
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="replace")
+    except urlerror.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{url} failed with HTTP {err.code}: {detail}") from err
+    return json.loads(data) if data.strip() else {}
+
+
+def multipart_body(fields: dict[str, str], files: dict[str, Path]) -> tuple[bytes, str]:
+    boundary = f"kpopmvlyrics-{os.getpid()}-{int(time.time() * 1000)}"
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    for name, path in files.items():
+        mime = audio_mime_type(path)
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                (
+                    f'Content-Disposition: form-data; name="{name}"; '
+                    f'filename="{path.name}"\r\n'
+                ).encode(),
+                f"Content-Type: {mime}\r\n\r\n".encode(),
+                path.read_bytes(),
+                b"\r\n",
+            ]
+        )
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def provider_base_url(provider: str, override: str | None) -> str:
+    if override and override.strip():
+        return override.strip().rstrip("/")
+    return {
+        "openai": "https://api.openai.com/v1",
+        "elevenlabs": "https://api.elevenlabs.io/v1",
+        "mistral": "https://api.mistral.ai/v1",
+        "gemini": "https://generativelanguage.googleapis.com/v1beta",
+        "soniox": "https://api.soniox.com/v1",
+        "alibaba": "https://dashscope-intl.aliyuncs.com/api/v1",
+    }[provider]
+
+
+def require_api_key(provider: str, api_key: str | None) -> str:
+    if api_key and api_key.strip():
+        return api_key.strip()
+    env_key = {
+        "openai": "OPENAI_API_KEY",
+        "elevenlabs": "ELEVENLABS_API_KEY",
+        "mistral": "MISTRAL_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "soniox": "SONIOX_API_KEY",
+        "alibaba": "DASHSCOPE_API_KEY",
+    }[provider]
+    value = os.environ.get(env_key)
+    if value:
+        return value
+    raise RuntimeError(f"Missing API key for {provider}. Set it in the app settings.")
+
+
+def numeric_time(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number > 1000:
+        return number / 1000.0
+    return number
+
+
+def dict_text(row: dict) -> str:
+    for key in ("text", "word", "token", "content"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def dict_start_end(row: dict) -> tuple[float | None, float | None]:
+    start = None
+    end = None
+    for key in ("start", "start_time", "start_sec", "begin_time", "start_ms", "begin_ms"):
+        if key in row:
+            start = numeric_time(row.get(key))
+            break
+    for key in ("end", "end_time", "end_sec", "finish_time", "end_ms", "finish_ms"):
+        if key in row:
+            end = numeric_time(row.get(key))
+            break
+    return start, end
+
+
+def tokens_from_rows(rows: list[dict]) -> list[AlignedToken]:
+    tokens = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("type") in {"spacing", "audio_event"}:
+            continue
+        text = dict_text(row)
+        start, end = dict_start_end(row)
+        if text and start is not None and end is not None and end >= start:
+            tokens.append(AlignedToken(text=text, start=start, end=max(end, start + 0.02)))
+    return tokens
+
+
+def segments_from_rows(rows: list[dict]) -> list[dict]:
+    segments = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        text = dict_text(row)
+        start, end = dict_start_end(row)
+        if text and start is not None and end is not None and end >= start:
+            segments.append({"text": text, "start_ms": ms(start), "end_ms": ms(max(end, start + 0.2)), "index": index})
+    return segments
+
+
+def distribute_segment_words(segments: list[dict]) -> list[AlignedToken]:
+    tokens: list[AlignedToken] = []
+    for segment in segments:
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        words = re.findall(r"\S+", text)
+        if not words:
+            continue
+        start = float(segment.get("start_ms", 0)) / 1000.0
+        end = float(segment.get("end_ms", 0)) / 1000.0
+        if end <= start:
+            continue
+        step = (end - start) / len(words)
+        for index, word in enumerate(words):
+            word_start = start + step * index
+            tokens.append(AlignedToken(word, word_start, word_start + max(0.02, step * 0.85)))
+    return tokens
+
+
+def recursive_collect_timed_rows(obj) -> tuple[list[dict], list[dict]]:
+    words: list[dict] = []
+    segments: list[dict] = []
+    if isinstance(obj, dict):
+        text = dict_text(obj)
+        start, end = dict_start_end(obj)
+        if text and start is not None and end is not None:
+            if "words" in obj or "tokens" in obj or "segment" in str(obj.get("type", "")).lower():
+                segments.append(obj)
+            else:
+                words.append(obj)
+        for value in obj.values():
+            child_words, child_segments = recursive_collect_timed_rows(value)
+            words.extend(child_words)
+            segments.extend(child_segments)
+    elif isinstance(obj, list):
+        if obj and all(isinstance(item, dict) for item in obj):
+            direct_tokens = tokens_from_rows(obj)
+            direct_segments = segments_from_rows(obj)
+            if direct_tokens:
+                words.extend(obj)
+            elif direct_segments:
+                segments.extend(obj)
+        for value in obj:
+            child_words, child_segments = recursive_collect_timed_rows(value)
+            words.extend(child_words)
+            segments.extend(child_segments)
+    return words, segments
+
+
+def text_from_response(obj) -> str:
+    if isinstance(obj, dict):
+        for key in ("text", "transcript"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        try:
+            parts = obj["candidates"][0]["content"]["parts"]
+            for part in parts:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    return part["text"].strip()
+        except (KeyError, IndexError, TypeError):
+            pass
+    return ""
+
+
+def parse_json_text(text: str) -> dict:
+    cleaned = text.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+    return json.loads(cleaned)
+
+
+def external_transcript_from_response(provider: str, model: str, response_obj: dict, source: str) -> ExternalTranscript:
+    word_rows, segment_rows = recursive_collect_timed_rows(response_obj)
+    words = tokens_from_rows(word_rows)
+    segments = segments_from_rows(segment_rows)
+    if not segments:
+        for key in ("segments", "chunks"):
+            value = response_obj.get(key)
+            if isinstance(value, list):
+                segments = segments_from_rows(value)
+                if segments:
+                    break
+    if not words:
+        for key in ("words", "tokens"):
+            value = response_obj.get(key)
+            if isinstance(value, list):
+                words = tokens_from_rows(value)
+                if words:
+                    break
+    if not words and segments:
+        words = distribute_segment_words(segments)
+    language = response_obj.get("language") or response_obj.get("language_code")
+    return ExternalTranscript(
+        language=language if isinstance(language, str) else None,
+        words=words,
+        segments=segments,
+        raw_text=text_from_response(response_obj),
+        alignment_source=source or f"{provider}:{model}",
+    )
+
+
+def transcribe_openai(args: argparse.Namespace) -> ExternalTranscript:
+    api_key = require_api_key("openai", args.api_key)
+    base = provider_base_url("openai", args.base_url)
+    fields = {
+        "model": args.model,
+        "response_format": "verbose_json",
+        "timestamp_granularities[]": "word",
+    }
+    if args.language:
+        fields["language"] = args.language
+    if args.lyrics_text:
+        fields["prompt"] = args.lyrics_text[:2000]
+    body, content_type = multipart_body(fields, {"file": args.audio})
+    response_obj = http_json(
+        f"{base}/audio/transcriptions",
+        {"Authorization": f"Bearer {api_key}", "Content-Type": content_type},
+        body,
+    )
+    return external_transcript_from_response("openai", args.model, response_obj, "openai")
+
+
+def transcribe_elevenlabs(args: argparse.Namespace) -> ExternalTranscript:
+    api_key = require_api_key("elevenlabs", args.api_key)
+    base = provider_base_url("elevenlabs", args.base_url)
+    fields = {"model_id": args.model}
+    if args.language:
+        fields["language_code"] = args.language
+    body, content_type = multipart_body(fields, {"file": args.audio})
+    response_obj = http_json(
+        f"{base}/speech-to-text",
+        {"xi-api-key": api_key, "Content-Type": content_type},
+        body,
+    )
+    return external_transcript_from_response("elevenlabs", args.model, response_obj, "elevenlabs")
+
+
+def transcribe_mistral(args: argparse.Namespace) -> ExternalTranscript:
+    api_key = require_api_key("mistral", args.api_key)
+    base = provider_base_url("mistral", args.base_url)
+    fields = {"model": args.model, "timestamp_granularities[]": "segment"}
+    body, content_type = multipart_body(fields, {"file": args.audio})
+    response_obj = http_json(
+        f"{base}/audio/transcriptions",
+        {"Authorization": f"Bearer {api_key}", "Content-Type": content_type},
+        body,
+    )
+    return external_transcript_from_response("mistral", args.model, response_obj, "mistral")
+
+
+def transcribe_gemini(args: argparse.Namespace) -> ExternalTranscript:
+    api_key = require_api_key("gemini", args.api_key)
+    base = provider_base_url("gemini", args.base_url)
+    audio_data = base64.b64encode(args.audio.read_bytes()).decode("ascii")
+    prompt = (
+        "Transcribe the speech and singing in this audio. Return JSON only with "
+        '{"language":"<bcp47>","segments":[{"start_ms":0,"end_ms":0,"text":"..."}]}. '
+        "Use millisecond timestamps. Do not include markdown."
+    )
+    if args.lyrics_text:
+        prompt += "\nKnown lyrics/context:\n" + args.lyrics_text[:8000]
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": audio_mime_type(args.audio), "data": audio_data}},
+                ]
+            }
+        ],
+        "generationConfig": {"response_mime_type": "application/json"},
+    }
+    response_obj = http_json(
+        f"{base}/models/{args.model}:generateContent?key={api_key}",
+        {},
+        payload,
+    )
+    text = text_from_response(response_obj)
+    parsed = parse_json_text(text) if text else response_obj
+    return external_transcript_from_response("gemini", args.model, parsed, "gemini")
+
+
+def transcribe_soniox(args: argparse.Namespace) -> ExternalTranscript:
+    api_key = require_api_key("soniox", args.api_key)
+    base = provider_base_url("soniox", args.base_url)
+    body, content_type = multipart_body({}, {"file": args.audio})
+    file_obj = http_json(
+        f"{base}/files",
+        {"Authorization": f"Bearer {api_key}", "Content-Type": content_type},
+        body,
+    )
+    file_id = file_obj.get("id") or file_obj.get("file_id")
+    if not file_id:
+        raise RuntimeError(f"Soniox upload response did not include a file id: {file_obj}")
+    payload = {
+        "model": args.model,
+        "file_id": file_id,
+        "enable_language_identification": True,
+    }
+    if args.language:
+        payload["language_hints"] = [args.language]
+    job = http_json(f"{base}/transcriptions", {"Authorization": f"Bearer {api_key}"}, payload)
+    transcription_id = job.get("id") or job.get("transcription_id")
+    if not transcription_id:
+        raise RuntimeError(f"Soniox transcription response did not include an id: {job}")
+    status_obj = job
+    deadline = time.time() + 900
+    while time.time() < deadline:
+        status = str(status_obj.get("status", "")).lower()
+        if status in {"completed", "complete", "succeeded", "success"}:
+            break
+        if status in {"failed", "error"}:
+            raise RuntimeError(status_obj.get("error_message") or f"Soniox transcription failed: {status_obj}")
+        time.sleep(2.0)
+        status_obj = http_get_json(f"{base}/transcriptions/{transcription_id}", {"Authorization": f"Bearer {api_key}"})
+    else:
+        raise RuntimeError("Soniox transcription timed out")
+    transcript = http_get_json(
+        f"{base}/transcriptions/{transcription_id}/transcript",
+        {"Authorization": f"Bearer {api_key}"},
+    )
+    return external_transcript_from_response("soniox", args.model, transcript, "soniox")
+
+
+def transcribe_alibaba(args: argparse.Namespace) -> ExternalTranscript:
+    api_key = require_api_key("alibaba", args.api_key)
+    base = provider_base_url("alibaba", args.base_url)
+    audio_data = base64.b64encode(args.audio.read_bytes()).decode("ascii")
+    messages = []
+    if args.lyrics_text:
+        messages.append({"role": "system", "content": [{"text": args.lyrics_text[:10000]}]})
+    messages.append(
+        {
+            "role": "user",
+            "content": [{"audio": f"data:{audio_mime_type(args.audio)};base64,{audio_data}"}],
+        }
+    )
+    asr_options = {"enable_itn": False}
+    if args.language:
+        asr_options["language"] = args.language
+    payload = {
+        "model": args.model,
+        "input": {"messages": messages},
+        "parameters": {"asr_options": asr_options},
+    }
+    response_obj = http_json(
+        f"{base}/services/aigc/multimodal-generation/generation",
+        {"Authorization": f"Bearer {api_key}"},
+        payload,
+    )
+    return external_transcript_from_response("alibaba", args.model, response_obj, "alibaba-qwen-asr")
+
+
+def transcribe_external(args: argparse.Namespace) -> ExternalTranscript:
+    return {
+        "openai": transcribe_openai,
+        "elevenlabs": transcribe_elevenlabs,
+        "mistral": transcribe_mistral,
+        "gemini": transcribe_gemini,
+        "soniox": transcribe_soniox,
+        "alibaba": transcribe_alibaba,
+    }[args.provider](args)
 
 
 _memory_hooks_installed = False
@@ -898,6 +1339,59 @@ def main() -> int:
         print(f"Audio file not found: {args.audio}", file=sys.stderr)
         return 1
 
+    language_code = args.language.strip() if args.language else None
+    align_language = resolve_align_language(language_code, args.align_language)
+    align_text = args.lyrics_text.strip() if args.lyrics_text else ""
+
+    if args.provider != "local":
+        try:
+            transcript = transcribe_external(args)
+        except Exception as err:
+            import traceback
+
+            print(f"{args.provider} ASR failed: {err}", file=sys.stderr)
+            traceback.print_exc()
+            return 1
+
+        words_out = [
+            {
+                "text": token.text,
+                "start_ms": ms(token.start),
+                "end_ms": ms(token.end),
+            }
+            for token in transcript.words
+            if token.text.strip()
+        ]
+        payload = {
+            "language": transcript.language or language_code,
+            "model": args.model,
+            "backend": transcript.alignment_source,
+            "device": "api",
+            "align_language": align_language,
+            "words": words_out,
+            "segments": transcript.segments,
+            "alignment_source": transcript.alignment_source if words_out else "none",
+            "align_word_count": len(words_out),
+            "line_timings": [],
+            "text": transcript.raw_text,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(
+            json.dumps(
+                {
+                    "backend": payload["backend"],
+                    "model": args.model,
+                    "words": len(words_out),
+                    "segments": len(transcript.segments),
+                    "language": payload["language"],
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 0
+
     try:
         import_qwen_asr()
     except ImportError as err:
@@ -908,9 +1402,6 @@ def main() -> int:
         return 1
 
     runtime_device = resolve_device(args.device)
-    language_code = args.language.strip() if args.language else None
-    align_language = resolve_align_language(language_code, args.align_language)
-    align_text = args.lyrics_text.strip() if args.lyrics_text else ""
 
     line_specs: list[dict] = []
     if args.lyrics_lines_file and args.lyrics_lines_file.exists():

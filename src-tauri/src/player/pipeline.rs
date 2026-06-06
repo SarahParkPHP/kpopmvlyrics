@@ -8,15 +8,15 @@ use gstreamer as gst;
 use gstreamer::bus::BusWatchGuard;
 use gstreamer::prelude::*;
 use gstreamer::prelude::ObjectExt;
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(tauri_shell, native_frontend))]
 use gstreamer_video as gst_video;
-#[cfg(not(target_os = "linux"))]
-use gstreamer_video::prelude::VideoOverlayExtManual;
+#[cfg(any(tauri_shell, native_frontend))]
+use gstreamer_video::prelude::{VideoOverlayExt, VideoOverlayExtManual};
 
 use crate::models::{StreamSpec, VideoPosition};
 use crate::player::events::PlaybackEvents;
 
-#[cfg(target_os = "linux")]
+#[cfg(desktop_unix)]
 use crate::player::hw_decode::{caps_use_cuda_memory, configure_decoder_ranks, hw_decode_profile, prepare_environment};
 
 pub struct PlaybackEngine {
@@ -640,13 +640,13 @@ fn connect_video_decode_to_queue(
     queue: &gst::Element,
     pipeline: &gst::Pipeline,
 ) {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(tauri_shell)]
     {
         connect_decodebin_to_queue(decode, queue, "video/");
         return;
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(desktop_unix)]
     {
         let queue_weak = queue.downgrade();
         let pipeline_weak = pipeline.downgrade();
@@ -692,13 +692,13 @@ fn link_cuda_video_pad(
     src_pad: &gst::Pad,
     queue: &gst::Element,
 ) -> bool {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(tauri_shell)]
     {
         let _ = (pipeline, src_pad, queue);
         return false;
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(desktop_unix)]
     {
         let download = match gst::ElementFactory::make("cudadownload")
             .name("video-cuda-download")
@@ -755,7 +755,7 @@ fn connect_decodebin_to_queue(decode: &gst::Element, queue: &gst::Element, prefi
     });
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(tauri_shell, native_frontend))]
 pub fn set_video_overlay_handle(sink: &gst::Element, handle: usize) -> Result<(), String> {
     if let Ok(video_sink) = sink.clone().dynamic_cast::<gst_video::VideoOverlay>() {
         // SAFETY: `set_window_handle` is unsafe because it cannot validate the
@@ -780,7 +780,25 @@ pub fn set_video_overlay_handle(sink: &gst::Element, handle: usize) -> Result<()
     Err("Video sink does not support window embedding".into())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Position the embedded video within its host surface (logical pixels).
+#[cfg(any(tauri_shell, native_frontend))]
+pub fn set_video_overlay_rectangle(
+    sink: &gst::Element,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(), String> {
+    let overlay = find_video_overlay(sink)
+        .ok_or_else(|| "Video sink does not support a render rectangle".to_string())?;
+    overlay
+        .set_render_rectangle(x, y, width, height)
+        .map_err(|err| err.to_string())?;
+    overlay.expose();
+    Ok(())
+}
+
+#[cfg(any(tauri_shell, native_frontend))]
 fn find_video_overlay(element: &gst::Element) -> Option<gst_video::VideoOverlay> {
     if let Ok(overlay) = element.clone().dynamic_cast::<gst_video::VideoOverlay>() {
         return Some(overlay);
@@ -808,10 +826,10 @@ pub(crate) fn ensure_gstreamer() -> Result<(), String> {
     static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
     GST_INIT
         .get_or_init(|| {
-            #[cfg(target_os = "linux")]
+            #[cfg(desktop_unix)]
             prepare_environment();
             gst::init().map_err(|err| err.to_string())?;
-            #[cfg(target_os = "linux")]
+            #[cfg(desktop_unix)]
             configure_decoder_ranks();
             Ok(())
         })

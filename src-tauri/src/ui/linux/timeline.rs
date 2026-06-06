@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(desktop_unix)]
 
 //! Final Cut / Premiere-style timeline editor for lyrics.
 //!
@@ -420,8 +420,7 @@ impl Timeline {
         // Clips.
         let mut css = String::new();
         for line in &song.lines {
-            let Some(timing) = model.alignment.iter().find(|a| a.lyric_index == line.index)
-            else {
+            let Some(timing) = model.alignment.iter().find(|a| a.lyric_index == line.index) else {
                 continue;
             };
             let layer_index = LyricLayer::ALL
@@ -605,11 +604,12 @@ impl Timeline {
                 ins.romanization
                     .set_text(line.romanization.as_deref().unwrap_or(""));
                 ins.english.set_text(line.english.as_deref().unwrap_or(""));
-                ins.member.set_active_id(line.member.as_deref().unwrap_or(""));
+                ins.member
+                    .set_active_id(line.member.as_deref().unwrap_or(""));
                 ins.layer.set_active_id(line.layer.as_str());
-                if let Some(timing) = selected.and_then(|index| {
-                    model.alignment.iter().find(|a| a.lyric_index == index)
-                }) {
+                if let Some(timing) = selected
+                    .and_then(|index| model.alignment.iter().find(|a| a.lyric_index == index))
+                {
                     ins.start.set_value(timing.start_ms as f64);
                     ins.end.set_value(timing.end_ms as f64);
                 }

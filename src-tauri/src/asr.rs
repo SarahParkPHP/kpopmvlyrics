@@ -21,6 +21,13 @@ pub enum AsrModelSize {
     #[default]
     Small,
     Large,
+    OpenAiGpt4oTranscribe,
+    OpenAiWhisper1,
+    ElevenLabsScribeV2,
+    MistralVoxtralMini,
+    GeminiFlash,
+    SonioxAsyncV4,
+    AlibabaQwenFlash,
 }
 
 impl AsrModelSize {
@@ -29,19 +36,60 @@ impl AsrModelSize {
             Self::Disabled => None,
             Self::Small => Some(SMALL_ASR_MODEL),
             Self::Large => Some(LARGE_ASR_MODEL),
+            _ => None,
         }
     }
 
     pub fn model_filename(self) -> &'static str {
-        self.hf_model_id().unwrap_or("(none)")
+        self.hf_model_id()
+            .unwrap_or(self.model_id().unwrap_or("(none)"))
     }
 
     pub fn backend(self) -> &'static str {
-        "qwen-asr"
+        match self.provider_id() {
+            Some("openai") => "openai",
+            Some("elevenlabs") => "elevenlabs",
+            Some("mistral") => "mistral",
+            Some("gemini") => "gemini",
+            Some("soniox") => "soniox",
+            Some("alibaba") => "alibaba-qwen-asr",
+            _ => "qwen-asr",
+        }
     }
 
     pub fn is_enabled(self) -> bool {
         !matches!(self, Self::Disabled)
+    }
+
+    pub fn is_local(self) -> bool {
+        matches!(self, Self::Small | Self::Large)
+    }
+
+    pub fn provider_id(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAiGpt4oTranscribe | Self::OpenAiWhisper1 => Some("openai"),
+            Self::ElevenLabsScribeV2 => Some("elevenlabs"),
+            Self::MistralVoxtralMini => Some("mistral"),
+            Self::GeminiFlash => Some("gemini"),
+            Self::SonioxAsyncV4 => Some("soniox"),
+            Self::AlibabaQwenFlash => Some("alibaba"),
+            _ => None,
+        }
+    }
+
+    pub fn model_id(self) -> Option<&'static str> {
+        match self {
+            Self::Small => Some(SMALL_ASR_MODEL),
+            Self::Large => Some(LARGE_ASR_MODEL),
+            Self::OpenAiGpt4oTranscribe => Some("gpt-4o-transcribe"),
+            Self::OpenAiWhisper1 => Some("whisper-1"),
+            Self::ElevenLabsScribeV2 => Some("scribe_v2"),
+            Self::MistralVoxtralMini => Some("voxtral-mini-latest"),
+            Self::GeminiFlash => Some("gemini-2.5-flash"),
+            Self::SonioxAsyncV4 => Some("stt-async-v4"),
+            Self::AlibabaQwenFlash => Some("qwen3-asr-flash"),
+            Self::Disabled => None,
+        }
     }
 
     pub fn label(self) -> &'static str {
@@ -49,6 +97,13 @@ impl AsrModelSize {
             Self::Disabled => "No ASR (captions only)",
             Self::Small => "Qwen3-ASR 0.6B (faster)",
             Self::Large => "Qwen3-ASR 1.7B (more accurate)",
+            Self::OpenAiGpt4oTranscribe => "OpenAI gpt-4o-transcribe",
+            Self::OpenAiWhisper1 => "OpenAI whisper-1",
+            Self::ElevenLabsScribeV2 => "ElevenLabs Scribe v2",
+            Self::MistralVoxtralMini => "Mistral Voxtral Mini",
+            Self::GeminiFlash => "Gemini 2.5 Flash",
+            Self::SonioxAsyncV4 => "Soniox STT async v4",
+            Self::AlibabaQwenFlash => "Alibaba Qwen3-ASR-Flash",
         }
     }
 
@@ -56,6 +111,17 @@ impl AsrModelSize {
         match value.trim().to_ascii_lowercase().as_str() {
             "disabled" | "none" | "off" => Self::Disabled,
             "large" | "large-v3" | "1.7b" | "qwen3-1.7b" | "qwen3-asr-1.7b" => Self::Large,
+            "openai:gpt-4o-transcribe" | "gpt-4o-transcribe" => Self::OpenAiGpt4oTranscribe,
+            "openai:whisper-1" | "whisper-1" => Self::OpenAiWhisper1,
+            "elevenlabs:scribe_v2" | "elevenlabs:scribe-v2" | "scribe_v2" | "scribe-v2" => {
+                Self::ElevenLabsScribeV2
+            }
+            "mistral:voxtral-mini-latest" | "voxtral-mini-latest" => Self::MistralVoxtralMini,
+            "gemini:gemini-2.5-flash" | "gemini-2.5-flash" => Self::GeminiFlash,
+            "soniox:stt-async-v4" | "stt-async-v4" => Self::SonioxAsyncV4,
+            "alibaba:qwen3-asr-flash" | "dashscope:qwen3-asr-flash" | "qwen3-asr-flash" => {
+                Self::AlibabaQwenFlash
+            }
             _ => Self::Small,
         }
     }
@@ -65,6 +131,13 @@ impl AsrModelSize {
             Self::Disabled => "disabled",
             Self::Small => "small",
             Self::Large => "large",
+            Self::OpenAiGpt4oTranscribe => "openai:gpt-4o-transcribe",
+            Self::OpenAiWhisper1 => "openai:whisper-1",
+            Self::ElevenLabsScribeV2 => "elevenlabs:scribe_v2",
+            Self::MistralVoxtralMini => "mistral:voxtral-mini-latest",
+            Self::GeminiFlash => "gemini:gemini-2.5-flash",
+            Self::SonioxAsyncV4 => "soniox:stt-async-v4",
+            Self::AlibabaQwenFlash => "alibaba:qwen3-asr-flash",
         }
     }
 }
@@ -191,7 +264,10 @@ pub fn asr_available() -> bool {
     verbose(format!("asr probe python={}", python.display()));
     let mut command = Command::new(&python);
     scrub_appimage_python_env(&mut command);
-    command.args(["-c", "from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner; import torch"]);
+    command.args([
+        "-c",
+        "from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner; import torch",
+    ]);
     let available = command_output_with_timeout(command, ASR_PROBE_TIMEOUT)
         .map(|output| output.status.success())
         .unwrap_or(false);
@@ -207,6 +283,9 @@ pub fn transcribe_video(
     video_id: &str,
     language_hint: Option<&str>,
     model_size: AsrModelSize,
+    demucs_enabled: bool,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
     lyrics_text: Option<&str>,
     forced_lines: Option<&[ForcedAlignLine]>,
     align_language: Option<&str>,
@@ -223,6 +302,9 @@ pub fn transcribe_video(
         &audio_path,
         language_hint,
         model_size,
+        demucs_enabled,
+        api_key,
+        base_url,
         lyrics_text,
         forced_lines,
         align_language,
@@ -233,6 +315,9 @@ pub fn transcribe_audio(
     audio_path: &Path,
     language_hint: Option<&str>,
     model_size: AsrModelSize,
+    demucs_enabled: bool,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
     lyrics_text: Option<&str>,
     forced_lines: Option<&[ForcedAlignLine]>,
     align_language: Option<&str>,
@@ -241,7 +326,7 @@ pub fn transcribe_audio(
     if !script.exists() {
         return Err(anyhow!("ASR script not found at {}", script.display()));
     }
-    if !asr_available() {
+    if model_size.is_local() && !asr_available() {
         return Err(anyhow!(
             "Qwen3 ASR (qwen-asr) is not installed. {}",
             asr_setup_hint()
@@ -249,11 +334,15 @@ pub fn transcribe_audio(
     }
 
     let python = asr_python()?;
+    let asr_audio_path = if demucs_enabled {
+        let _phase = PhaseGuard::begin("asr demucs vocals");
+        separate_vocals_with_demucs(audio_path, &python)?
+    } else {
+        audio_path.to_path_buf()
+    };
 
-    let output_path = std::env::temp_dir().join(format!(
-        "kpopmvlyrics-asr-{}.json",
-        std::process::id()
-    ));
+    let output_path =
+        std::env::temp_dir().join(format!("kpopmvlyrics-asr-{}.json", std::process::id()));
     let lyrics_lines_path = std::env::temp_dir().join(format!(
         "kpopmvlyrics-asr-lines-{}.json",
         std::process::id()
@@ -264,10 +353,12 @@ pub fn transcribe_audio(
         .map(|_| TempFileGuard(lyrics_lines_path.clone()));
 
     let model_id = model_size
-        .hf_model_id()
-        .ok_or_else(|| anyhow!("Qwen3 ASR is disabled in settings"))?;
+        .model_id()
+        .ok_or_else(|| anyhow!("ASR is disabled in settings"))?;
+    let provider_id = model_size.provider_id().unwrap_or("local");
     verbose(format!(
-        "asr model={} aligner={} device={} align_language={:?}",
+        "asr provider={} model={} aligner={} device={} align_language={:?}",
+        provider_id,
         model_id,
         ALIGNER_MODEL,
         effective_asr_device(),
@@ -279,15 +370,23 @@ pub fn transcribe_audio(
     command
         .arg(&script)
         .arg("--audio")
-        .arg(audio_path)
+        .arg(&asr_audio_path)
         .arg("--output")
         .arg(&output_path)
+        .arg("--provider")
+        .arg(provider_id)
         .arg("--model")
         .arg(model_id)
         .arg("--aligner-model")
         .arg(ALIGNER_MODEL)
         .arg("--device")
         .arg(effective_asr_device());
+    if let Some(key) = api_key.filter(|value| !value.trim().is_empty()) {
+        command.arg("--api-key").arg(key);
+    }
+    if let Some(url) = base_url.filter(|value| !value.trim().is_empty()) {
+        command.arg("--base-url").arg(url);
+    }
     if let Some(language) = language_hint.filter(|value| !value.is_empty()) {
         command.arg("--language").arg(language);
     }
@@ -301,18 +400,16 @@ pub fn transcribe_audio(
         let body = serde_json::to_string(lines).context("serialize forced align lines")?;
         std::fs::write(&lyrics_lines_path, body)
             .with_context(|| format!("write {}", lyrics_lines_path.display()))?;
-        command
-            .arg("--lyrics-lines-file")
-            .arg(&lyrics_lines_path);
+        command.arg("--lyrics-lines-file").arg(&lyrics_lines_path);
     }
 
     let output = command_output_with_timeout(command, WHISPER_TIMEOUT)
-        .map_err(|err| anyhow!("Could not run Qwen3 ASR script: {err}"))?;
+        .map_err(|err| anyhow!("Could not run ASR script: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(anyhow!(
-            "Qwen3 ASR failed: {}{}",
+            "ASR failed: {}{}",
             stderr.trim(),
             if stdout.trim().is_empty() {
                 String::new()
@@ -325,6 +422,102 @@ pub fn transcribe_audio(
     let body = std::fs::read_to_string(&output_path)
         .with_context(|| format!("read asr output {}", output_path.display()))?;
     serde_json::from_str(&body).context("parse asr JSON output")
+}
+
+fn separate_vocals_with_demucs(audio_path: &Path, python: &Path) -> Result<PathBuf> {
+    let output_dir = audio_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("demucs-vocals");
+    let stem = audio_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio");
+    let expected = output_dir.join("htdemucs").join(stem).join("vocals.wav");
+    if expected.exists() {
+        verbose(format!("demucs using cached vocals={}", expected.display()));
+        return Ok(expected);
+    }
+
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("create demucs output dir {}", output_dir.display()))?;
+
+    verbose(format!(
+        "demucs separate vocals audio={} output={}",
+        audio_path.display(),
+        output_dir.display()
+    ));
+    let mut command = Command::new(python);
+    scrub_appimage_python_env(&mut command);
+    command
+        .args([
+            "-m",
+            "demucs.separate",
+            "-n",
+            "htdemucs",
+            "--two-stems",
+            "vocals",
+            "-o",
+        ])
+        .arg(&output_dir);
+    match effective_asr_device().as_str() {
+        "cpu" => {
+            command.args(["-d", "cpu"]);
+        }
+        "cuda" => {
+            command.args(["-d", "cuda"]);
+        }
+        _ => {}
+    }
+    command.arg(audio_path);
+
+    let output = command_output_with_timeout(command, WHISPER_TIMEOUT)
+        .map_err(|err| anyhow!("Could not run Demucs stem separation: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "Demucs stem separation failed: {}{}",
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", stdout.trim())
+            }
+        ));
+    }
+
+    if expected.exists() {
+        return Ok(expected);
+    }
+    find_vocals_wav(&output_dir).ok_or_else(|| {
+        anyhow!(
+            "Demucs did not produce vocals.wav under {}",
+            output_dir.display()
+        )
+    })
+}
+
+fn find_vocals_wav(root: &Path) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("vocals.wav"))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 pub fn asr_caption_lines(video_id: &str, transcript: &AsrTranscript) -> Vec<CaptionLine> {
@@ -431,7 +624,27 @@ fn asr_script_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("KPOPMVLYRICS_ASR_SCRIPT") {
         return Ok(PathBuf::from(path));
     }
+
+    if let Some(path) = find_installed_asr_script() {
+        return Ok(path);
+    }
+
     Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/run_qwen_asr.py"))
+}
+
+fn find_installed_asr_script() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    for candidate in [
+        exe_dir.join("../lib/kpopmvlyrics/run_qwen_asr.py"),
+        exe_dir.join("../share/kpopmvlyrics/run_qwen_asr.py"),
+        exe_dir.join("scripts/run_qwen_asr.py"),
+    ] {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn asr_python() -> Result<PathBuf> {
@@ -490,9 +703,20 @@ mod tests {
         );
         assert_eq!(AsrModelSize::from_storage("none"), AsrModelSize::Disabled);
         assert_eq!(AsrModelSize::Small.hf_model_id(), Some(SMALL_ASR_MODEL));
+        assert_eq!(
+            AsrModelSize::from_storage("elevenlabs:scribe_v2"),
+            AsrModelSize::ElevenLabsScribeV2
+        );
+        assert_eq!(
+            AsrModelSize::AlibabaQwenFlash.as_storage(),
+            "alibaba:qwen3-asr-flash"
+        );
+        assert_eq!(AsrModelSize::SonioxAsyncV4.model_id(), Some("stt-async-v4"));
         assert!(AsrModelSize::Disabled.hf_model_id().is_none());
         assert!(!AsrModelSize::Disabled.is_enabled());
         assert!(AsrModelSize::Small.is_enabled());
+        assert!(AsrModelSize::Small.is_local());
+        assert!(!AsrModelSize::OpenAiGpt4oTranscribe.is_local());
     }
 
     #[test]

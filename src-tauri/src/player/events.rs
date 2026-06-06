@@ -8,7 +8,23 @@ pub struct PlaybackEvents {
     pub on_error: Option<Rc<dyn Fn(String)>>,
 }
 
-#[cfg(not(target_os = "linux"))]
+impl PlaybackEvents {
+    /// Canonical, UI-agnostic constructor: every native frontend (GTK4, SwiftUI
+    /// via UniFFI, WinUI 3, Qt) supplies its own position/error sinks here.
+    /// Consumed by the reusable `NativePlayer` (macOS/Qt/WinUI frontends).
+    #[cfg(native_frontend)]
+    pub fn from_callbacks(
+        on_position: impl Fn(VideoPosition) + 'static,
+        on_error: impl Fn(String) + 'static,
+    ) -> Self {
+        Self {
+            on_position: Some(Rc::new(on_position)),
+            on_error: Some(Rc::new(on_error)),
+        }
+    }
+}
+
+#[cfg(tauri_shell)]
 impl PlaybackEvents {
     pub fn from_tauri(app: tauri::AppHandle) -> Self {
         use tauri::Emitter;

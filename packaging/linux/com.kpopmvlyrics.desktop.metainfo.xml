@@ -5,10 +5,16 @@
   <summary>Play YouTube MVs with synced member-colored lyrics</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
+  <developer id="com.kpopmvlyrics">
+    <name>K-Pop MV Lyrics contributors</name>
+  </developer>
+  <url type="homepage">https://github.com/SarahParkPHP/kpopmvlyrics</url>
   <description>
     <p>K-Pop MV Lyrics is a desktop app for loading a YouTube music video, importing or fetching lyric and caption timing data, and displaying synced member-colored lyrics during playback.</p>
+    <p>Optional ASR/STT alignment supports local Qwen models, external speech-to-text providers, and Demucs vocal stem separation when the user installs and enables those components.</p>
   </description>
   <launchable type="desktop-id">com.kpopmvlyrics.desktop.desktop</launchable>
+  <content_rating type="oars-1.1"/>
   <releases>
     <release version="0.1.0" date="2026-05-25"/>
   </releases>

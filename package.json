@@ -4,36 +4,18 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
-    "build": "tsc && vite build",
-    "preview": "vite preview --host 127.0.0.1",
+    "build": "CARGO_INCREMENTAL=0 cargo build --manifest-path src-tauri/Cargo.toml --release",
     "tauri": "tauri",
-    "tauri:dev": "GDK_BACKEND=x11 npm run tauri -- dev",
-    "package:deb-rpm": "CARGO_INCREMENTAL=0 tauri build",
+    "package:deb-rpm": "CARGO_INCREMENTAL=0 tauri build --bundles deb,rpm",
+    "package:appimage": "scripts/package-appimage.sh",
     "package:tar": "scripts/package-tar.sh",
     "package:flatpak": "scripts/package-flatpak.sh",
-    "package:linux": "npm run package:deb-rpm && npm run package:tar && npm run package:flatpak",
-    "test": "vitest run"
+    "package:linux": "npm run package:deb-rpm && npm run package:appimage && npm run package:tar && npm run package:flatpak",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml"
   },
-  "dependencies": {
-    "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-dialog": "^2.0.0",
-    "@vitejs/plugin-react": "^5.0.0",
-    "lucide-react": "^0.475.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "vite": "^7.0.0"
-  },
+  "dependencies": {},
   "devDependencies": {
-    "@tauri-apps/cli": "^2.0.0",
-    "@testing-library/jest-dom": "^6.6.3",
-    "@testing-library/react": "^16.2.0",
-    "@types/node": "^24.0.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "jsdom": "^26.0.0",
-    "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "@tauri-apps/cli": "^2.0.0"
   },
   "packageManager": "npm@11.15.0"
 }

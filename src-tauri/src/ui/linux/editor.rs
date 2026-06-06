@@ -1,6 +1,7 @@
-#![cfg(target_os = "linux")]
+#![cfg(desktop_unix)]
 
 use std::cell::RefCell;
+use std::fs;
 use std::rc::Rc;
 
 use gtk::gio;
@@ -12,7 +13,9 @@ use gtk::{
 
 use crate::app::{shift_alignment, DEFAULT_MANUAL_CAPTIONS, DEFAULT_MANUAL_LYRICS};
 use crate::log::{progress, verbose, PhaseGuard};
-use crate::models::{AlignmentLine, LyricLayer, LyricLine, MemberProfile};
+use crate::models::{
+    AlignmentLine, LyricLayer, LyricLine, MemberProfile, SongPackage, VideoMetadata,
+};
 
 use super::timeline::Timeline;
 use super::{spawn_work, BackgroundUpdate, UiModel, UiView, WorkerSnapshot};
@@ -31,6 +34,7 @@ pub struct EditorBuild {
     pub shift_back_button: Button,
     pub shift_forward_button: Button,
     pub save_button: Button,
+    pub export_json_button: Button,
     pub lyrics_view: TextView,
     pub captions_view: TextView,
 }
@@ -73,11 +77,13 @@ pub fn build_editor_panel() -> EditorBuild {
     let shift_back_button = Button::with_label("-0.5s");
     let shift_forward_button = Button::with_label("+0.5s");
     let save_button = Button::with_label("Save Alignment");
+    let export_json_button = Button::with_label("Export JSON");
     import_actions.append(&import_lyrics_button);
     import_actions.append(&import_captions_button);
     import_actions.append(&shift_back_button);
     import_actions.append(&shift_forward_button);
     import_actions.append(&save_button);
+    import_actions.append(&export_json_button);
     panel.append(&import_actions);
 
     let timeline = Timeline::new();
@@ -99,6 +105,7 @@ pub fn build_editor_panel() -> EditorBuild {
         shift_back_button,
         shift_forward_button,
         save_button,
+        export_json_button,
         lyrics_view,
         captions_view,
     }
@@ -123,6 +130,8 @@ pub fn connect_editor_handlers(
             revealer.set_reveal_child(open);
             if open {
                 view.render_editor_table();
+            } else {
+                *view.editor.render_key.borrow_mut() = String::new();
             }
         });
     }
@@ -235,7 +244,27 @@ pub fn connect_editor_handlers(
         });
     }
 
-    let _ = window;
+    {
+        let view = Rc::clone(view);
+        let window = window.clone();
+        build.export_json_button.connect_clicked(move |_| {
+            let snapshot = {
+                let model = view.model.borrow();
+                model
+                    .metadata
+                    .clone()
+                    .zip(model.song.clone())
+                    .map(|(metadata, song)| (metadata, song, model.alignment.clone()))
+            };
+            let Some((metadata, song, alignment)) = snapshot else {
+                view.refresh_mut(|model| {
+                    model.error = Some("Load lyrics and resolve a video first".to_string());
+                });
+                return;
+            };
+            export_json_with_dialog(&window, Rc::clone(&view), metadata, song, alignment);
+        });
+    }
 }
 
 impl UiView {
@@ -333,32 +362,28 @@ pub fn pick_member_image(
     dialog.set_filters(Some(&filters));
     dialog.set_default_filter(Some(&filter));
 
-    dialog.open(
-        Some(window),
-        None::<&gio::Cancellable>,
-        move |result| {
-            if let Ok(file) = result {
-                if let Some(path) = file.path() {
-                    let mut updated = member.clone();
-                    updated.local_image_path = Some(path.to_string_lossy().into_owned());
-                    view.refresh_mut(|model| {
-                        if let Err(err) = model.ctx.save_member_override(&group_name, &updated) {
-                            model.error = Some(err);
-                            return;
-                        }
-                        if let Some(song) = &mut model.song {
-                            for item in &mut song.members {
-                                if item.stage_name == updated.stage_name {
-                                    *item = updated.clone();
-                                }
+    dialog.open(Some(window), None::<&gio::Cancellable>, move |result| {
+        if let Ok(file) = result {
+            if let Some(path) = file.path() {
+                let mut updated = member.clone();
+                updated.local_image_path = Some(path.to_string_lossy().into_owned());
+                view.refresh_mut(|model| {
+                    if let Err(err) = model.ctx.save_member_override(&group_name, &updated) {
+                        model.error = Some(err);
+                        return;
+                    }
+                    if let Some(song) = &mut model.song {
+                        for item in &mut song.members {
+                            if item.stage_name == updated.stage_name {
+                                *item = updated.clone();
                             }
                         }
-                        model.editor_table_dirty = true;
-                    });
-                }
+                    }
+                    model.editor_table_dirty = true;
+                });
             }
-        },
-    );
+        }
+    });
 }
 
 pub fn resolve_video_chain(
@@ -410,10 +435,12 @@ pub fn resolve_video_chain(
             progress("open align start", 0.68);
             let result = {
                 let _phase = PhaseGuard::begin("align_lyrics_with_progress");
-                snapshot.ctx.align_lyrics_with_progress(song_id, &video_id, |p| {
-                    progress("open align", p);
-                    report_progress(p);
-                })?
+                snapshot
+                    .ctx
+                    .align_lyrics_with_progress(song_id, &video_id, |p| {
+                        progress("open align", p);
+                        report_progress(p);
+                    })?
             };
             verbose(format!(
                 "open align done lines={} captions={} summary={}",
@@ -436,10 +463,9 @@ pub fn resolve_video_chain(
     progress("open resolve_stream", 0.86);
     let stream_spec = {
         let _phase = PhaseGuard::begin("resolve_stream");
-        snapshot.ctx.resolve_stream(
-            &snapshot.url,
-            snapshot.selected_format.as_deref(),
-        )?
+        snapshot
+            .ctx
+            .resolve_stream(&snapshot.url, snapshot.selected_format.as_deref())?
     };
     verbose(format!("open stream resolved: {stream_spec:?}"));
     report_progress(0.94);
@@ -482,7 +508,11 @@ impl UiModel {
         }
     }
 
-    pub fn update_alignment(&mut self, lyric_index: usize, update: impl FnOnce(&mut AlignmentLine)) {
+    pub fn update_alignment(
+        &mut self,
+        lyric_index: usize,
+        update: impl FnOnce(&mut AlignmentLine),
+    ) {
         if let Some(line) = self
             .alignment
             .iter_mut()
@@ -572,3 +602,167 @@ impl UiModel {
 
 /// Default length of a freshly created clip.
 pub const DEFAULT_CLIP_MS: i64 = 1_500;
+
+fn export_json_with_dialog(
+    window: &ApplicationWindow,
+    view: Rc<UiView>,
+    metadata: VideoMetadata,
+    song: SongPackage,
+    alignment: Vec<AlignmentLine>,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Export JSON")
+        .accept_label("_Export")
+        .modal(true)
+        .initial_name(export_filename(&song, &metadata).as_str())
+        .build();
+
+    dialog.save(
+        Some(window),
+        None::<&gio::Cancellable>,
+        move |result| match result {
+            Ok(file) => {
+                let Some(path) = file.path() else {
+                    view.refresh_mut(|model| {
+                        model.error = Some("Could not determine export path".to_string());
+                    });
+                    return;
+                };
+                let payload = build_json_export(&metadata, &song, &alignment);
+                let write_result = serde_json::to_string_pretty(&payload)
+                    .map(|json| format!("{json}\n"))
+                    .map_err(|err| err.to_string())
+                    .and_then(|json| fs::write(&path, json).map_err(|err| err.to_string()));
+                view.refresh_mut(|model| match write_result {
+                    Ok(()) => {
+                        model.message = Some(format!("JSON exported to {}", path.display()));
+                        model.error = None;
+                    }
+                    Err(err) => {
+                        model.error = Some(format!("JSON export failed: {err}"));
+                    }
+                });
+            }
+            Err(err) => {
+                if !err.matches(gtk::DialogError::Dismissed) {
+                    view.refresh_mut(|model| {
+                        model.error = Some(format!("JSON export failed: {err}"));
+                    });
+                }
+            }
+        },
+    );
+}
+
+fn build_json_export(
+    metadata: &VideoMetadata,
+    song: &SongPackage,
+    alignment: &[AlignmentLine],
+) -> serde_json::Value {
+    crate::export::build_export_json(metadata, song, alignment)
+}
+
+fn export_filename(song: &SongPackage, metadata: &VideoMetadata) -> String {
+    format!(
+        "{}-{}-{}.json",
+        safe_filename(&song.song.artist),
+        safe_filename(&song.song.title),
+        safe_filename(&metadata.video_id)
+    )
+}
+
+fn safe_filename(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(60)
+        .collect::<String>();
+    if cleaned.is_empty() {
+        "export".to_string()
+    } else {
+        cleaned
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::build_json_export;
+    use crate::models::{
+        AlignmentLine, LyricLayer, LyricLine, MemberProfile, Song, SongPackage, VideoMetadata,
+    };
+
+    #[test]
+    fn builds_requested_json_export_shape() {
+        let metadata = VideoMetadata {
+            video_id: "abc123".into(),
+            title: Some("Song".into()),
+            artist_hint: Some("Group".into()),
+            original_url: "https://www.youtube.com/watch?v=abc123".into(),
+        };
+        let song = SongPackage {
+            song: Song {
+                id: Some(1),
+                title: "Song".into(),
+                artist: "Group".into(),
+                group_name: Some("Group".into()),
+                source_url: None,
+            },
+            provider: "fixture".into(),
+            members: vec![MemberProfile {
+                id: None,
+                stage_name: "Nayeon".into(),
+                real_name: None,
+                color: "#e84855".into(),
+                image_url: Some("https://example.com/nayeon.jpg".into()),
+                local_image_path: None,
+                provider: None,
+            }],
+            lines: vec![LyricLine {
+                id: Some(1),
+                song_id: Some(1),
+                index: 0,
+                member: Some("Nayeon".into()),
+                original: "annyeong".into(),
+                romanization: Some("annyeong".into()),
+                english: Some("hello".into()),
+                with_all: false,
+                layer: LyricLayer::Backing,
+                segments: Vec::new(),
+            }],
+        };
+        let alignment = vec![AlignmentLine {
+            lyric_index: 0,
+            caption_index: Some(0),
+            start_ms: 1000,
+            end_ms: 2400,
+            confidence: 1.0,
+            needs_review: false,
+        }];
+
+        let payload = build_json_export(&metadata, &song, &alignment);
+
+        assert_eq!(payload["video"]["platform"], "youtube");
+        assert_eq!(payload["video"]["videoId"], "abc123");
+        assert_eq!(payload["members"][0]["color"], "#e84855");
+        assert_eq!(
+            payload["members"][0]["imageUrl"],
+            "https://example.com/nayeon.jpg"
+        );
+        assert_eq!(payload["lyrics"][0]["startMs"], 1000);
+        assert_eq!(payload["lyrics"][0]["endMs"], 2400);
+        assert_eq!(payload["lyrics"][0]["layer"], "backing");
+        assert_eq!(payload["lyrics"][0]["member"], "Nayeon");
+        assert_eq!(payload["lyrics"][0]["original"], "annyeong");
+        assert_eq!(payload["lyrics"][0]["romanization"], "annyeong");
+        assert_eq!(payload["lyrics"][0]["english"], "hello");
+    }
+}

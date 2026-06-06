@@ -13,6 +13,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "kpopmvlyrics"
 path = "src/main.rs"
 
+[[example]]
+name = "uniffi-bindgen"
+required-features = ["macos_ffi"]
+
+[features]
+# Reusable native player + public `frontend` API for the non-GTK Rust frontends
+# (Qt/QML via cxx-qt, WinUI 3 via windows-rs). Enabled by those crates.
+native_player = []
+# Generated FFI surface consumed by the native macOS (SwiftUI) app via UniFFI.
+macos_ffi = ["native_player", "dep:uniffi"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -32,13 +43,16 @@ rayon = "1.10"
 url = "2"
 gstreamer = "0.25"
 gstreamer-video = "0.25"
+uniffi = { version = "0.28", optional = true, features = ["cli"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# GTK/gstreamer native desktop path: Linux and the BSDs.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 gtk = { package = "gtk4", version = "0.11", features = ["gnome_46"] }
 glib = "0.22"
 gdk-pixbuf = "0.22"
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+# Legacy Tauri webview shell: Windows and macOS (until each gains a native UI).
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tauri = { version = "2", features = ["unstable", "protocol-asset"] }
 tauri-plugin-dialog = "2"
 

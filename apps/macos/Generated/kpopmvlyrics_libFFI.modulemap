@@ -1,0 +1,4 @@
+module kpopmvlyrics_libFFI {
+    header "kpopmvlyrics_libFFI.h"
+    export *
+}
