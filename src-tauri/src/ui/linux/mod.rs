@@ -217,6 +217,8 @@ struct UiModel {
     pending_autoplay: bool,
     timeline_spectrogram: Option<AudioSpectrogram>,
     pending_spectrogram_video_id: Option<String>,
+    timeline_demucs_spectrogram: Option<AudioSpectrogram>,
+    pending_demucs_spectrogram_video_id: Option<String>,
     open_progress: Option<f64>,
     editor_table_dirty: bool,
 }
@@ -406,6 +408,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         pending_autoplay: false,
         timeline_spectrogram: None,
         pending_spectrogram_video_id: None,
+        timeline_demucs_spectrogram: None,
+        pending_demucs_spectrogram_video_id: None,
         open_progress: None,
         editor_table_dirty: false,
     }));
@@ -791,6 +795,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                                 && !is_background_members
                                 && update.label != "Open"
                                 && update.label != "Spectrogram"
+                                && update.label != "Vocals spectrogram"
                             {
                                 model.message = Some(format!("{} complete", update.label));
                             }
@@ -801,6 +806,10 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                         if is_open {
                             apply_url_entry_progress(&view_for_tick, Some(0.96));
                             spawn_timeline_spectrogram(
+                                work_tx_for_tick.clone(),
+                                Rc::clone(&view_for_tick),
+                            );
+                            spawn_timeline_demucs_spectrogram(
                                 work_tx_for_tick.clone(),
                                 Rc::clone(&view_for_tick),
                             );
@@ -1156,6 +1165,8 @@ fn connect_view_handlers(
                 model.active_index = 0;
                 model.timeline_spectrogram = None;
                 model.pending_spectrogram_video_id = None;
+                model.timeline_demucs_spectrogram = None;
+                model.pending_demucs_spectrogram_video_id = None;
             });
             let view = Rc::clone(&view);
             spawn_open_work(work_tx.clone(), open_progress_tx.clone(), view);
@@ -1666,6 +1677,73 @@ pub(super) fn spawn_timeline_spectrogram(
         };
         let _ = work_tx.send(BackgroundUpdate {
             label: "Spectrogram",
+            result,
+        });
+    });
+}
+
+/// Build the Demucs vocals spectrogram for the open video in the background.
+///
+/// Reuses a cached `vocals.wav` from a prior ASR-with-Demucs run when present;
+/// otherwise this runs Demucs, which is heavy — so it runs separately from the
+/// full-mix spectrogram and surfaces whenever it finishes.
+pub(super) fn spawn_timeline_demucs_spectrogram(
+    work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
+    view: Rc<UiView>,
+) {
+    let should_spawn = view.model.try_borrow_mut().ok().and_then(|mut model| {
+        let metadata = model.metadata.clone()?;
+        if metadata.original_url.trim().is_empty() {
+            return None;
+        }
+        if model
+            .timeline_demucs_spectrogram
+            .as_ref()
+            .is_some_and(|spectrogram| spectrogram.video_id == metadata.video_id)
+        {
+            return None;
+        }
+        if model.pending_demucs_spectrogram_video_id.as_deref() == Some(metadata.video_id.as_str()) {
+            return None;
+        }
+        model.pending_demucs_spectrogram_video_id = Some(metadata.video_id.clone());
+        Some(())
+    });
+    if should_spawn.is_none() {
+        return;
+    }
+
+    let snapshot = view.model.borrow().clone_for_thread();
+    std::thread::spawn(move || {
+        let result = match snapshot.metadata.clone() {
+            Some(metadata) => match snapshot
+                .ctx
+                .build_timeline_demucs_spectrogram(&metadata.video_id, &metadata.original_url)
+            {
+                Ok(spectrogram) => Ok(Box::new(move |model: &mut UiModel| {
+                    if model
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|current| current.video_id == spectrogram.video_id)
+                    {
+                        model.timeline_demucs_spectrogram = Some(spectrogram);
+                        model.editor_table_dirty = true;
+                    }
+                    model.pending_demucs_spectrogram_video_id = None;
+                }) as Box<dyn FnOnce(&mut UiModel) + Send>),
+                Err(err) => Ok(Box::new(move |model: &mut UiModel| {
+                    // Best-effort: Demucs may not be installed. Don't clobber the
+                    // error banner on every song — just leave the row empty.
+                    model.pending_demucs_spectrogram_video_id = None;
+                    eprintln!("kpopmvlyrics: vocals spectrogram failed: {err}");
+                }) as Box<dyn FnOnce(&mut UiModel) + Send>),
+            },
+            None => Ok(Box::new(|model: &mut UiModel| {
+                model.pending_demucs_spectrogram_video_id = None;
+            }) as Box<dyn FnOnce(&mut UiModel) + Send>),
+        };
+        let _ = work_tx.send(BackgroundUpdate {
+            label: "Vocals spectrogram",
             result,
         });
     });

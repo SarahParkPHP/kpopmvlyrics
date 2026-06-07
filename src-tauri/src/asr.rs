@@ -430,6 +430,26 @@ pub fn transcribe_audio(
     serde_json::from_str(&body).context("parse asr JSON output")
 }
 
+/// Path to the Demucs vocals produced by a prior ASR-with-Demucs run for
+/// `video_id`, if it is still cached. Lets callers (e.g. the timeline vocals
+/// spectrogram) reuse the separation instead of running Demucs again.
+pub fn cached_demucs_vocals(video_id: &str) -> Option<PathBuf> {
+    let expected = asr_cache_dir()
+        .ok()?
+        .join("demucs-vocals")
+        .join("htdemucs")
+        .join(video_id)
+        .join("vocals.wav");
+    expected.exists().then_some(expected)
+}
+
+/// Run (or reuse cached) Demucs vocal separation for an arbitrary audio file,
+/// returning the path to its `vocals.wav` stem.
+pub fn separate_vocals(audio_path: &Path) -> Result<PathBuf> {
+    let python = asr_python()?;
+    separate_vocals_with_demucs(audio_path, &python)
+}
+
 fn separate_vocals_with_demucs(audio_path: &Path, python: &Path) -> Result<PathBuf> {
     let output_dir = audio_path
         .parent()

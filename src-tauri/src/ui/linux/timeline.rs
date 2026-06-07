@@ -23,7 +23,10 @@ use super::{spawn_player_work, IdDropDown, UiView};
 
 const RULER_H: f64 = 22.0;
 const AUDIO_ROW_H: f64 = 72.0;
+const VOCALS_ROW_H: f64 = 72.0;
 const ROW_H: f64 = 56.0;
+/// Y where the lyric tracks begin, below the ruler and both audio rows.
+const TRACKS_TOP: f64 = RULER_H + AUDIO_ROW_H + VOCALS_ROW_H;
 const CLIP_PAD: f64 = 4.0;
 const EDGE_PX: f64 = 8.0;
 const MIN_CLIP_PX: f64 = 14.0;
@@ -52,6 +55,7 @@ struct TimelineState {
     selected: Option<usize>,
     playhead_ms: i64,
     spectrogram: Option<AudioSpectrogram>,
+    demucs_spectrogram: Option<AudioSpectrogram>,
 }
 
 struct Inspector {
@@ -88,6 +92,7 @@ impl Timeline {
             selected: None,
             playhead_ms: 0,
             spectrogram: None,
+            demucs_spectrogram: None,
         }));
 
         let root = GtkBox::new(Orientation::Vertical, 6);
@@ -126,6 +131,12 @@ impl Timeline {
         audio_label.set_margin_start(8);
         audio_label.add_css_class("timeline-audio-header");
         headers.append(&audio_label);
+        let vocals_label = Label::new(Some("Vocals"));
+        vocals_label.set_xalign(0.0);
+        vocals_label.set_size_request(HEADER_W, VOCALS_ROW_H as i32);
+        vocals_label.set_margin_start(8);
+        vocals_label.add_css_class("timeline-audio-header");
+        headers.append(&vocals_label);
         for layer in LyricLayer::ALL {
             let label = Label::new(Some(layer.label()));
             label.set_xalign(0.0);
@@ -154,7 +165,7 @@ impl Timeline {
         scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
         scroller.set_hexpand(true);
         scroller.set_vexpand(true);
-        scroller.set_min_content_height((RULER_H + AUDIO_ROW_H + ROW_H * 3.0) as i32);
+        scroller.set_min_content_height((TRACKS_TOP + ROW_H * 3.0) as i32);
         scroller.set_child(Some(&overlay));
         body.append(&scroller);
         root.append(&body);
@@ -406,6 +417,24 @@ impl Timeline {
         }
     }
 
+    pub fn set_demucs_spectrogram(&self, spectrogram: Option<AudioSpectrogram>) {
+        let changed = {
+            let mut state = self.state.borrow_mut();
+            let changed = state
+                .demucs_spectrogram
+                .as_ref()
+                .map(|value| value.video_id.as_str())
+                != spectrogram.as_ref().map(|value| value.video_id.as_str());
+            if changed {
+                state.demucs_spectrogram = spectrogram;
+            }
+            changed
+        };
+        if changed {
+            self.drawing.queue_draw();
+        }
+    }
+
     /// Full relayout: rebuild clip widgets and the ruler from the model.
     pub fn relayout(self: &Rc<Self>, view: &Rc<UiView>) {
         clear_fixed(&self.fixed);
@@ -456,7 +485,7 @@ impl Timeline {
                 .unwrap_or(0);
             let x = timing.start_ms.max(0) as f64 * px_per_ms;
             let w = ((timing.end_ms - timing.start_ms).max(1) as f64 * px_per_ms).max(MIN_CLIP_PX);
-            let y = RULER_H + AUDIO_ROW_H + layer_index as f64 * ROW_H + CLIP_PAD;
+            let y = TRACKS_TOP + layer_index as f64 * ROW_H + CLIP_PAD;
             let h = ROW_H - 2.0 * CLIP_PAD;
 
             let clip = self.build_clip(view, line.index, line, selected, x, w, y);
@@ -477,7 +506,7 @@ impl Timeline {
 
     fn set_content_size(&self, width: f64) {
         let w = (width.ceil() as i32).max(1);
-        let h = (RULER_H + AUDIO_ROW_H + ROW_H * 3.0) as i32;
+        let h = (TRACKS_TOP + ROW_H * 3.0) as i32;
         self.drawing.set_size_request(w, h);
         self.fixed.set_size_request(w, h);
     }
@@ -764,7 +793,14 @@ fn draw_background(
     let height = height as f64;
     let state = state.borrow();
 
-    draw_audio_spectrogram(ctx, width, state.spectrogram.as_ref());
+    draw_audio_spectrogram(ctx, width, RULER_H, AUDIO_ROW_H, state.spectrogram.as_ref());
+    draw_audio_spectrogram(
+        ctx,
+        width,
+        RULER_H + AUDIO_ROW_H,
+        VOCALS_ROW_H,
+        state.demucs_spectrogram.as_ref(),
+    );
 
     // Row separators.
     ctx.set_source_rgba(1.0, 1.0, 1.0, 0.10);
@@ -773,8 +809,10 @@ fn draw_background(
     ctx.line_to(width, RULER_H);
     ctx.move_to(0.0, RULER_H + AUDIO_ROW_H);
     ctx.line_to(width, RULER_H + AUDIO_ROW_H);
+    ctx.move_to(0.0, TRACKS_TOP);
+    ctx.line_to(width, TRACKS_TOP);
     for i in 0..=3 {
-        let y = RULER_H + AUDIO_ROW_H + i as f64 * ROW_H;
+        let y = TRACKS_TOP + i as f64 * ROW_H;
         ctx.move_to(0.0, y);
         ctx.line_to(width, y);
     }
@@ -808,6 +846,8 @@ fn draw_background(
 fn draw_audio_spectrogram(
     ctx: &gtk::cairo::Context,
     width: f64,
+    row_top: f64,
+    row_h: f64,
     spectrogram: Option<&AudioSpectrogram>,
 ) {
     let Some(spectrogram) = spectrogram else {
@@ -817,11 +857,11 @@ fn draw_audio_spectrogram(
         return;
     }
 
-    let top = RULER_H + 6.0;
-    let draw_h = (AUDIO_ROW_H - 12.0).max(1.0);
+    let top = row_top + 6.0;
+    let draw_h = (row_h - 12.0).max(1.0);
 
     ctx.set_source_rgba(0.11, 0.16, 0.19, 0.72);
-    ctx.rectangle(0.0, RULER_H, width, AUDIO_ROW_H);
+    ctx.rectangle(0.0, row_top, width, row_h);
     let _ = ctx.fill();
 
     let Ok(mut surface) = gtk::cairo::ImageSurface::create(

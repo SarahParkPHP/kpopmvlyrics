@@ -19,7 +19,8 @@ use crate::models::{
 
 use super::timeline::Timeline;
 use super::{
-    spawn_timeline_spectrogram, spawn_work, BackgroundUpdate, UiModel, UiView, WorkerSnapshot,
+    spawn_timeline_demucs_spectrogram, spawn_timeline_spectrogram, spawn_work, BackgroundUpdate,
+    UiModel, UiView, WorkerSnapshot,
 };
 
 pub struct EditorWidgets {
@@ -340,6 +341,9 @@ impl UiView {
             self.editor
                 .timeline
                 .set_spectrogram(model.timeline_spectrogram.clone());
+            self.editor
+                .timeline
+                .set_demucs_spectrogram(model.timeline_demucs_spectrogram.clone());
             model.editor_table_dirty
                 || *self.editor.render_key.borrow() != editor_render_key(&model)
         };
@@ -548,6 +552,8 @@ pub fn resolve_video_chain(
         model.active_index = 0;
         model.timeline_spectrogram = None;
         model.pending_spectrogram_video_id = None;
+        model.timeline_demucs_spectrogram = None;
+        model.pending_demucs_spectrogram_video_id = None;
         model.pending_stream = Some(stream_spec);
         model.editor_table_dirty = true;
         if let Some(summary) = align_summary {
@@ -707,6 +713,8 @@ fn import_json_with_dialog(
                         model.pending_autoplay = false;
                         model.timeline_spectrogram = None;
                         model.pending_spectrogram_video_id = None;
+                        model.timeline_demucs_spectrogram = None;
+                        model.pending_demucs_spectrogram_video_id = None;
                         model.player_loaded = false;
                         model.current_ms = 0;
                         model.active_index = 0;
@@ -723,6 +731,7 @@ fn import_json_with_dialog(
                 });
                 if should_load_video {
                     spawn_timeline_spectrogram(work_tx.clone(), Rc::clone(&view));
+                    spawn_timeline_demucs_spectrogram(work_tx.clone(), Rc::clone(&view));
                     spawn_work(work_tx.clone(), Rc::clone(&view), "Stream", move |snapshot| {
                         let spec = snapshot.ctx.resolve_stream(&snapshot.url, None)?;
                         Ok(Box::new(move |model: &mut UiModel| {

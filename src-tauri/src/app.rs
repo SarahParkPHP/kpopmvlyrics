@@ -146,6 +146,14 @@ impl AppContext {
         audio_visual::build_timeline_spectrogram(video_id, url).map_err(to_string)
     }
 
+    pub fn build_timeline_demucs_spectrogram(
+        &self,
+        video_id: &str,
+        url: &str,
+    ) -> Result<AudioSpectrogram, String> {
+        audio_visual::build_timeline_demucs_spectrogram(video_id, url).map_err(to_string)
+    }
+
     pub fn fetch_lyrics(&self, query: &str) -> Result<SongPackage, String> {
         // Different color-coded sites cover different songs (and the same query can
         // produce a confidently-wrong match on one site), so we score every

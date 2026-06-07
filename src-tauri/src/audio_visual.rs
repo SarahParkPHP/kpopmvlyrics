@@ -14,11 +14,11 @@ use crate::process_util::{command_output_with_timeout, YTDLP_TIMEOUT};
 
 const TARGET_SAMPLE_RATE: i32 = 22_050;
 const N_FFT: usize = 2_048;
-const WIN_LENGTH: usize = 2_048;
-const MIN_HOP_LENGTH: usize = 256;
-const TARGET_TIME_BINS: usize = 4_096;
-const FREQ_BINS: usize = 96;
-const DISPLAY_DYNAMIC_RANGE_DB: f32 = 74.0;
+const WIN_LENGTH: usize = 1_024;
+const MIN_HOP_LENGTH: usize = 96;
+const TARGET_TIME_BINS: usize = 12_288;
+const FREQ_BINS: usize = 128;
+const DISPLAY_DYNAMIC_RANGE_DB: f32 = 78.0;
 
 pub fn build_timeline_spectrogram(video_id: &str, url: &str) -> Result<AudioSpectrogram> {
     let cache_dir = audio_cache_dir()?;
@@ -26,6 +26,26 @@ pub fn build_timeline_spectrogram(video_id: &str, url: &str) -> Result<AudioSpec
     let key = safe_cache_key(video_id);
     let audio_path = cached_audio_path(&cache_dir, &key, url)?;
     let samples = decode_audio_mono_f32(&audio_path)?;
+    build_spectrogram_from_samples(video_id, &samples)
+}
+
+/// Build a spectrogram from the Demucs-separated vocals for this video.
+///
+/// Reuses a `vocals.wav` from a prior ASR-with-Demucs run if one is still
+/// cached; otherwise runs Demucs on the timeline audio (an expensive ML pass)
+/// and caches the result alongside it.
+pub fn build_timeline_demucs_spectrogram(video_id: &str, url: &str) -> Result<AudioSpectrogram> {
+    let vocals = match crate::asr::cached_demucs_vocals(video_id) {
+        Some(path) => path,
+        None => {
+            let cache_dir = audio_cache_dir()?;
+            fs::create_dir_all(&cache_dir)?;
+            let key = safe_cache_key(video_id);
+            let audio_path = cached_audio_path(&cache_dir, &key, url)?;
+            crate::asr::separate_vocals(&audio_path)?
+        }
+    };
+    let samples = decode_audio_mono_f32(&vocals)?;
     build_spectrogram_from_samples(video_id, &samples)
 }
 
@@ -278,8 +298,8 @@ fn spectrogram_to_intensities(raw: &[Vec<f32>], output_bins: usize) -> Vec<u8> {
         .into_iter()
         .map(|db| {
             let normalized = ((db - floor) / span).clamp(0.0, 1.0);
-            let gated = ((normalized - 0.10) / 0.90).clamp(0.0, 1.0);
-            (gated.powf(1.65) * 255.0) as u8
+            let gated = ((normalized - 0.07) / 0.93).clamp(0.0, 1.0);
+            (gated.powf(1.35) * 255.0) as u8
         })
         .collect()
 }
@@ -292,13 +312,16 @@ fn smooth_spectrogram(pixels: &[u8]) -> Vec<u8> {
     if width == 0 {
         return Vec::new();
     }
+    // Light, mostly-vertical smoothing: it knocks down the banding between
+    // adjacent log-frequency rows without blurring along time, so transients
+    // and vocal detail stay sharp instead of washing into a smooth blob.
     let mut smoothed = vec![0u8; pixels.len()];
     for y in 0..FREQ_BINS {
         for x in 0..width {
             let mut weighted_sum = 0u32;
             let mut weight_sum = 0u32;
             for dy in -1isize..=1 {
-                for dx in -2isize..=2 {
+                for dx in -1isize..=1 {
                     let Some(sx) = x.checked_add_signed(dx) else {
                         continue;
                     };
@@ -309,11 +332,9 @@ fn smooth_spectrogram(pixels: &[u8]) -> Vec<u8> {
                         continue;
                     }
                     let weight = match (dx.abs(), dy.abs()) {
-                        (0, 0) => 8,
-                        (1, 0) => 4,
-                        (2, 0) => 2,
-                        (0, 1) => 3,
-                        (1, 1) => 2,
+                        (0, 0) => 16,
+                        (0, 1) => 4,
+                        (1, 0) => 2,
                         _ => 1,
                     };
                     weighted_sum += pixels[sy * width + sx] as u32 * weight;
@@ -434,7 +455,7 @@ mod tests {
 
     #[test]
     fn chooses_reasonable_hop_for_short_audio() {
-        assert_eq!(hop_length_for(100), 256);
+        assert_eq!(hop_length_for(100), 96);
     }
 
     #[test]
@@ -482,7 +503,7 @@ mod tests {
         let spectrogram = build_spectrogram_from_samples("test", &samples).unwrap();
 
         assert_eq!(spectrogram.video_id, "test");
-        assert_eq!(spectrogram.height, 96);
+        assert_eq!(spectrogram.height, 128);
         assert_eq!(
             spectrogram.pixels.len(),
             spectrogram.width * spectrogram.height
