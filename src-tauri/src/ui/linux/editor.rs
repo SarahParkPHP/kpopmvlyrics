@@ -9,6 +9,7 @@ use gtk::prelude::*;
 use gtk::{
     ApplicationWindow, Box as GtkBox, Button, Orientation, ScrolledWindow, Stack, TextView, Window,
 };
+use serde::Deserialize;
 
 use crate::app::{shift_alignment, DEFAULT_MANUAL_CAPTIONS, DEFAULT_MANUAL_LYRICS};
 use crate::log::{progress, verbose, PhaseGuard};
@@ -17,7 +18,9 @@ use crate::models::{
 };
 
 use super::timeline::Timeline;
-use super::{spawn_work, BackgroundUpdate, UiModel, UiView, WorkerSnapshot};
+use super::{
+    spawn_timeline_spectrogram, spawn_work, BackgroundUpdate, UiModel, UiView, WorkerSnapshot,
+};
 
 pub struct EditorWidgets {
     pub timeline: Rc<Timeline>,
@@ -33,6 +36,7 @@ pub struct EditorBuild {
     pub shift_back_button: Button,
     pub shift_forward_button: Button,
     pub save_button: Button,
+    pub import_json_button: Button,
     pub export_json_button: Button,
 }
 
@@ -47,12 +51,14 @@ pub fn build_editor_panel() -> EditorBuild {
     let shift_back_button = Button::with_label("-0.5s");
     let shift_forward_button = Button::with_label("+0.5s");
     let save_button = Button::with_label("Save Alignment");
+    let import_json_button = Button::with_label("Import JSON");
     let export_json_button = Button::with_label("Export JSON");
     import_actions.append(&import_lyrics_button);
     import_actions.append(&import_captions_button);
     import_actions.append(&shift_back_button);
     import_actions.append(&shift_forward_button);
     import_actions.append(&save_button);
+    import_actions.append(&import_json_button);
     import_actions.append(&export_json_button);
     panel.append(&import_actions);
 
@@ -70,6 +76,7 @@ pub fn build_editor_panel() -> EditorBuild {
         shift_back_button,
         shift_forward_button,
         save_button,
+        import_json_button,
         export_json_button,
     }
 }
@@ -276,6 +283,15 @@ pub fn connect_editor_handlers(
     {
         let view = Rc::clone(view);
         let window = window.clone();
+        let work_tx = work_tx.clone();
+        build.import_json_button.connect_clicked(move |_| {
+            import_json_with_dialog(&window, Rc::clone(&view), work_tx.clone());
+        });
+    }
+
+    {
+        let view = Rc::clone(view);
+        let window = window.clone();
         build.export_json_button.connect_clicked(move |_| {
             let snapshot = {
                 let model = view.model.borrow();
@@ -321,6 +337,9 @@ impl UiView {
             let Ok(model) = self.model.try_borrow() else {
                 return;
             };
+            self.editor
+                .timeline
+                .set_spectrogram(model.timeline_spectrogram.clone());
             model.editor_table_dirty
                 || *self.editor.render_key.borrow() != editor_render_key(&model)
         };
@@ -527,6 +546,8 @@ pub fn resolve_video_chain(
         model.player_loaded = false;
         model.current_ms = 0;
         model.active_index = 0;
+        model.timeline_spectrogram = None;
+        model.pending_spectrogram_video_id = None;
         model.pending_stream = Some(stream_spec);
         model.editor_table_dirty = true;
         if let Some(summary) = align_summary {
@@ -642,6 +663,85 @@ impl UiModel {
 /// Default length of a freshly created clip.
 pub const DEFAULT_CLIP_MS: i64 = 1_500;
 
+fn import_json_with_dialog(
+    window: &ApplicationWindow,
+    view: Rc<UiView>,
+    work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Import JSON")
+        .accept_label("_Import")
+        .modal(true)
+        .build();
+
+    dialog.open(
+        Some(window),
+        None::<&gio::Cancellable>,
+        move |result| match result {
+            Ok(file) => {
+                let Some(path) = file.path() else {
+                    view.refresh_mut(|model| {
+                        model.error = Some("Could not determine import path".to_string());
+                    });
+                    return;
+                };
+                let fallback_metadata = view.model.borrow().metadata.clone();
+                let import_result = fs::read_to_string(&path)
+                    .map_err(|err| err.to_string())
+                    .and_then(|text| parse_json_import(&text, fallback_metadata.as_ref()));
+                let should_load_video = import_result
+                    .as_ref()
+                    .is_ok_and(|(metadata, _, _)| !metadata.original_url.trim().is_empty());
+                view.refresh_mut(|model| match import_result {
+                    Ok((metadata, song, alignment)) => {
+                        let (show_original, show_romanization, show_english) =
+                            crate::lyrics::lyric_language_toggles(&song.lines);
+                        model.url = metadata.original_url.clone();
+                        model.metadata = Some(metadata);
+                        model.song = Some(song);
+                        model.captions.clear();
+                        model.alignment = alignment;
+                        model.selected_format = None;
+                        model.pending_stream = None;
+                        model.pending_seek_ms = Some(0);
+                        model.pending_autoplay = false;
+                        model.timeline_spectrogram = None;
+                        model.pending_spectrogram_video_id = None;
+                        model.player_loaded = false;
+                        model.current_ms = 0;
+                        model.active_index = 0;
+                        model.show_original = show_original;
+                        model.show_romanization = show_romanization;
+                        model.show_english = show_english;
+                        model.editor_table_dirty = true;
+                        model.message = Some(format!("JSON imported from {}", path.display()));
+                        model.error = None;
+                    }
+                    Err(err) => {
+                        model.error = Some(format!("JSON import failed: {err}"));
+                    }
+                });
+                if should_load_video {
+                    spawn_timeline_spectrogram(work_tx.clone(), Rc::clone(&view));
+                    spawn_work(work_tx.clone(), Rc::clone(&view), "Stream", move |snapshot| {
+                        let spec = snapshot.ctx.resolve_stream(&snapshot.url, None)?;
+                        Ok(Box::new(move |model: &mut UiModel| {
+                            model.pending_stream = Some(spec);
+                        }) as Box<dyn FnOnce(&mut UiModel) + Send>)
+                    });
+                }
+            }
+            Err(err) => {
+                if !err.matches(gtk::DialogError::Dismissed) {
+                    view.refresh_mut(|model| {
+                        model.error = Some(format!("JSON import failed: {err}"));
+                    });
+                }
+            }
+        },
+    );
+}
+
 fn export_json_with_dialog(
     window: &ApplicationWindow,
     view: Rc<UiView>,
@@ -701,6 +801,156 @@ fn build_json_export(
     crate::export::build_export_json(metadata, song, alignment)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonImportPayload {
+    video: JsonImportVideo,
+    #[serde(default)]
+    members: Vec<JsonImportMember>,
+    lyrics: Vec<JsonImportLyric>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonImportVideo {
+    video_id: String,
+    platform: Option<String>,
+    url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonImportMember {
+    name: String,
+    color: Option<String>,
+    image_url: Option<String>,
+    local_image_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonImportLyric {
+    index: Option<usize>,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    layer: Option<String>,
+    member: Option<String>,
+    original: String,
+    romanization: Option<String>,
+    english: Option<String>,
+}
+
+fn parse_json_import(
+    raw: &str,
+    fallback_metadata: Option<&VideoMetadata>,
+) -> Result<(VideoMetadata, SongPackage, Vec<AlignmentLine>), String> {
+    let payload: JsonImportPayload =
+        serde_json::from_str(raw).map_err(|err| format!("Invalid JSON: {err}"))?;
+    if payload.lyrics.is_empty() {
+        return Err("Import JSON has no lyrics".to_string());
+    }
+
+    let JsonImportVideo {
+        video_id,
+        platform,
+        url,
+    } = payload.video;
+    let original_url = url
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| {
+            let platform = platform.as_deref().unwrap_or("youtube");
+            if !video_id.trim().is_empty()
+                && (platform == "youtube" || platform == "youtu.be" || platform.ends_with("youtube.com"))
+            {
+                Some(format!("https://www.youtube.com/watch?v={video_id}"))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| "Import JSON has no video URL".to_string())?;
+    let title = fallback_metadata
+        .and_then(|metadata| metadata.title.clone())
+        .unwrap_or_else(|| "Imported JSON".to_string());
+    let artist = fallback_metadata
+        .and_then(|metadata| metadata.artist_hint.clone())
+        .unwrap_or_else(|| "Imported Artist".to_string());
+    let metadata = VideoMetadata {
+        video_id,
+        title: Some(title.clone()),
+        artist_hint: Some(artist.clone()),
+        original_url,
+    };
+
+    let members = payload
+        .members
+        .into_iter()
+        .filter(|member| !member.name.trim().is_empty())
+        .map(|member| MemberProfile {
+            id: None,
+            stage_name: member.name,
+            real_name: None,
+            color: member.color.unwrap_or_else(|| "#5f7c8a".to_string()),
+            image_url: member.image_url,
+            local_image_path: member.local_image_path,
+            provider: Some("json".to_string()),
+        })
+        .collect::<Vec<_>>();
+
+    let mut alignment = Vec::new();
+    let lines = payload
+        .lyrics
+        .into_iter()
+        .enumerate()
+        .map(|(position, lyric)| {
+            let index = lyric.index.unwrap_or(position);
+            if let (Some(start_ms), Some(end_ms)) = (lyric.start_ms, lyric.end_ms) {
+                let start_ms = start_ms.max(0);
+                alignment.push(AlignmentLine {
+                    lyric_index: index,
+                    caption_index: None,
+                    start_ms,
+                    end_ms: end_ms.max(start_ms + 1),
+                    confidence: 1.0,
+                    needs_review: false,
+                });
+            }
+            LyricLine {
+                id: None,
+                song_id: None,
+                index,
+                member: lyric.member,
+                original: lyric.original,
+                romanization: lyric.romanization,
+                english: lyric.english,
+                with_all: false,
+                layer: lyric
+                    .layer
+                    .as_deref()
+                    .and_then(LyricLayer::from_str)
+                    .unwrap_or_default(),
+                segments: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok((
+        metadata,
+        SongPackage {
+            song: crate::models::Song {
+                id: None,
+                title,
+                artist: artist.clone(),
+                group_name: Some(artist),
+                source_url: None,
+            },
+            lines,
+            members,
+            provider: "json".to_string(),
+        },
+        alignment,
+    ))
+}
+
 fn export_filename(song: &SongPackage, metadata: &VideoMetadata) -> String {
     format!(
         "{}-{}-{}.json",
@@ -734,7 +984,7 @@ fn safe_filename(value: &str) -> String {
 
 #[cfg(test)]
 mod export_tests {
-    use super::build_json_export;
+    use super::{build_json_export, parse_json_import};
     use crate::models::{
         AlignmentLine, LyricLayer, LyricLine, MemberProfile, Song, SongPackage, VideoMetadata,
     };
@@ -803,5 +1053,55 @@ mod export_tests {
         assert_eq!(payload["lyrics"][0]["original"], "annyeong");
         assert_eq!(payload["lyrics"][0]["romanization"], "annyeong");
         assert_eq!(payload["lyrics"][0]["english"], "hello");
+    }
+
+    #[test]
+    fn imports_export_json_shape_into_song_and_alignment() {
+        let fallback = VideoMetadata {
+            video_id: "fallback".into(),
+            title: Some("Song".into()),
+            artist_hint: Some("Group".into()),
+            original_url: "https://www.youtube.com/watch?v=fallback".into(),
+        };
+        let raw = r##"{
+            "version": 1,
+            "video": {
+                "platform": "youtube",
+                "videoId": "abc123",
+                "url": "https://www.youtube.com/watch?v=abc123"
+            },
+            "members": [
+                {
+                    "name": "Nayeon",
+                    "color": "#e84855",
+                    "imageUrl": "https://example.com/nayeon.jpg",
+                    "localImagePath": null
+                }
+            ],
+            "lyrics": [
+                {
+                    "index": 0,
+                    "startMs": 1000,
+                    "endMs": 2400,
+                    "layer": "backing",
+                    "member": "Nayeon",
+                    "original": "annyeong",
+                    "romanization": "annyeong",
+                    "english": "hello"
+                }
+            ]
+        }"##;
+
+        let (metadata, song, alignment) = parse_json_import(raw, Some(&fallback)).unwrap();
+
+        assert_eq!(metadata.video_id, "abc123");
+        assert_eq!(metadata.original_url, "https://www.youtube.com/watch?v=abc123");
+        assert_eq!(song.song.title, "Song");
+        assert_eq!(song.members[0].stage_name, "Nayeon");
+        assert_eq!(song.lines[0].layer, LyricLayer::Backing);
+        assert_eq!(song.lines[0].english.as_deref(), Some("hello"));
+        assert_eq!(alignment[0].lyric_index, 0);
+        assert_eq!(alignment[0].start_ms, 1000);
+        assert_eq!(alignment[0].end_ms, 2400);
     }
 }

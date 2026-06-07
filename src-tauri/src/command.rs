@@ -36,6 +36,9 @@ pub fn invoke(ctx: &AppContext, command: &str, args_json: &str) -> Result<String
             let format_id = args.get("formatId").and_then(Value::as_str);
             to_json(ctx.resolve_stream(&url, format_id)?)
         }
+        "build_timeline_spectrogram" => {
+            to_json(ctx.build_timeline_spectrogram(&str_arg("videoId")?, &str_arg("url")?)?)
+        }
         "fetch_lyrics" => to_json(ctx.fetch_lyrics(&str_arg("query")?)?),
         "import_lyrics" => to_json(ctx.import_lyrics(
             &str_arg("rawText")?,

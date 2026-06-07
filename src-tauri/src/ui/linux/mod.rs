@@ -25,8 +25,8 @@ use crate::align::has_playback_timing;
 use crate::app::{apply_member_profiles, format_ms, AppContext};
 use crate::asr::AsrModelSize;
 use crate::models::{
-    AlignmentLine, CaptionLine, MemberProfile, SongPackage, StreamSpec, VideoFormat, VideoMetadata,
-    VideoPosition,
+    AlignmentLine, AudioSpectrogram, CaptionLine, MemberProfile, SongPackage, StreamSpec,
+    VideoFormat, VideoMetadata, VideoPosition,
 };
 use crate::player::NativeLinuxPlayer;
 use crate::player::PlaybackEvents;
@@ -39,6 +39,39 @@ use lyrics::{compute_lyric_stage_content, lyric_content_key, LyricStage, LyricSt
 use video_overlay::{build_video_overlay, VideoOverlay};
 
 const APP_ID: &str = "com.kpopmvlyrics.desktop";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemePreference {
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    fn from_storage(value: &str) -> Self {
+        match value {
+            "light" => Self::Light,
+            "dark" => Self::Dark,
+            _ => Self::System,
+        }
+    }
+
+    fn as_storage(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+}
 
 /// `gtk::DropDown` driven by a parallel `Vec<String>` of option IDs so we can
 /// keep the "select by id, ignore display label" pattern that the deprecated
@@ -126,7 +159,7 @@ pub fn run(args: Vec<String>) {
     application.run_with_args(&args);
 }
 
-struct BackgroundUpdate {
+pub(super) struct BackgroundUpdate {
     label: &'static str,
     result: Result<Box<dyn FnOnce(&mut UiModel) + Send>, String>,
 }
@@ -174,6 +207,7 @@ struct UiModel {
     show_english: bool,
     asr_model_size: AsrModelSize,
     asr_demucs_enabled: bool,
+    theme_preference: ThemePreference,
     busy: Option<String>,
     message: Option<String>,
     error: Option<String>,
@@ -181,6 +215,8 @@ struct UiModel {
     pending_seek_ms: Option<u64>,
     active_seek_ms: Option<u64>,
     pending_autoplay: bool,
+    timeline_spectrogram: Option<AudioSpectrogram>,
+    pending_spectrogram_video_id: Option<String>,
     open_progress: Option<f64>,
     editor_table_dirty: bool,
 }
@@ -282,7 +318,7 @@ fn apply_member_visual(entry: &MemberButton, state: MemberVisualState) {
     }
 }
 
-struct UiView {
+pub(super) struct UiView {
     this: Rc<RefCell<Option<Rc<UiView>>>>,
     model: Rc<RefCell<UiModel>>,
     window: ApplicationWindow,
@@ -296,6 +332,7 @@ struct UiView {
     main_stack: Stack,
     quality_combo: IdDropDown,
     asr_model_combo: IdDropDown,
+    theme_combo: IdDropDown,
     settings_revealer: Revealer,
     query_entry: Entry,
     original_toggle: CheckButton,
@@ -309,6 +346,7 @@ struct UiView {
     format_render_key: Rc<RefCell<String>>,
     suppress_quality_reload: Rc<Cell<bool>>,
     suppress_asr_model_reload: Rc<Cell<bool>>,
+    suppress_theme_reload: Rc<Cell<bool>>,
     video_overlay: Rc<VideoOverlay>,
     member_image_cache: Rc<RefCell<HashMap<String, String>>>,
     member_image_pending: Rc<RefCell<HashSet<String>>>,
@@ -322,6 +360,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let initial_asr_model = ctx.asr_model_size();
     let initial_asr_provider = initial_asr_model.provider_id();
     let initial_asr_demucs_enabled = ctx.asr_demucs_enabled();
+    let initial_theme = ThemePreference::from_storage(&ctx.theme_preference());
 
     let (position_tx, position_rx) = std::sync::mpsc::channel::<VideoPosition>();
     let (error_tx, error_rx) = std::sync::mpsc::channel::<String>();
@@ -357,6 +396,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         show_english: true,
         asr_model_size: initial_asr_model,
         asr_demucs_enabled: initial_asr_demucs_enabled,
+        theme_preference: initial_theme,
         busy: None,
         message: None,
         error: None,
@@ -364,6 +404,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         pending_seek_ms: None,
         active_seek_ms: None,
         pending_autoplay: false,
+        timeline_spectrogram: None,
+        pending_spectrogram_video_id: None,
         open_progress: None,
         editor_table_dirty: false,
     }));
@@ -374,6 +416,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         .default_width(1280)
         .default_height(920)
         .build();
+    apply_theme_preference(&window, initial_theme);
 
     let paned = Paned::new(Orientation::Vertical);
     let top = GtkBox::new(Orientation::Vertical, 8);
@@ -534,6 +577,19 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let asr_demucs_toggle = CheckButton::with_label("Demucs vocals");
     asr_demucs_toggle.set_active(initial_asr_demucs_enabled);
 
+    let theme_row = GtkBox::new(Orientation::Horizontal, 8);
+    theme_row.append(&Label::new(Some("Theme")));
+    let theme_combo = IdDropDown::new();
+    for theme in [
+        ThemePreference::System,
+        ThemePreference::Light,
+        ThemePreference::Dark,
+    ] {
+        theme_combo.append(theme.as_storage(), theme.label());
+    }
+    theme_combo.set_active_id(initial_theme.as_storage());
+    theme_row.append(&theme_combo.widget);
+
     let asr_api_key_row = GtkBox::new(Orientation::Horizontal, 8);
     asr_api_key_row.append(&Label::new(Some("ASR API key")));
     let asr_api_key_entry = Entry::new();
@@ -567,6 +623,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     controls_flow.set_row_spacing(6);
     controls_flow.set_homogeneous(false);
     controls_flow.set_halign(gtk::Align::Start);
+    controls_flow.append(&theme_row);
     controls_flow.append(&asr_model_row);
     controls_flow.append(&asr_demucs_toggle);
     controls_flow.append(&fetch_lyrics_button);
@@ -645,6 +702,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         main_stack: main_stack.clone(),
         quality_combo: quality_combo.clone(),
         asr_model_combo: asr_model_combo.clone(),
+        theme_combo: theme_combo.clone(),
         // NB: IdDropDown::clone copies the same underlying StringList + ids so
         // updates from anywhere reflect everywhere - it's a cheap Rc-style clone.
         settings_revealer: settings_revealer.clone(),
@@ -663,6 +721,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         format_render_key: Rc::new(RefCell::new(String::new())),
         suppress_quality_reload: Rc::new(Cell::new(false)),
         suppress_asr_model_reload: Rc::new(Cell::new(false)),
+        suppress_theme_reload: Rc::new(Cell::new(false)),
         video_overlay: Rc::clone(&video_overlay),
         member_image_cache: Rc::new(RefCell::new(HashMap::new())),
         member_image_pending: Rc::new(RefCell::new(HashSet::new())),
@@ -731,6 +790,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                             if update.label != "Alignment"
                                 && !is_background_members
                                 && update.label != "Open"
+                                && update.label != "Spectrogram"
                             {
                                 model.message = Some(format!("{} complete", update.label));
                             }
@@ -740,6 +800,10 @@ fn build_main_window(app: &Application) -> Result<(), String> {
                         }
                         if is_open {
                             apply_url_entry_progress(&view_for_tick, Some(0.96));
+                            spawn_timeline_spectrogram(
+                                work_tx_for_tick.clone(),
+                                Rc::clone(&view_for_tick),
+                            );
                             let group = view_for_tick.model.try_borrow().ok().and_then(|model| {
                                 model
                                     .song
@@ -807,6 +871,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         &url_entry,
         &quality_combo,
         &asr_model_combo,
+        &theme_combo,
         &asr_demucs_toggle,
         &asr_api_key_entry,
         &asr_base_url_entry,
@@ -920,6 +985,7 @@ impl UiView {
         self.query_entry.set_text(&model.query);
         self.sync_language_toggles(&model);
         self.sync_asr_model_combo(&model);
+        self.sync_theme_combo(&model);
         render_status(&self.status_label, &model);
         self.schedule_lyric_build(&model);
         drop(model);
@@ -990,6 +1056,18 @@ impl UiView {
         }
     }
 
+    fn sync_theme_combo(&self, model: &UiModel) {
+        if self.suppress_theme_reload.get() {
+            return;
+        }
+        let target = model.theme_preference.as_storage();
+        if self.theme_combo.active_id().as_deref() != Some(target) {
+            self.suppress_theme_reload.set(true);
+            self.theme_combo.set_active_id(target);
+            self.suppress_theme_reload.set(false);
+        }
+    }
+
     fn apply_song_language_toggles(model: &mut UiModel, lines: &[crate::models::LyricLine]) {
         let (show_original, show_romanization, show_english) =
             crate::lyrics::lyric_language_toggles(lines);
@@ -1043,6 +1121,7 @@ fn connect_view_handlers(
     url_entry: &Entry,
     quality_combo: &IdDropDown,
     asr_model_combo: &IdDropDown,
+    theme_combo: &IdDropDown,
     asr_demucs_toggle: &CheckButton,
     asr_api_key_entry: &Entry,
     asr_base_url_entry: &Entry,
@@ -1075,6 +1154,8 @@ fn connect_view_handlers(
                 model.player_loaded = false;
                 model.current_ms = 0;
                 model.active_index = 0;
+                model.timeline_spectrogram = None;
+                model.pending_spectrogram_video_id = None;
             });
             let view = Rc::clone(&view);
             spawn_open_work(work_tx.clone(), open_progress_tx.clone(), view);
@@ -1100,6 +1181,30 @@ fn connect_view_handlers(
                 Ok(Box::new(move |model: &mut UiModel| {
                     model.pending_stream = Some(spec);
                 }) as Box<dyn FnOnce(&mut UiModel) + Send>)
+            });
+        });
+    }
+
+    {
+        let view = Rc::clone(view);
+        let suppress = Rc::clone(&view.suppress_theme_reload);
+        let window = view.window.clone();
+        theme_combo.connect_changed(move |combo| {
+            if suppress.get() {
+                return;
+            }
+            let Some(id) = combo.active_id() else {
+                return;
+            };
+            let theme = ThemePreference::from_storage(&id);
+            apply_theme_preference(&window, theme);
+            view.refresh_mut(|model| {
+                model.theme_preference = theme;
+                if let Err(err) = model.ctx.set_theme_preference(theme.as_storage()) {
+                    model.error = Some(err);
+                } else {
+                    model.message = Some(format!("Theme set to {}", theme.label()));
+                }
             });
         });
     }
@@ -1468,6 +1573,21 @@ fn apply_url_entry_progress(view: &UiView, progress: Option<f64>) {
     view.url_progress_provider.load_from_string(&css);
 }
 
+fn apply_theme_preference(window: &ApplicationWindow, theme: ThemePreference) {
+    window.remove_css_class("kpml-theme-system");
+    window.remove_css_class("kpml-theme-light");
+    window.remove_css_class("kpml-theme-dark");
+    window.add_css_class(match theme {
+        ThemePreference::System => "kpml-theme-system",
+        ThemePreference::Light => "kpml-theme-light",
+        ThemePreference::Dark => "kpml-theme-dark",
+    });
+
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(theme == ThemePreference::Dark);
+    }
+}
+
 fn spawn_member_profiles_in_background(
     work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
     view: Rc<UiView>,
@@ -1486,6 +1606,66 @@ fn spawn_member_profiles_in_background(
         })();
         let _ = work_tx.send(BackgroundUpdate {
             label: "Members",
+            result,
+        });
+    });
+}
+
+pub(super) fn spawn_timeline_spectrogram(
+    work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
+    view: Rc<UiView>,
+) {
+    let should_spawn = view.model.try_borrow_mut().ok().and_then(|mut model| {
+        let metadata = model.metadata.clone()?;
+        if metadata.original_url.trim().is_empty() {
+            return None;
+        }
+        if model
+            .timeline_spectrogram
+            .as_ref()
+            .is_some_and(|spectrogram| spectrogram.video_id == metadata.video_id)
+        {
+            return None;
+        }
+        if model.pending_spectrogram_video_id.as_deref() == Some(metadata.video_id.as_str()) {
+            return None;
+        }
+        model.pending_spectrogram_video_id = Some(metadata.video_id.clone());
+        Some(())
+    });
+    if should_spawn.is_none() {
+        return;
+    }
+
+    let snapshot = view.model.borrow().clone_for_thread();
+    std::thread::spawn(move || {
+        let result = match snapshot.metadata.clone() {
+            Some(metadata) => match snapshot
+                .ctx
+                .build_timeline_spectrogram(&metadata.video_id, &metadata.original_url)
+            {
+                Ok(spectrogram) => Ok(Box::new(move |model: &mut UiModel| {
+                    if model
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|current| current.video_id == spectrogram.video_id)
+                    {
+                        model.timeline_spectrogram = Some(spectrogram);
+                        model.editor_table_dirty = true;
+                    }
+                    model.pending_spectrogram_video_id = None;
+                }) as Box<dyn FnOnce(&mut UiModel) + Send>),
+                Err(err) => Ok(Box::new(move |model: &mut UiModel| {
+                    model.pending_spectrogram_video_id = None;
+                    model.error = Some(format!("Spectrogram failed: {err}"));
+                }) as Box<dyn FnOnce(&mut UiModel) + Send>),
+            },
+            None => Ok(Box::new(|model: &mut UiModel| {
+                model.pending_spectrogram_video_id = None;
+            }) as Box<dyn FnOnce(&mut UiModel) + Send>),
+        };
+        let _ = work_tx.send(BackgroundUpdate {
+            label: "Spectrogram",
             result,
         });
     });

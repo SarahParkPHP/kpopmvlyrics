@@ -29,20 +29,10 @@ cargo build --release
 ./target/release/kpopmvlyrics
 ```
 
-### Windows / macOS (Tauri + React)
+### Other native frontends
 
-```bash
-npm install
-npm run tauri dev
-```
-
-Install [GStreamer runtime](https://gstreamer.freedesktop.org/download/) for native video playback.
-
-For frontend-only iteration on Windows/macOS:
-
-```bash
-npm run dev
-```
+Experimental native frontends live under `apps/` for macOS, Windows WinUI, and KDE/Qt.
+Install [GStreamer runtime](https://gstreamer.freedesktop.org/download/) for native video playback on those platforms.
 
 ## Test
 

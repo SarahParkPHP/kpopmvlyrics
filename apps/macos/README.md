@@ -2,9 +2,9 @@
 
 Native macOS frontend. It contains **no business logic**: every operation goes
 to the shared Rust core (`src-tauri`) through a UniFFI-generated boundary, the
-same `AppContext` the GTK4/Linux UI uses in-process. Data crosses as JSON
-(mirroring the old `tauri.ts` `api`); the GStreamer video renders directly into
-an `NSView` via the core's player thread.
+same `AppContext` the GTK4/Linux UI uses in-process. Data crosses through the
+shared JSON command surface; the GStreamer video renders directly into an
+`NSView` via the core's player thread.
 
 ```
 SwiftUI views ──> AppState ──> CoreClient ──> [UniFFI] ──> Rust Core (AppContext + player)

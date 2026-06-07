@@ -1,5 +1,6 @@
 mod align;
 mod app;
+mod audio_visual;
 mod captions;
 #[cfg(feature = "native_player")]
 mod command;

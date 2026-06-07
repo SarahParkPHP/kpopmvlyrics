@@ -21,7 +21,9 @@ pub struct VideoFormat {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum StreamSpec {
-    Progressive { uri: String },
+    Progressive {
+        uri: String,
+    },
     Adaptive {
         video_uri: String,
         audio_uri: String,
@@ -35,6 +37,17 @@ pub struct VideoPosition {
     pub duration_ms: Option<u64>,
     pub playing: bool,
     pub buffering: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioSpectrogram {
+    pub video_id: String,
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<u8>,
+    #[serde(default)]
+    pub waveform: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -17,11 +17,12 @@ use gtk::{
     Orientation, Overlay, ScrolledWindow, SpinButton,
 };
 
-use crate::models::{LyricLayer, MemberProfile};
+use crate::models::{AudioSpectrogram, LyricLayer, MemberProfile};
 
 use super::{spawn_player_work, IdDropDown, UiView};
 
 const RULER_H: f64 = 22.0;
+const AUDIO_ROW_H: f64 = 72.0;
 const ROW_H: f64 = 56.0;
 const CLIP_PAD: f64 = 4.0;
 const EDGE_PX: f64 = 8.0;
@@ -50,6 +51,7 @@ struct TimelineState {
     px_per_ms: f64,
     selected: Option<usize>,
     playhead_ms: i64,
+    spectrogram: Option<AudioSpectrogram>,
 }
 
 struct Inspector {
@@ -85,6 +87,7 @@ impl Timeline {
             px_per_ms: DEFAULT_PX_PER_MS,
             selected: None,
             playhead_ms: 0,
+            spectrogram: None,
         }));
 
         let root = GtkBox::new(Orientation::Vertical, 6);
@@ -117,6 +120,12 @@ impl Timeline {
         let ruler_spacer = GtkBox::new(Orientation::Vertical, 0);
         ruler_spacer.set_size_request(HEADER_W, RULER_H as i32);
         headers.append(&ruler_spacer);
+        let audio_label = Label::new(Some("Audio"));
+        audio_label.set_xalign(0.0);
+        audio_label.set_size_request(HEADER_W, AUDIO_ROW_H as i32);
+        audio_label.set_margin_start(8);
+        audio_label.add_css_class("timeline-audio-header");
+        headers.append(&audio_label);
         for layer in LyricLayer::ALL {
             let label = Label::new(Some(layer.label()));
             label.set_xalign(0.0);
@@ -145,7 +154,7 @@ impl Timeline {
         scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
         scroller.set_hexpand(true);
         scroller.set_vexpand(true);
-        scroller.set_min_content_height((RULER_H + ROW_H * 3.0) as i32);
+        scroller.set_min_content_height((RULER_H + AUDIO_ROW_H + ROW_H * 3.0) as i32);
         scroller.set_child(Some(&overlay));
         body.append(&scroller);
         root.append(&body);
@@ -379,6 +388,24 @@ impl Timeline {
         self.drawing.queue_draw();
     }
 
+    pub fn set_spectrogram(&self, spectrogram: Option<AudioSpectrogram>) {
+        let changed = {
+            let mut state = self.state.borrow_mut();
+            let changed = state
+                .spectrogram
+                .as_ref()
+                .map(|value| value.video_id.as_str())
+                != spectrogram.as_ref().map(|value| value.video_id.as_str());
+            if changed {
+                state.spectrogram = spectrogram;
+            }
+            changed
+        };
+        if changed {
+            self.drawing.queue_draw();
+        }
+    }
+
     /// Full relayout: rebuild clip widgets and the ruler from the model.
     pub fn relayout(self: &Rc<Self>, view: &Rc<UiView>) {
         clear_fixed(&self.fixed);
@@ -429,7 +456,7 @@ impl Timeline {
                 .unwrap_or(0);
             let x = timing.start_ms.max(0) as f64 * px_per_ms;
             let w = ((timing.end_ms - timing.start_ms).max(1) as f64 * px_per_ms).max(MIN_CLIP_PX);
-            let y = RULER_H + layer_index as f64 * ROW_H + CLIP_PAD;
+            let y = RULER_H + AUDIO_ROW_H + layer_index as f64 * ROW_H + CLIP_PAD;
             let h = ROW_H - 2.0 * CLIP_PAD;
 
             let clip = self.build_clip(view, line.index, line, selected, x, w, y);
@@ -450,7 +477,7 @@ impl Timeline {
 
     fn set_content_size(&self, width: f64) {
         let w = (width.ceil() as i32).max(1);
-        let h = (RULER_H + ROW_H * 3.0) as i32;
+        let h = (RULER_H + AUDIO_ROW_H + ROW_H * 3.0) as i32;
         self.drawing.set_size_request(w, h);
         self.fixed.set_size_request(w, h);
     }
@@ -737,11 +764,17 @@ fn draw_background(
     let height = height as f64;
     let state = state.borrow();
 
-    // Track separators.
+    draw_audio_spectrogram(ctx, width, state.spectrogram.as_ref());
+
+    // Row separators.
     ctx.set_source_rgba(1.0, 1.0, 1.0, 0.10);
     ctx.set_line_width(1.0);
+    ctx.move_to(0.0, RULER_H);
+    ctx.line_to(width, RULER_H);
+    ctx.move_to(0.0, RULER_H + AUDIO_ROW_H);
+    ctx.line_to(width, RULER_H + AUDIO_ROW_H);
     for i in 0..=3 {
-        let y = RULER_H + i as f64 * ROW_H;
+        let y = RULER_H + AUDIO_ROW_H + i as f64 * ROW_H;
         ctx.move_to(0.0, y);
         ctx.line_to(width, y);
     }
@@ -770,6 +803,178 @@ fn draw_background(
         ctx.line_to(px, height);
         let _ = ctx.stroke();
     }
+}
+
+fn draw_audio_spectrogram(
+    ctx: &gtk::cairo::Context,
+    width: f64,
+    spectrogram: Option<&AudioSpectrogram>,
+) {
+    let Some(spectrogram) = spectrogram else {
+        return;
+    };
+    if spectrogram.width == 0 || spectrogram.height == 0 || spectrogram.pixels.is_empty() {
+        return;
+    }
+
+    let top = RULER_H + 6.0;
+    let draw_h = (AUDIO_ROW_H - 12.0).max(1.0);
+
+    ctx.set_source_rgba(0.11, 0.16, 0.19, 0.72);
+    ctx.rectangle(0.0, RULER_H, width, AUDIO_ROW_H);
+    let _ = ctx.fill();
+
+    let Ok(mut surface) = gtk::cairo::ImageSurface::create(
+        gtk::cairo::Format::Rgb24,
+        spectrogram.width as i32,
+        spectrogram.height as i32,
+    ) else {
+        return;
+    };
+    let stride = surface.stride() as usize;
+    if let Ok(mut data) = surface.data() {
+        for sy in 0..spectrogram.height {
+            for sx in 0..spectrogram.width {
+                let value = spectrogram.pixels[sy * spectrogram.width + sx] as f64 / 255.0;
+                let (red, green, blue) = spectrogram_color(value);
+                let offset = sy * stride + sx * 4;
+                data[offset] = blue;
+                data[offset + 1] = green;
+                data[offset + 2] = red;
+                data[offset + 3] = 0;
+            }
+        }
+    } else {
+        return;
+    }
+    surface.mark_dirty();
+
+    let pattern = gtk::cairo::SurfacePattern::create(&surface);
+    pattern.set_filter(gtk::cairo::Filter::Nearest);
+
+    let _ = ctx.save();
+    ctx.rectangle(0.0, top, width, draw_h);
+    ctx.clip();
+    ctx.translate(0.0, top);
+    ctx.scale(
+        width / spectrogram.width as f64,
+        draw_h / spectrogram.height as f64,
+    );
+    let _ = ctx.set_source(&pattern);
+    ctx.rectangle(
+        0.0,
+        0.0,
+        spectrogram.width as f64,
+        spectrogram.height as f64,
+    );
+    let _ = ctx.fill();
+    let _ = ctx.restore();
+
+    draw_audio_waveform_overlay(ctx, width, top, draw_h, spectrogram);
+}
+
+fn spectrogram_color(value: f64) -> (u8, u8, u8) {
+    const STOPS: &[(f64, (u8, u8, u8))] = &[
+        (0.00, (7, 10, 14)),
+        (0.24, (9, 18, 29)),
+        (0.46, (16, 52, 74)),
+        (0.66, (26, 112, 102)),
+        (0.84, (166, 132, 46)),
+        (0.96, (202, 72, 36)),
+        (1.00, (240, 202, 126)),
+    ];
+    let value = value.clamp(0.0, 1.0);
+    for window in STOPS.windows(2) {
+        let (start, start_color) = window[0];
+        let (end, end_color) = window[1];
+        if value <= end {
+            let amount = ((value - start) / (end - start)).clamp(0.0, 1.0);
+            return (
+                lerp_u8(start_color.0, end_color.0, amount),
+                lerp_u8(start_color.1, end_color.1, amount),
+                lerp_u8(start_color.2, end_color.2, amount),
+            );
+        }
+    }
+    STOPS
+        .last()
+        .map(|(_, color)| *color)
+        .unwrap_or((255, 255, 255))
+}
+
+fn lerp_u8(start: u8, end: u8, amount: f64) -> u8 {
+    (start as f64 + (end as f64 - start as f64) * amount).round() as u8
+}
+
+fn draw_audio_waveform_overlay(
+    ctx: &gtk::cairo::Context,
+    width: f64,
+    top: f64,
+    draw_h: f64,
+    spectrogram: &AudioSpectrogram,
+) {
+    if spectrogram.waveform.is_empty() {
+        return;
+    }
+    let center = top + draw_h * 0.54;
+    let max_amp = draw_h * 0.42;
+    let source_w = spectrogram.waveform.len();
+    let pixel_w = width.ceil().max(1.0) as usize;
+
+    let _ = ctx.save();
+    ctx.rectangle(0.0, top, width, draw_h);
+    ctx.clip();
+    ctx.set_source_rgba(0.70, 0.90, 0.96, 0.42);
+    ctx.move_to(0.0, center);
+    for px in 0..=pixel_w {
+        let (start, end) = source_range_for_pixel(px, pixel_w, source_w);
+        let amplitude = spectrogram.waveform[start..end]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0) as f64
+            / 255.0;
+        let y = center - amplitude * max_amp;
+        ctx.line_to(px as f64, y);
+    }
+    for px in (0..=pixel_w).rev() {
+        let (start, end) = source_range_for_pixel(px, pixel_w, source_w);
+        let amplitude = spectrogram.waveform[start..end]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0) as f64
+            / 255.0;
+        let y = center + amplitude * max_amp;
+        ctx.line_to(px as f64, y);
+    }
+    ctx.close_path();
+    let _ = ctx.fill();
+
+    ctx.set_source_rgba(0.86, 0.98, 1.0, 0.70);
+    ctx.set_line_width(1.0);
+    ctx.move_to(0.0, center);
+    for px in 0..=pixel_w {
+        let (start, end) = source_range_for_pixel(px, pixel_w, source_w);
+        let amplitude = spectrogram.waveform[start..end]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0) as f64
+            / 255.0;
+        ctx.line_to(px as f64, center - amplitude * max_amp);
+    }
+    let _ = ctx.stroke();
+    let _ = ctx.restore();
+}
+
+fn source_range_for_pixel(px: usize, pixel_w: usize, source_w: usize) -> (usize, usize) {
+    let start = px.saturating_mul(source_w) / pixel_w.max(1);
+    let end = ((px + 1).saturating_mul(source_w) / pixel_w.max(1) + 1).min(source_w);
+    (
+        start.min(source_w.saturating_sub(1)),
+        end.max(start + 1).min(source_w),
+    )
 }
 
 fn clear_fixed(fixed: &Fixed) {

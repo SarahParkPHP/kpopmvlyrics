@@ -9,8 +9,8 @@ struct AppError: LocalizedError {
 
 let autoQuality = "auto"
 
-/// The app's single observable view-model. Mirrors the state and actions of the
-/// legacy React `App.tsx`, but talks to the Rust core through `CoreClient`.
+/// The app's single observable view-model. It talks to the Rust core through
+/// `CoreClient`.
 @MainActor
 final class AppState: ObservableObject {
     @Published var url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
@@ -78,7 +78,7 @@ final class AppState: ObservableObject {
 
     var reviewCount: Int { alignment.filter { $0.needsReview }.count }
 
-    // MARK: - Actions (mirror App.tsx)
+    // MARK: - Actions
 
     func resolveVideo() {
         let url = self.url

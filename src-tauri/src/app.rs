@@ -9,6 +9,7 @@ use crate::asr::{
     asr_available, asr_caption_lines, asr_setup_hint, effective_asr_model, forced_align_language,
     transcribe_video, AsrModelSize, AsrTranscript,
 };
+use crate::audio_visual;
 use crate::captions::{parse_caption_text, CaptionProvider, YouTubeCaptionProvider};
 use crate::db::Repository;
 use crate::log::{progress, verbose, PhaseGuard};
@@ -41,6 +42,7 @@ const ASR_DEMUCS_SETTING: &str = "asr_demucs_enabled";
 const ACCURACY_RETRY_THRESHOLD: f64 = 0.6;
 const ASR_API_KEY_PREFIX: &str = "asr_api_key_";
 const ASR_BASE_URL_PREFIX: &str = "asr_base_url_";
+const THEME_SETTING: &str = "gtk_theme";
 
 impl AppContext {
     pub fn open() -> Result<Self, String> {
@@ -102,6 +104,15 @@ impl AppContext {
         self.set_user_setting(&format!("{ASR_BASE_URL_PREFIX}{provider}"), value)
     }
 
+    pub fn theme_preference(&self) -> String {
+        self.user_setting(THEME_SETTING)
+            .unwrap_or_else(|| "system".to_string())
+    }
+
+    pub fn set_theme_preference(&self, value: &str) -> Result<(), String> {
+        self.set_user_setting(THEME_SETTING, value)
+    }
+
     fn user_setting(&self, key: &str) -> Option<String> {
         self.repo
             .lock()
@@ -125,6 +136,14 @@ impl AppContext {
 
     pub fn resolve_stream(&self, url: &str, format_id: Option<&str>) -> Result<StreamSpec, String> {
         video::resolve_stream_spec_inner(url, format_id).map_err(to_string)
+    }
+
+    pub fn build_timeline_spectrogram(
+        &self,
+        video_id: &str,
+        url: &str,
+    ) -> Result<AudioSpectrogram, String> {
+        audio_visual::build_timeline_spectrogram(video_id, url).map_err(to_string)
     }
 
     pub fn fetch_lyrics(&self, query: &str) -> Result<SongPackage, String> {
@@ -994,5 +1013,4 @@ mod tests {
         );
     }
 }
-
 

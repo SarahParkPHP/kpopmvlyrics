@@ -42,7 +42,9 @@ strsim = "0.11"
 rayon = "1.10"
 url = "2"
 gstreamer = "0.25"
+gstreamer-app = "0.25"
 gstreamer-video = "0.25"
+spectrs = { version = "0.2.1", default-features = false }
 uniffi = { version = "0.28", optional = true, features = ["cli"] }
 
 # GTK/gstreamer native desktop path: Linux and the BSDs.

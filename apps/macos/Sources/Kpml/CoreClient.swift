@@ -2,8 +2,7 @@ import Foundation
 
 /// Thin, type-safe Swift wrapper over the UniFFI-generated `Core`.
 ///
-/// Structured data crosses as JSON (the same `invoke(name, args) -> json` shape
-/// the core uses), so this layer mirrors the old `tauri.ts` `api` object. The
+/// Structured data crosses as JSON through the shared command surface. The
 /// underlying Rust `Core` is `Send + Sync`, so this is safe to call off the main
 /// actor (`@unchecked Sendable`).
 final class CoreClient: @unchecked Sendable {

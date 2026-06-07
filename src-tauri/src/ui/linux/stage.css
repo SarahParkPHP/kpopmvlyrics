@@ -3,6 +3,14 @@
   border-radius: 8px;
 }
 
+.kpml-theme-dark .lyric-stage-panel {
+  background-color: #1f2328;
+}
+
+.kpml-theme-light .lyric-stage-panel {
+  background-color: #f7f7f7;
+}
+
 .lyric-current-panel {
   min-height: 0;
   padding: 10px 24px 16px 24px;
@@ -16,6 +24,10 @@ label.lyric-current-text {
 
 .lyric-empty-message {
   color: #666666;
+}
+
+.kpml-theme-dark .lyric-empty-message {
+  color: #aeb7c2;
 }
 
 .member-strip {
@@ -80,11 +92,23 @@ label.lyric-current-text {
   border-right: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.kpml-theme-light .timeline-headers {
+  background-color: #20242a;
+}
+
 .timeline-track-header {
   color: #cfcfcf;
   font-weight: 700;
   font-size: 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.timeline-audio-header {
+  color: #dcecf4;
+  font-weight: 800;
+  font-size: 12px;
+  background-color: #172026;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.10);
 }
 
 .timeline-ruler-label {

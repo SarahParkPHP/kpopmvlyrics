@@ -5,12 +5,11 @@ mod pipeline;
 mod hw_decode;
 
 pub use events::PlaybackEvents;
+pub(crate) use pipeline::ensure_gstreamer;
 
 // Building blocks the reusable native player thread drives directly.
 #[cfg(native_frontend)]
-pub(crate) use pipeline::{
-    ensure_gstreamer, set_video_overlay_handle, set_video_overlay_rectangle, PlaybackEngine,
-};
+pub(crate) use pipeline::{set_video_overlay_handle, set_video_overlay_rectangle, PlaybackEngine};
 
 #[cfg(native_frontend)]
 mod native_player;
