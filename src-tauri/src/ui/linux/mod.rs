@@ -18,7 +18,7 @@ use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, CssProvider, Entry,
     EventControllerKey, Frame, Label, Orientation, Paned, Revealer, RevealerTransitionType,
-    ScrolledWindow,
+    ScrolledWindow, Stack, StackSwitcher,
 };
 
 use crate::align::has_playback_timing;
@@ -33,7 +33,7 @@ use crate::player::PlaybackEvents;
 
 use editor::{
     build_editor_panel, connect_editor_handlers, pick_member_image, resolve_video_chain,
-    EditorWidgets,
+    EditorWidgets, EDITOR_PAGE, PLAYBACK_PAGE,
 };
 use lyrics::{compute_lyric_stage_content, lyric_content_key, LyricStage, LyricStageContent};
 use video_overlay::{build_video_overlay, VideoOverlay};
@@ -292,6 +292,7 @@ struct UiView {
     clock_label: Label,
     lyric_box: GtkBox,
     member_box: GtkBox,
+    main_stack: Stack,
     quality_combo: IdDropDown,
     asr_model_combo: IdDropDown,
     settings_revealer: Revealer,
@@ -408,14 +409,12 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let open_button = Button::with_label("Open");
     let stream_button = Button::with_label("Stream");
     let settings_button = Button::with_label("Settings");
-    let editor_button = Button::with_label("Editor");
 
     let toolbar = GtkBox::new(Orientation::Horizontal, 6);
     toolbar.append(&url_entry);
     toolbar.append(&quality_combo.widget);
     toolbar.append(&open_button);
     toolbar.append(&settings_button);
-    toolbar.append(&editor_button);
 
     let member_scroll = ScrolledWindow::new();
     member_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
@@ -582,23 +581,33 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     settings_panel.append(&status_label);
 
     let editor_build = build_editor_panel();
-    let editor_revealer = editor_build.revealer.clone();
-    // The editor panel contains vexpanding scrolled windows, and GtkRevealer
-    // propagates its child's expand flag upward even while collapsed. Without an
-    // explicit vexpand(false) the closed revealer keeps claiming a share of the
-    // top box's spare vertical space, leaving a tall grey band below the lyrics.
-    editor_revealer.set_vexpand(false);
+    editor_build.panel.set_vexpand(true);
     let settings_revealer = Revealer::new();
     settings_revealer.set_transition_type(RevealerTransitionType::SlideDown);
     settings_revealer.set_reveal_child(false);
     settings_revealer.set_child(Some(&settings_panel));
 
+    // Playback page: member portraits + language/clock toolbar + lyrics stage.
+    let playback_page = GtkBox::new(Orientation::Vertical, 8);
+    playback_page.append(&member_scroll);
+    playback_page.append(&stage_toolbar);
+    playback_page.append(&lyric_frame);
+
+    // Tabs: "Playback" (above) and "Editor" replace each other in this stack, so
+    // the editor takes over the member/lyrics area instead of stacking below it.
+    let main_stack = Stack::new();
+    main_stack.set_vexpand(true);
+    main_stack.add_titled(&playback_page, Some(PLAYBACK_PAGE), "Playback");
+    main_stack.add_titled(&editor_build.panel, Some(EDITOR_PAGE), "Editor");
+
+    let stack_switcher = StackSwitcher::new();
+    stack_switcher.set_stack(Some(&main_stack));
+    stack_switcher.set_halign(gtk::Align::Center);
+
     top.append(&toolbar);
-    top.append(&member_scroll);
-    top.append(&stage_toolbar);
-    top.append(&lyric_frame);
+    top.append(&stack_switcher);
+    top.append(&main_stack);
     top.append(&settings_revealer);
-    top.append(&editor_revealer);
 
     let video_box = player.borrow().video_widget().clone();
     video_box.set_vexpand(true);
@@ -631,6 +640,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         clock_label: clock_label.clone(),
         lyric_box: lyric_box.clone(),
         member_box: member_box.clone(),
+        main_stack: main_stack.clone(),
         quality_combo: quality_combo.clone(),
         asr_model_combo: asr_model_combo.clone(),
         // NB: IdDropDown::clone copies the same underlying StringList + ids so
@@ -641,7 +651,6 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         roman_toggle: roman_toggle.clone(),
         english_toggle: english_toggle.clone(),
         editor: EditorWidgets {
-            revealer: editor_build.widgets.revealer.clone(),
             timeline: Rc::clone(&editor_build.widgets.timeline),
             render_key: Rc::new(RefCell::new(String::new())),
         },
@@ -816,7 +825,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     video_overlay.connect_handlers(&view);
 
-    connect_editor_handlers(&view, &window, work_tx, &editor_build, &editor_button);
+    connect_editor_handlers(&view, &window, work_tx, &editor_build, &main_stack);
 
     {
         let view = Rc::clone(&view);
@@ -911,7 +920,7 @@ impl UiView {
         render_status(&self.status_label, &model);
         self.video_overlay
             .update_seek_bar(model.current_ms, model.duration_ms);
-        if self.editor.revealer.reveals_child() {
+        if self.editor_visible() {
             self.editor.timeline.set_playhead(model.current_ms);
         }
         self.sync_active_line(&model);

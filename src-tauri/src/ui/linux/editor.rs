@@ -7,8 +7,7 @@ use std::rc::Rc;
 use gtk::gio;
 use gtk::prelude::*;
 use gtk::{
-    ApplicationWindow, Box as GtkBox, Button, Label, Orientation, Revealer, ScrolledWindow,
-    TextView,
+    ApplicationWindow, Box as GtkBox, Button, Orientation, ScrolledWindow, Stack, TextView, Window,
 };
 
 use crate::app::{shift_alignment, DEFAULT_MANUAL_CAPTIONS, DEFAULT_MANUAL_LYRICS};
@@ -21,13 +20,13 @@ use super::timeline::Timeline;
 use super::{spawn_work, BackgroundUpdate, UiModel, UiView, WorkerSnapshot};
 
 pub struct EditorWidgets {
-    pub revealer: Revealer,
     pub timeline: Rc<Timeline>,
     pub render_key: Rc<RefCell<String>>,
 }
 
 pub struct EditorBuild {
-    pub revealer: Revealer,
+    /// The editor page content, added to the main stack as the "Editor" tab.
+    pub panel: GtkBox,
     pub widgets: EditorWidgets,
     pub import_lyrics_button: Button,
     pub import_captions_button: Button,
@@ -35,42 +34,13 @@ pub struct EditorBuild {
     pub shift_forward_button: Button,
     pub save_button: Button,
     pub export_json_button: Button,
-    pub lyrics_view: TextView,
-    pub captions_view: TextView,
 }
 
 pub fn build_editor_panel() -> EditorBuild {
     let panel = GtkBox::new(Orientation::Vertical, 8);
 
-    let import_row = GtkBox::new(Orientation::Horizontal, 8);
-    import_row.set_homogeneous(true);
-
-    let lyrics_frame = GtkBox::new(Orientation::Vertical, 4);
-    lyrics_frame.set_hexpand(true);
-    lyrics_frame.append(&Label::new(Some("Manual lyrics")));
-    let lyrics_scroll = ScrolledWindow::new();
-    lyrics_scroll.set_min_content_height(100);
-    lyrics_scroll.set_vexpand(true);
-    let lyrics_view = TextView::new();
-    lyrics_view.buffer().set_text(DEFAULT_MANUAL_LYRICS);
-    lyrics_scroll.set_child(Some(&lyrics_view));
-    lyrics_frame.append(&lyrics_scroll);
-
-    let captions_frame = GtkBox::new(Orientation::Vertical, 4);
-    captions_frame.set_hexpand(true);
-    captions_frame.append(&Label::new(Some("Manual captions")));
-    let captions_scroll = ScrolledWindow::new();
-    captions_scroll.set_min_content_height(100);
-    captions_scroll.set_vexpand(true);
-    let captions_view = TextView::new();
-    captions_view.buffer().set_text(DEFAULT_MANUAL_CAPTIONS);
-    captions_scroll.set_child(Some(&captions_view));
-    captions_frame.append(&captions_scroll);
-
-    import_row.append(&lyrics_frame);
-    import_row.append(&captions_frame);
-    panel.append(&import_row);
-
+    // Manual lyrics/captions text now live in modal dialogs (opened by the
+    // Import buttons) instead of permanently occupying the editor page.
     let import_actions = GtkBox::new(Orientation::Horizontal, 6);
     let import_lyrics_button = Button::with_label("Import Lyrics");
     let import_captions_button = Button::with_label("Import Captions");
@@ -89,14 +59,9 @@ pub fn build_editor_panel() -> EditorBuild {
     let timeline = Timeline::new();
     panel.append(&timeline.root);
 
-    let revealer = Revealer::new();
-    revealer.set_reveal_child(false);
-    revealer.set_child(Some(&panel));
-
     EditorBuild {
-        revealer: revealer.clone(),
+        panel,
         widgets: EditorWidgets {
-            revealer,
             timeline,
             render_key: Rc::new(RefCell::new(String::new())),
         },
@@ -106,9 +71,67 @@ pub fn build_editor_panel() -> EditorBuild {
         shift_forward_button,
         save_button,
         export_json_button,
-        lyrics_view,
-        captions_view,
     }
+}
+
+/// Modal text-entry dialog used to paste manual lyrics or captions. Calls
+/// `on_import` with the entered text when the user confirms.
+fn open_text_import_dialog(
+    parent: &ApplicationWindow,
+    title: &str,
+    initial_text: &str,
+    on_import: impl Fn(String) + 'static,
+) {
+    let dialog = Window::builder()
+        .title(title)
+        .transient_for(parent)
+        .modal(true)
+        .default_width(560)
+        .default_height(440)
+        .build();
+
+    let layout = GtkBox::new(Orientation::Vertical, 8);
+    layout.set_margin_top(12);
+    layout.set_margin_bottom(12);
+    layout.set_margin_start(12);
+    layout.set_margin_end(12);
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    let text_view = TextView::new();
+    text_view.set_wrap_mode(gtk::WrapMode::WordChar);
+    text_view.set_monospace(true);
+    text_view.buffer().set_text(initial_text);
+    scroll.set_child(Some(&text_view));
+    layout.append(&scroll);
+
+    let actions = GtkBox::new(Orientation::Horizontal, 6);
+    actions.set_halign(gtk::Align::End);
+    let cancel_button = Button::with_label("Cancel");
+    let import_button = Button::with_label("Import");
+    import_button.add_css_class("suggested-action");
+    actions.append(&cancel_button);
+    actions.append(&import_button);
+    layout.append(&actions);
+
+    dialog.set_child(Some(&layout));
+
+    {
+        let dialog = dialog.clone();
+        cancel_button.connect_clicked(move |_| dialog.close());
+    }
+    {
+        let dialog = dialog.clone();
+        import_button.connect_clicked(move |_| {
+            let buffer = text_view.buffer();
+            let (start, end) = buffer.bounds();
+            let text = buffer.text(&start, &end, true).to_string();
+            on_import(text);
+            dialog.close();
+        });
+    }
+
+    dialog.present();
 }
 
 pub fn connect_editor_handlers(
@@ -116,19 +139,17 @@ pub fn connect_editor_handlers(
     window: &ApplicationWindow,
     work_tx: std::sync::mpsc::Sender<BackgroundUpdate>,
     build: &EditorBuild,
-    editor_button: &Button,
+    main_stack: &Stack,
 ) {
     // Wire the timeline interactions (need the live view).
     build.widgets.timeline.connect(view);
     build.widgets.timeline.connect_seek(view);
 
+    // Lay out the timeline whenever the Editor tab becomes visible.
     {
         let view = Rc::clone(view);
-        let revealer = build.widgets.revealer.clone();
-        editor_button.connect_clicked(move |_| {
-            let open = !revealer.reveals_child();
-            revealer.set_reveal_child(open);
-            if open {
+        main_stack.connect_visible_child_notify(move |stack| {
+            if stack.visible_child_name().as_deref() == Some(EDITOR_PAGE) {
                 view.render_editor_table();
             } else {
                 *view.editor.render_key.borrow_mut() = String::new();
@@ -138,54 +159,62 @@ pub fn connect_editor_handlers(
 
     {
         let view = Rc::clone(view);
-        let lyrics_view = build.lyrics_view.clone();
+        let window = window.clone();
         let work_tx = work_tx.clone();
         build.import_lyrics_button.connect_clicked(move |_| {
-            let buffer = lyrics_view.buffer();
-            let (start, end) = buffer.bounds();
-            let text = buffer.text(&start, &end, true).to_string();
-            let query = view.model.borrow().query.clone();
-            let title = if query.is_empty() {
-                "Imported Song".to_string()
-            } else {
-                query.clone()
-            };
-            let artist = query
-                .split_whitespace()
-                .next()
-                .unwrap_or("Imported Group")
-                .to_string();
             let view = Rc::clone(&view);
-            spawn_work(work_tx.clone(), view, "Lyric import", move |snapshot| {
-                let package = snapshot.ctx.import_lyrics(&text, &title, &artist)?;
-                Ok(Box::new(move |model: &mut UiModel| {
-                    model.song = Some(package);
-                    model.editor_table_dirty = true;
-                }) as Box<dyn FnOnce(&mut UiModel) + Send>)
+            let work_tx = work_tx.clone();
+            open_text_import_dialog(&window, "Import lyrics", DEFAULT_MANUAL_LYRICS, move |text| {
+                let query = view.model.borrow().query.clone();
+                let title = if query.is_empty() {
+                    "Imported Song".to_string()
+                } else {
+                    query.clone()
+                };
+                let artist = query
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("Imported Group")
+                    .to_string();
+                let view = Rc::clone(&view);
+                spawn_work(work_tx.clone(), view, "Lyric import", move |snapshot| {
+                    let package = snapshot.ctx.import_lyrics(&text, &title, &artist)?;
+                    Ok(Box::new(move |model: &mut UiModel| {
+                        model.song = Some(package);
+                        model.editor_table_dirty = true;
+                    }) as Box<dyn FnOnce(&mut UiModel) + Send>)
+                });
             });
         });
     }
 
     {
         let view = Rc::clone(view);
-        let captions_view = build.captions_view.clone();
+        let window = window.clone();
         let work_tx = work_tx.clone();
         build.import_captions_button.connect_clicked(move |_| {
-            let buffer = captions_view.buffer();
-            let (start, end) = buffer.bounds();
-            let text = buffer.text(&start, &end, true).to_string();
             let view = Rc::clone(&view);
-            spawn_work(work_tx.clone(), view, "Caption import", move |snapshot| {
-                let video_id = snapshot
-                    .metadata
-                    .as_ref()
-                    .map(|meta| meta.video_id.clone())
-                    .ok_or_else(|| "Resolve a YouTube URL first".to_string())?;
-                let captions = snapshot.ctx.import_captions(&video_id, &text)?;
-                Ok(Box::new(move |model: &mut UiModel| {
-                    model.captions = captions;
-                }) as Box<dyn FnOnce(&mut UiModel) + Send>)
-            });
+            let work_tx = work_tx.clone();
+            open_text_import_dialog(
+                &window,
+                "Import captions",
+                DEFAULT_MANUAL_CAPTIONS,
+                move |text| {
+                    let view = Rc::clone(&view);
+                    spawn_work(work_tx.clone(), view, "Caption import", move |snapshot| {
+                        let video_id = snapshot
+                            .metadata
+                            .as_ref()
+                            .map(|meta| meta.video_id.clone())
+                            .ok_or_else(|| "Resolve a YouTube URL first".to_string())?;
+                        let captions = snapshot.ctx.import_captions(&video_id, &text)?;
+                        Ok(Box::new(move |model: &mut UiModel| {
+                            model.captions = captions;
+                        })
+                            as Box<dyn FnOnce(&mut UiModel) + Send>)
+                    });
+                },
+            );
         });
     }
 
@@ -267,11 +296,21 @@ pub fn connect_editor_handlers(
     }
 }
 
+/// Stack page name for the editor tab (shared by the switcher and visibility checks).
+pub const EDITOR_PAGE: &str = "editor";
+/// Stack page name for the playback tab (member photos + lyrics).
+pub const PLAYBACK_PAGE: &str = "playback";
+
 impl UiView {
+    /// Whether the Editor tab is currently the visible stack page.
+    pub fn editor_visible(&self) -> bool {
+        self.main_stack.visible_child_name().as_deref() == Some(EDITOR_PAGE)
+    }
+
     /// Relayout the timeline editor when its contents changed. Named
     /// `render_editor_table` for historical call sites (the tick loop, editor open).
     pub fn render_editor_table(&self) {
-        if !self.editor.revealer.reveals_child() {
+        if !self.editor_visible() {
             return;
         }
         let Some(view) = self.this.borrow().clone() else {
