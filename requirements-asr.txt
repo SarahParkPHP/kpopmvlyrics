@@ -2,3 +2,6 @@ qwen-asr>=0.0.6
 demucs>=4.0.1
 soynlp>=0.0.493
 numpy>=1.20
+# NOTE: demucs depends on torchaudio (+ torchcodec). setup-asr.sh installs the
+# CPU torchaudio build and torchcodec separately so torchaudio's CUDA-version
+# check doesn't fail against the system PyTorch — do not add torchaudio here.

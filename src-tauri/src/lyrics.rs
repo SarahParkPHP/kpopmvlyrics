@@ -12,6 +12,84 @@ use crate::process_util::http_client;
 
 pub trait LyricsProvider {
     fn fetch(&self, query: &str) -> Result<SongPackage>;
+
+    /// Fetch along with a 0..N match confidence for the query, used to pick the
+    /// best provider when several return results. Defaults to a neutral score.
+    fn fetch_scored(&self, query: &str) -> Result<(f64, SongPackage)> {
+        self.fetch(query).map(|package| (0.0, package))
+    }
+}
+
+/// A color-coded-lyrics WordPress site. Both colorcodedlyrics.com and
+/// colorcodedheaven.com share the same `/?s=` search and lyric markup, so they
+/// reuse all of the parsing/ranking helpers below — only the host differs.
+struct CclSite {
+    domain: &'static str,
+    base_url: &'static str,
+    provider: &'static str,
+}
+
+const CCL_SITE: CclSite = CclSite {
+    domain: "colorcodedlyrics.com",
+    base_url: "https://colorcodedlyrics.com",
+    provider: "colorcodedlyrics",
+};
+
+const CCH_SITE: CclSite = CclSite {
+    domain: "colorcodedheaven.com",
+    base_url: "https://colorcodedheaven.com",
+    provider: "colorcodedheaven",
+};
+
+/// A color-coded match scoring at or above this is taken as correct without
+/// consulting further sources (see `AppContext::fetch_lyrics`).
+pub const LYRICS_CONFIDENT_SCORE: f64 = 2.0;
+
+/// Baseline confidence for a Genius result, which carries no title-match score.
+/// Set so Genius beats a clearly-wrong color-coded match (negative score) but
+/// loses to a genuine one.
+pub const GENIUS_BASELINE_SCORE: f64 = 0.5;
+
+fn fetch_ccl_scored(
+    client: &Client,
+    site: &CclSite,
+    query: &str,
+) -> Result<(f64, SongPackage)> {
+    let mut best: Option<(f64, String)> = None;
+    let mut consider = |score: f64, link: String| {
+        if best
+            .as_ref()
+            .map(|(best_score, _)| score > *best_score)
+            .unwrap_or(true)
+        {
+            best = Some((score, link));
+        }
+    };
+
+    for search_query in lyrics_search_queries(query) {
+        let search_url = format!("{}/?s={}", site.base_url, urlencoding(&search_query));
+        let search_html = client.get(search_url).send()?.text()?;
+        let document = Html::parse_document(&search_html);
+        if let Some((score, link)) = rank_best_colorcodedlyrics_link(&document, query, site.domain)
+        {
+            consider(score, link);
+        }
+    }
+
+    // wp-json slug lookup (available on colorcodedlyrics; gracefully no-ops where
+    // the REST API is disabled, e.g. colorcodedheaven).
+    for slug in colorcodedlyrics_slug_candidates(query) {
+        if let Some((link, title)) = lookup_colorcodedlyrics_by_slug(client, &slug, site.base_url) {
+            let score = score_colorcodedlyrics_match(query, &title, &link);
+            consider(score, link);
+        }
+    }
+
+    let (score, link) =
+        best.ok_or_else(|| anyhow!("{} result not found for {query}", site.provider))?;
+    let html = client.get(&link).send()?.text()?;
+    let package = parse_colorcodedlyrics_html_with_provider(&html, Some(link), site.provider)?;
+    Ok((score, package))
 }
 
 pub struct ColorCodedLyricsProvider {
@@ -28,40 +106,33 @@ impl Default for ColorCodedLyricsProvider {
 
 impl LyricsProvider for ColorCodedLyricsProvider {
     fn fetch(&self, query: &str) -> Result<SongPackage> {
-        let mut best: Option<(f64, String)> = None;
-        let mut consider = |score: f64, link: String| {
-            if best
-                .as_ref()
-                .map(|(best_score, _)| score > *best_score)
-                .unwrap_or(true)
-            {
-                best = Some((score, link));
-            }
-        };
+        self.fetch_scored(query).map(|(_, package)| package)
+    }
 
-        for search_query in lyrics_search_queries(query) {
-            let search_url = format!(
-                "https://colorcodedlyrics.com/?s={}",
-                urlencoding(&search_query)
-            );
-            let search_html = self.client.get(search_url).send()?.text()?;
-            let document = Html::parse_document(&search_html);
-            if let Some((score, link)) = rank_best_colorcodedlyrics_link(&document, query) {
-                consider(score, link);
-            }
+    fn fetch_scored(&self, query: &str) -> Result<(f64, SongPackage)> {
+        fetch_ccl_scored(&self.client, &CCL_SITE, query)
+    }
+}
+
+pub struct ColorCodedHeavenProvider {
+    client: Client,
+}
+
+impl Default for ColorCodedHeavenProvider {
+    fn default() -> Self {
+        Self {
+            client: http_client("kpopmvlyrics/0.1"),
         }
+    }
+}
 
-        for slug in colorcodedlyrics_slug_candidates(query) {
-            if let Some((link, title)) = lookup_colorcodedlyrics_by_slug(&self.client, &slug) {
-                let score = score_colorcodedlyrics_match(query, &title, &link);
-                consider(score, link);
-            }
-        }
+impl LyricsProvider for ColorCodedHeavenProvider {
+    fn fetch(&self, query: &str) -> Result<SongPackage> {
+        self.fetch_scored(query).map(|(_, package)| package)
+    }
 
-        let (_, link) =
-            best.ok_or_else(|| anyhow!("ColorCodedLyrics result not found for {query}"))?;
-        let html = self.client.get(&link).send()?.text()?;
-        parse_colorcodedlyrics_html(&html, Some(link))
+    fn fetch_scored(&self, query: &str) -> Result<(f64, SongPackage)> {
+        fetch_ccl_scored(&self.client, &CCH_SITE, query)
     }
 }
 
@@ -91,6 +162,10 @@ impl LyricsProvider for GeniusProvider {
         let page = self.client.get(link).send()?.text()?;
         parse_genius_html(&page, Some(link.to_string()))
     }
+
+    fn fetch_scored(&self, query: &str) -> Result<(f64, SongPackage)> {
+        self.fetch(query).map(|package| (GENIUS_BASELINE_SCORE, package))
+    }
 }
 
 pub fn parse_manual_lyrics(raw_text: &str, title: &str, artist: &str) -> Result<SongPackage> {
@@ -112,13 +187,26 @@ pub fn parse_manual_lyrics(raw_text: &str, title: &str, artist: &str) -> Result<
     })
 }
 
-pub fn parse_colorcodedlyrics_html(html: &str, source_url: Option<String>) -> Result<SongPackage> {
+pub fn parse_colorcodedlyrics_html_with_provider(
+    html: &str,
+    source_url: Option<String>,
+    provider: &str,
+) -> Result<SongPackage> {
     let document = Html::parse_document(html);
-    let title_selector = Selector::parse("h1.entry-title, h1").unwrap();
-    let title = document
-        .select(&title_selector)
-        .next()
-        .map(|node| node.text().collect::<Vec<_>>().join(" "))
+    // Prefer the post title (`.entry-title`) over a bare `<h1>` — on
+    // colorcodedheaven the first `<h1>` is the site branding, so a union
+    // selector would pick "Color Coded Heaven" instead of the song.
+    let title = ["h1.entry-title", ".entry-title", "h1"]
+        .iter()
+        .filter_map(|selector| Selector::parse(selector).ok())
+        .find_map(|selector| {
+            document
+                .select(&selector)
+                .next()
+                .map(|node| node.text().collect::<String>())
+        })
+        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|title| !title.is_empty())
         .unwrap_or_else(|| "Untitled".to_string());
 
     let content_html = first_selector_html(&document, &[".entry-content", "article", "body"])
@@ -139,7 +227,7 @@ pub fn parse_colorcodedlyrics_html(html: &str, source_url: Option<String>) -> Re
         },
         members: members_for_lines(&lines, &color_members),
         lines,
-        provider: "colorcodedlyrics".into(),
+        provider: provider.to_string(),
     })
 }
 
@@ -711,7 +799,26 @@ struct ParsedSegment {
     color: Option<String>,
 }
 
+/// Which lyric language a column holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnLang {
+    Romanization,
+    Hangul,
+    Translation,
+}
+
 fn parse_colorcodedlyrics_columns(
+    html: &str,
+    color_to_member: &std::collections::HashMap<String, String>,
+) -> Option<Vec<LyricLine>> {
+    // colorcodedlyrics labels each column inline (first <p> is "Hangul" etc.);
+    // colorcodedheaven puts the labels in a separate header row. Try the inline
+    // layout first, then fall back to the header-row layout.
+    parse_columns_inline_markers(html, color_to_member)
+        .or_else(|| parse_columns_header_row(html, color_to_member))
+}
+
+fn parse_columns_inline_markers(
     html: &str,
     color_to_member: &std::collections::HashMap<String, String>,
 ) -> Option<Vec<LyricLine>> {
@@ -733,6 +840,106 @@ fn parse_colorcodedlyrics_columns(
         }
     }
 
+    build_lines_from_language_groups(romanization, hangul, translation, color_to_member)
+}
+
+/// Header-row column layout (colorcodedheaven): a `wp-block-columns` row whose
+/// columns are bare language labels, followed by one or more lyric rows whose
+/// columns map positionally to that order.
+fn parse_columns_header_row(
+    html: &str,
+    color_to_member: &std::collections::HashMap<String, String>,
+) -> Option<Vec<LyricLine>> {
+    let document = Html::parse_fragment(html);
+    let block_selector = Selector::parse(".wp-block-columns").ok()?;
+
+    let mut romanization: Vec<Vec<ParsedColumnLine>> = Vec::new();
+    let mut hangul: Vec<Vec<ParsedColumnLine>> = Vec::new();
+    let mut translation: Vec<Vec<ParsedColumnLine>> = Vec::new();
+    let mut order: Option<Vec<ColumnLang>> = None;
+
+    for block in document.select(&block_selector) {
+        let columns = direct_child_columns(block);
+        if columns.len() < 2 {
+            continue;
+        }
+
+        if order.is_none() {
+            let labels: Vec<Option<ColumnLang>> =
+                columns.iter().map(|col| column_language_label(*col)).collect();
+            if labels.iter().all(Option::is_some) {
+                order = Some(labels.into_iter().flatten().collect());
+                continue;
+            }
+        }
+
+        let Some(order) = order.as_ref() else {
+            continue;
+        };
+        if columns.len() != order.len() {
+            continue;
+        }
+        for (column, lang) in columns.iter().zip(order.iter()) {
+            let groups = column_line_groups(*column);
+            if groups.is_empty() {
+                continue;
+            }
+            match lang {
+                ColumnLang::Romanization => romanization.extend(groups),
+                ColumnLang::Hangul => hangul.extend(groups),
+                ColumnLang::Translation => translation.extend(groups),
+            }
+        }
+    }
+
+    build_lines_from_language_groups(romanization, hangul, translation, color_to_member)
+}
+
+/// Direct `.wp-block-column` children of a columns block (avoids descending into
+/// nested column blocks; distinguishes the column token from `wp-block-columns`).
+fn direct_child_columns(block: ElementRef<'_>) -> Vec<ElementRef<'_>> {
+    block
+        .children()
+        .filter_map(ElementRef::wrap)
+        .filter(|el| el.value().classes().any(|class| class == "wp-block-column"))
+        .collect()
+}
+
+fn column_language_label(column: ElementRef<'_>) -> Option<ColumnLang> {
+    let text = column.text().collect::<String>();
+    match text.trim().to_lowercase().as_str() {
+        "romanization" | "romaja" => Some(ColumnLang::Romanization),
+        "hangul" | "korean" | "japanese" | "original" => Some(ColumnLang::Hangul),
+        "english" | "translation" => Some(ColumnLang::Translation),
+        _ => None,
+    }
+}
+
+/// Per-paragraph line groups from a lyric column (no leading language marker).
+fn column_line_groups(column: ElementRef<'_>) -> Vec<Vec<ParsedColumnLine>> {
+    let Ok(paragraph_selector) = Selector::parse("p") else {
+        return Vec::new();
+    };
+    let mut groups = Vec::new();
+    for paragraph in column.select(&paragraph_selector) {
+        let marker = strip_tags(&paragraph.html()).trim().to_lowercase();
+        if marker.contains("credits") || marker.contains("disclaimer") {
+            break;
+        }
+        let lines = parsed_lines_from_block(&paragraph.inner_html());
+        if !lines.is_empty() {
+            groups.push(lines);
+        }
+    }
+    groups
+}
+
+fn build_lines_from_language_groups(
+    romanization: Vec<Vec<ParsedColumnLine>>,
+    hangul: Vec<Vec<ParsedColumnLine>>,
+    translation: Vec<Vec<ParsedColumnLine>>,
+    color_to_member: &std::collections::HashMap<String, String>,
+) -> Option<Vec<LyricLine>> {
     if romanization.is_empty() && hangul.is_empty() && translation.is_empty() {
         return None;
     }
@@ -1049,14 +1256,22 @@ fn inherit_members_on_segments(line: &mut LyricLine) {
     }
 }
 
-fn rank_best_colorcodedlyrics_link(document: &Html, query: &str) -> Option<(f64, String)> {
+fn rank_best_colorcodedlyrics_link(
+    document: &Html,
+    query: &str,
+    domain: &str,
+) -> Option<(f64, String)> {
     let selector = Selector::parse("h2 a, article a, .entry-title a").ok()?;
 
     document
         .select(&selector)
         .filter_map(|node| {
             let href = node.value().attr("href")?;
-            if !href.contains("colorcodedlyrics.com") {
+            if !href.contains(domain) {
+                return None;
+            }
+            // Skip comment-thread permalinks that WP search also surfaces.
+            if href.contains("/comment-page-") || href.contains("#comment") {
                 return None;
             }
             let text = node.text().collect::<Vec<_>>().join(" ");
@@ -1102,9 +1317,13 @@ struct ColorCodedLyricsPostTitle {
     rendered: String,
 }
 
-fn lookup_colorcodedlyrics_by_slug(client: &Client, slug: &str) -> Option<(String, String)> {
+fn lookup_colorcodedlyrics_by_slug(
+    client: &Client,
+    slug: &str,
+    base_url: &str,
+) -> Option<(String, String)> {
     let url = format!(
-        "https://colorcodedlyrics.com/wp-json/wp/v2/posts?slug={}&_fields=link,title&per_page=1",
+        "{base_url}/wp-json/wp/v2/posts?slug={}&_fields=link,title&per_page=1",
         urlencoding(slug)
     );
     let posts: Vec<ColorCodedLyricsPost> = client.get(url).send().ok()?.json().ok()?;
@@ -1157,6 +1376,20 @@ fn lyrics_search_queries(query: &str) -> Vec<String> {
     let Some(artist) = artist else {
         return dedupe_queries(queries);
     };
+
+    // The raw "Artist(한글) - Title" string confuses WordPress search (the " - "
+    // and glued parenthetical drop the title terms), so emit cleaner variants:
+    // without the separator, with parentheticals stripped, and with the artist's
+    // parenthetical (e.g. the Hangul name) spelled out alongside the clean name.
+    let artist_clean = strip_parentheticals(&artist);
+    let title_clean = strip_parentheticals(&title);
+    queries.push(format!("{artist} {title}"));
+    if !artist_clean.is_empty() && !title_clean.is_empty() {
+        queries.push(format!("{artist_clean} {title_clean}"));
+        for phrase in parenthetical_phrases(&artist) {
+            queries.push(format!("{artist_clean} {phrase} {title_clean}"));
+        }
+    }
 
     for romanization in parenthetical_phrases(&title) {
         queries.push(format!("{artist} {romanization}"));
@@ -1270,11 +1503,23 @@ fn push_search_token(tokens: &mut Vec<String>, token: &str) {
 }
 
 fn token_matches_candidate(token: &str, candidate: &str) -> bool {
+    let compact = token.replace([' ', '-', '_'], "");
+    // Whole-word / slug-segment match (candidate is space-separated search_key text).
+    let word_match = candidate
+        .split(|ch: char| !ch.is_alphanumeric())
+        .any(|word| !word.is_empty() && (word == token || word == compact));
+    if word_match {
+        return true;
+    }
+    // Short tokens ("ro", "ri", "ddi") only count as whole words — substring
+    // matching would wrongly hit them inside unrelated words ("ro" in "drop").
+    if compact.chars().count() <= 3 {
+        return false;
+    }
     if candidate.contains(token) {
         return true;
     }
-    let compact = token.replace([' ', '-', '_'], "");
-    if compact.len() > 2 && candidate.replace([' ', '-', '_'], "").contains(&compact) {
+    if candidate.replace([' ', '-', '_'], "").contains(&compact) {
         return true;
     }
     let hyphenated = token.replace(' ', "-");
@@ -1505,9 +1750,9 @@ mod tests {
     use super::{
         canonicalize_line_member_names, colorcodedlyrics_slug_candidates, ColorCodedLyricsProvider,
         lyric_language_toggles, lyrics_search_queries, member_highlight_for_line, members_for_lines,
-        normalize_line_member_tags, parse_colorcodedlyrics_html, parse_genius_html,
-        parse_manual_lyrics, rank_best_colorcodedlyrics_link, resolve_member_name,
-        score_colorcodedlyrics_match, song_search_tokens, strip_member_line_tag, LyricsProvider,
+        normalize_line_member_tags, parse_colorcodedlyrics_html_with_provider, parse_genius_html, parse_manual_lyrics,
+        rank_best_colorcodedlyrics_link, resolve_member_name, score_colorcodedlyrics_match,
+        song_search_tokens, strip_member_line_tag, LyricsProvider,
     };
     use crate::models::{LyricLine, MemberProfile};
     use scraper::Html;
@@ -1520,10 +1765,45 @@ mod tests {
     }
 
     #[test]
+    fn ranks_colorcodedheaven_search_result_by_domain() {
+        // Real markup shape from colorcodedheaven's /?s= results: a title link plus
+        // comment-thread permalinks that must be ignored.
+        let html = r#"
+            <h2><a href="https://colorcodedheaven.com/2022/03/29/purple-kiss-joah/comment-page-1/#comment-1">noise</a></h2>
+            <h2><a href="https://colorcodedheaven.com/2026/06/01/meovv-ddi-ro-ri/">MEOVV (미야오) – DDI RO RI</a></h2>
+        "#;
+        let document = Html::parse_document(html);
+        let (score, link) =
+            rank_best_colorcodedlyrics_link(&document, "MEOVV DDI RO RI", "colorcodedheaven.com")
+                .unwrap();
+        assert_eq!(link, "https://colorcodedheaven.com/2026/06/01/meovv-ddi-ro-ri/");
+        assert!(score > 1.0, "expected a confident song-token match, got {score}");
+    }
+
+    #[test]
+    fn parses_colorcodedheaven_columns_and_tags_provider() {
+        // colorcodedheaven shares colorcodedlyrics' legend + wp-block-columns markup.
+        let html = r#"<h1 class="entry-title">MEOVV - DDI RO RI</h1>
+            <div class="entry-content">
+            <p style="text-align: center"><span style="color: #c878ff">Sooin</span> | <span style="color: #689fcc">Gawon</span></p>
+            <div class="wp-block-columns"><div class="wp-block-column">Hangul</div><div class="wp-block-column">Romanization</div></div>
+            <div class="wp-block-columns">
+              <div class="wp-block-column"><p><span style="color: #c878ff">안녕</span></p></div>
+              <div class="wp-block-column"><p><span style="color: #c878ff">annyeong</span></p></div>
+            </div>
+            </div>"#;
+        let package =
+            parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedheaven").unwrap();
+        assert_eq!(package.provider, "colorcodedheaven");
+        assert!(!package.lines.is_empty());
+        assert_eq!(package.lines[0].original, "안녕");
+    }
+
+    #[test]
     fn parses_colorcodedlyrics_fixture() {
         let html = r#"<h1 class="entry-title">GROUP - Song Lyrics</h1><div class="entry-content">Jisoo: hello<br/>Jennie: world</div>"#;
         let package =
-            parse_colorcodedlyrics_html(html, Some("https://example.test".into())).unwrap();
+            parse_colorcodedlyrics_html_with_provider(html, Some("https://example.test".into()), "colorcodedlyrics").unwrap();
         assert_eq!(package.song.title, "Song");
         assert_eq!(package.lines.len(), 2);
     }
@@ -1539,7 +1819,7 @@ mod tests {
               <p><strong><span>Credits</span></strong></p>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         assert_eq!(package.members.len(), 2);
         assert_eq!(package.lines.len(), 3);
         assert_eq!(package.lines[0].member.as_deref(), Some("Sakura"));
@@ -1565,7 +1845,7 @@ mod tests {
               <p>metadata should not replace romanized lines</p>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         assert_eq!(package.lines.len(), 2);
         assert_eq!(
             package.lines[0].romanization.as_deref(),
@@ -1601,7 +1881,7 @@ mod tests {
               </div>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         assert_eq!(
             package
                 .members
@@ -1648,7 +1928,7 @@ mod tests {
               </div>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         let then_line = package
             .lines
             .iter()
@@ -1681,7 +1961,7 @@ mod tests {
               </div>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         assert_eq!(package.lines[2].original, "(I don’t doubt it!)");
         assert_eq!(
             package.lines[2].english.as_deref(),
@@ -1716,7 +1996,7 @@ mod tests {
               </div>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         assert_eq!(package.lines.len(), 1);
         assert_eq!(
             package.lines[0].member.as_deref(),
@@ -1759,7 +2039,8 @@ mod tests {
         "#;
         let document = Html::parse_document(html);
         let (_, link) =
-            rank_best_colorcodedlyrics_link(&document, "NMIXX(엔믹스) Heavy Serenade").unwrap();
+            rank_best_colorcodedlyrics_link(&document, "NMIXX(엔믹스) Heavy Serenade", "colorcodedlyrics.com")
+                .unwrap();
         assert!(link.ends_with("/nmixx-heavy-serenade/"));
     }
 
@@ -1771,7 +2052,8 @@ mod tests {
         "#;
         let document = Html::parse_document(html);
         let (_, link) =
-            rank_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)").unwrap();
+            rank_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)", "colorcodedlyrics.com")
+            .unwrap();
         assert!(link.ends_with("/stray-kids-s-class-teug/"));
     }
 
@@ -1789,19 +2071,53 @@ mod tests {
     }
 
     #[test]
+    fn lyrics_search_queries_emit_punctuation_free_variant() {
+        // The raw "Artist(한글) - Title" confuses WordPress search; a clean
+        // "Artist Title" variant must be tried so sites like colorcodedheaven
+        // surface the post.
+        let queries = lyrics_search_queries("MEOVV(미야오) - DDI RO RI");
+        assert!(
+            queries.iter().any(|query| query == "MEOVV DDI RO RI"),
+            "missing clean variant in {queries:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_confidently_match_wrong_same_artist_song() {
+        // The correct song must outscore a different same-artist song, and the
+        // wrong one must not reach the confident threshold (2.0) — short tokens
+        // like "ro"/"ri" must not match inside "drop".
+        let query = "MEOVV(미야오) - DDI RO RI";
+        let right = score_colorcodedlyrics_match(
+            query,
+            "MEOVV - DDI RO RI",
+            "https://colorcodedheaven.com/2026/06/01/meovv-ddi-ro-ri/",
+        );
+        let wrong = score_colorcodedlyrics_match(
+            query,
+            "MEOVV - DROP TOP",
+            "https://colorcodedlyrics.com/2025/06/15/meovv-drop-top/",
+        );
+        assert!(right > wrong, "right={right} wrong={wrong}");
+        assert!(wrong < 2.0, "wrong same-artist song scored confidently: {wrong}");
+    }
+
+    #[test]
     fn ranks_s_class_above_mess_when_both_present() {
         let html = r#"
             <article><h2><a href="https://colorcodedlyrics.com/2025/08/22/stray-kids-mess-eongmang/">Stray Kids - MESS (엉망)</a></h2></article>
             <article><h2><a href="https://colorcodedlyrics.com/2023/06/01/stray-kids-s-class-teug/">Stray Kids - S-Class (특)</a></h2></article>
         "#;
         let document = Html::parse_document(html);
-        let mess = rank_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)").unwrap();
+        let mess = rank_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)", "colorcodedlyrics.com")
+            .unwrap();
         let html = r#"
             <article><h2><a href="https://colorcodedlyrics.com/2025/08/22/stray-kids-mess-eongmang/">Stray Kids - MESS (엉망)</a></h2></article>
         "#;
         let document = Html::parse_document(html);
         let only_mess =
-            rank_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)").unwrap();
+            rank_best_colorcodedlyrics_link(&document, "Stray Kids 특(S-Class)", "colorcodedlyrics.com")
+            .unwrap();
         assert!(mess.0 > only_mess.0);
         assert!(mess.1.ends_with("/stray-kids-s-class-teug/"));
     }
@@ -1825,7 +2141,7 @@ mod tests {
               </div>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         assert_eq!(package.members.len(), 2);
         assert!(package
             .members
@@ -2008,7 +2324,7 @@ mod tests {
               <p><span style="color: #ff1744">This is for all my ladies</span><br/><span style="color: #00ccff">One time for all my ladies</span></p>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         assert_eq!(package.lines.len(), 2);
         assert!(package.lines.iter().all(|line| line.original.trim().is_empty()));
         assert_eq!(
@@ -2036,7 +2352,7 @@ mod tests {
               <p>Beep beep beep<br /><span style="color: #996de7">I'm outside your door so let's go don't let that</span><br />Beep beep beep<br /><span style="color: #996de7">Have you feeling low when you're grown you got the</span><br />Key key keys <span style="color: #ffb74d">(You got it)</span></p>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         let english: Vec<_> = package
             .lines
             .iter()
@@ -2087,7 +2403,7 @@ mod tests {
               <p><span style="color: #396ad8">Something about that water tastes like fun <span style="color: #ffb1b8">(Yeah yeah)</span></span></p>
             </div>
         "##;
-        let package = parse_colorcodedlyrics_html(html, None).unwrap();
+        let package = parse_colorcodedlyrics_html_with_provider(html, None, "colorcodedlyrics").unwrap();
         let hahaha = package
             .lines
             .iter()

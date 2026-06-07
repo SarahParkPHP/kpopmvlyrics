@@ -203,6 +203,12 @@ pub struct ForcedAlignLine {
     pub hint_start_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint_end_ms: Option<i64>,
+    /// Buffered audio window (ms) this line is expected to be sung in. The Python
+    /// worker slices the audio to these windows before forced alignment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slice_start_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slice_end_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

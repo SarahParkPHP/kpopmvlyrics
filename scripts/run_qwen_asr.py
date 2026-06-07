@@ -641,6 +641,103 @@ def transcribe_external(args: argparse.Namespace) -> ExternalTranscript:
     }[args.provider](args)
 
 
+# Providers that return word-level timestamps benefit from caption-guided slicing:
+# we send each region's audio + clean text and shift the returned word times back
+# to the global timeline. Segment-only providers stay whole-audio.
+WORD_TIMESTAMP_PROVIDERS = {"openai", "elevenlabs", "soniox"}
+
+
+def slice_audio_file(audio_path: Path, start_ms: int, end_ms: int) -> Path:
+    """Extract [start_ms, end_ms] from audio_path into a temp 16 kHz mono wav."""
+    import subprocess
+    import tempfile
+
+    fd, out = tempfile.mkstemp(suffix=".wav", prefix="kpm-slice-")
+    os.close(fd)
+    start_sec = max(0.0, start_ms / 1000.0)
+    duration_sec = max(0.2, (end_ms - start_ms) / 1000.0)
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{start_sec:.3f}",
+        "-i",
+        str(audio_path),
+        "-t",
+        f"{duration_sec:.3f}",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        out,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return Path(out)
+
+
+def transcribe_external_sliced(
+    args: argparse.Namespace,
+    line_specs: list[dict],
+) -> ExternalTranscript:
+    """Run a word-timestamp provider per caption-guided region and stitch results.
+
+    Each region is sent as an isolated audio slice plus its clean lyric text
+    (as the provider prompt/context). Returned word times are shifted by the
+    slice's start offset so they land on the song's global timeline.
+    """
+    import copy
+
+    max_region_ms = int(_env_float("KPOPMVLYRICS_ASR_REGION_MAX_SEC", 40.0) * 1000)
+    regions = group_lines_into_regions(line_specs, max_region_ms)
+    all_words: list[AlignedToken] = []
+    raw_parts: list[str] = []
+    language: str | None = None
+
+    for region_index, (start_ms, end_ms, group) in enumerate(regions):
+        region_text = " ".join(
+            str(spec.get("text", "")).strip() for spec in group if spec.get("text")
+        ).strip()
+        if not region_text:
+            continue
+        slice_path = slice_audio_file(args.audio, start_ms, end_ms)
+        print(
+            f"  region {region_index + 1}/{len(regions)}: "
+            f"{len(group)} lines, {start_ms / 1000.0:.1f}-{end_ms / 1000.0:.1f}s",
+            file=sys.stderr,
+        )
+        try:
+            region_args = copy.copy(args)
+            region_args.audio = slice_path
+            region_args.lyrics_text = region_text
+            transcript = transcribe_external(region_args)
+        finally:
+            try:
+                slice_path.unlink()
+            except OSError:
+                pass
+        offset = start_ms / 1000.0
+        for word in transcript.words:
+            all_words.append(
+                AlignedToken(word.text, word.start + offset, word.end + offset)
+            )
+        language = language or transcript.language
+        if transcript.raw_text:
+            raw_parts.append(transcript.raw_text)
+
+    return ExternalTranscript(
+        language=language,
+        words=all_words,
+        segments=[],
+        raw_text=" ".join(raw_parts),
+        alignment_source=f"{args.provider}-sliced",
+    )
+
+
 _memory_hooks_installed = False
 
 
@@ -1228,6 +1325,162 @@ def align_lyrics_chunked(
     return all_tokens, all_line_timings
 
 
+def _spec_window(spec: dict, fallback_ms: int) -> tuple[int, int]:
+    start = spec.get("slice_start_ms")
+    end = spec.get("slice_end_ms")
+    if start is None or end is None:
+        return fallback_ms, fallback_ms
+    return int(start), int(end)
+
+
+def group_lines_into_regions(
+    line_specs: list[dict],
+    max_region_ms: int,
+    gap_merge_ms: int = 1500,
+) -> list[tuple[int, int, list[dict]]]:
+    """Merge consecutive lines whose slice windows overlap/adjoin into regions.
+
+    Returns [(region_start_ms, region_end_ms, [specs...]), ...] in line order.
+    A region is flushed when the next window starts more than gap_merge_ms after
+    the current region's end, or when extending it would exceed max_region_ms
+    (which would re-hit the aligner's reliable-window limit).
+    """
+    regions: list[tuple[int, int, list[dict]]] = []
+    cur_specs: list[dict] = []
+    cur_start = 0
+    cur_end = 0
+    last_end = 0
+
+    for spec in line_specs:
+        start, end = _spec_window(spec, last_end)
+        last_end = max(last_end, end)
+        if (
+            cur_specs
+            and start <= cur_end + gap_merge_ms
+            and (max(cur_end, end) - cur_start) <= max_region_ms
+        ):
+            cur_specs.append(spec)
+            cur_start = min(cur_start, start)
+            cur_end = max(cur_end, end)
+        else:
+            if cur_specs:
+                regions.append((cur_start, cur_end, cur_specs))
+            cur_specs = [spec]
+            cur_start = start
+            cur_end = end
+
+    if cur_specs:
+        regions.append((cur_start, cur_end, cur_specs))
+    return regions
+
+
+def slice_wav(wav, sample_rate: int, start_ms: int, end_ms: int):
+    """Slice a normalized numpy waveform to [start_ms, end_ms], min ~1s.
+
+    Clamps both bounds into range; a window entirely past the audio end yields
+    the trailing ~1s rather than an empty array.
+    """
+    n = len(wav)
+    start = max(0, min(int(start_ms * sample_rate / 1000), n))
+    end = min(n, int(end_ms * sample_rate / 1000))
+    if end <= start:
+        start = max(0, min(start, max(0, n - sample_rate)))
+        end = min(n, start + sample_rate)
+    return wav[start:end]
+
+
+def align_lyrics_sliced(
+    aligner,
+    audio_path: Path,
+    line_specs: list[dict],
+    align_language: str,
+) -> tuple[list[AlignedToken], list[dict]]:
+    """Caption-guided forced alignment: slice the audio to each line's window,
+    align the clean lyric text within it, and shift timestamps to global time.
+
+    Global time = slice start + the aligner's relative frame time. Lines stay
+    keyed by their lyric index, so member/colour binding is preserved upstream.
+    """
+    from qwen_asr.inference.utils import SAMPLE_RATE, normalize_audios
+
+    wav = normalize_audios(str(audio_path))[0]
+    audio_duration_ms = ms(len(wav) / float(SAMPLE_RATE))
+    max_region_ms = int(_env_float("KPOPMVLYRICS_ASR_REGION_MAX_SEC", 40.0) * 1000)
+    regions = group_lines_into_regions(line_specs, max_region_ms)
+
+    all_tokens: list[AlignedToken] = []
+    all_line_timings: list[dict] = []
+    accepted = 0
+
+    for region_index, (start_ms, end_ms, group) in enumerate(regions):
+        region_text = " ".join(
+            str(spec.get("text", "")).strip() for spec in group if spec.get("text")
+        ).strip()
+        if not region_text:
+            continue
+        start_ms = max(0, min(start_ms, audio_duration_ms))
+        end_ms = max(start_ms + 500, min(end_ms, audio_duration_ms))
+        chunk_wav = slice_wav(wav, SAMPLE_RATE, start_ms, end_ms)
+        offset_sec = start_ms / 1000.0
+        chunk_duration_sec = len(chunk_wav) / float(SAMPLE_RATE)
+        print(
+            f"  region {region_index + 1}/{len(regions)}: {len(group)} lines, "
+            f"{offset_sec:.1f}-{end_ms / 1000.0:.1f}s, duration={chunk_duration_sec:.1f}s",
+            file=sys.stderr,
+        )
+        region_language = line_align_language(region_text, align_language)
+        results = aligner.align(
+            audio=(chunk_wav, SAMPLE_RATE),
+            text=region_text,
+            language=region_language,
+        )
+        if not results:
+            print("    skip: aligner returned no results", file=sys.stderr)
+            continue
+        tokens = forced_items_to_tokens(results[0])
+        if chunk_output_is_degenerate(tokens, chunk_duration_sec):
+            print(
+                f"    skip: degenerate FA output (tokens={len(tokens)})",
+                file=sys.stderr,
+            )
+            continue
+        tokens = repair_zero_word_timestamps(tokens)
+        chunk_timings = choose_line_timings(group, region_text, tokens)
+        offset_line_timings(chunk_timings, offset_sec)
+        for token in tokens:
+            token.start += offset_sec
+            token.end += offset_sec
+        for row in chunk_timings:
+            if row.get("start_ms") is not None and row["start_ms"] > audio_duration_ms + 500:
+                row["start_ms"] = None
+                row["end_ms"] = None
+        all_tokens.extend(tokens)
+        all_line_timings.extend(chunk_timings)
+        accepted += 1
+
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    print(
+        f"  accepted {accepted}/{len(regions)} regions, "
+        f"{sum(1 for r in all_line_timings if r.get('start_ms') is not None)} of "
+        f"{len(line_specs)} lines aligned",
+        file=sys.stderr,
+    )
+
+    dedupe_clustered_line_timings(all_line_timings)
+    synced = [row for row in all_line_timings if row.get("start_ms") is not None]
+    synced.sort(key=lambda row: row["start_ms"])
+    for index, row in enumerate(synced[:-1]):
+        next_start = synced[index + 1]["start_ms"]
+        if row["end_ms"] >= next_start:
+            row["end_ms"] = max(row["start_ms"] + 200, next_start - 1)
+
+    return all_tokens, all_line_timings
+
+
 def align_with_forced_aligner(
     aligner,
     audio_path: Path,
@@ -1333,6 +1586,39 @@ def transcribe_with_asr_model(
         return _try_with(_SMALL_FALLBACK_MODEL)
 
 
+def run_asr_with_context(
+    args: argparse.Namespace,
+    runtime_device: str,
+    align_text: str,
+    align_language: str,
+    language_code: str | None,
+) -> tuple[list[AlignedToken], str | None]:
+    """ASR transcription (optionally biased by `align_text`) → repaired tokens.
+
+    Returns (tokens, detected_language). Used as the whole-song path and as the
+    fallback when caption-guided slicing yields nothing.
+    """
+    result = transcribe_with_asr_model(
+        args.model,
+        args.aligner_model,
+        args.audio,
+        align_language,
+        runtime_device,
+        context=align_text,
+    )
+    tokens: list[AlignedToken] = []
+    detected_language = language_code
+    if result is not None:
+        detected_language = getattr(result, "language", None) or language_code
+        stamps = getattr(result, "time_stamps", None)
+        if stamps is not None:
+            tokens = forced_items_to_tokens(stamps)
+            if align_text:
+                tokens = filter_hallucinated_tokens(tokens, align_text)
+            tokens = repair_zero_word_timestamps(tokens)
+    return tokens, detected_language
+
+
 def main() -> int:
     args = parse_args()
     if not args.audio.exists():
@@ -1343,9 +1629,30 @@ def main() -> int:
     align_language = resolve_align_language(language_code, args.align_language)
     align_text = args.lyrics_text.strip() if args.lyrics_text else ""
 
+    line_specs: list[dict] = []
+    if args.lyrics_lines_file and args.lyrics_lines_file.exists():
+        parsed = json.loads(args.lyrics_lines_file.read_text(encoding="utf-8"))
+        if isinstance(parsed, list):
+            line_specs = parsed
+    has_slice_windows = any(
+        spec.get("slice_start_ms") is not None for spec in line_specs
+    )
+
     if args.provider != "local":
         try:
-            transcript = transcribe_external(args)
+            if (
+                has_slice_windows
+                and line_specs
+                and args.provider in WORD_TIMESTAMP_PROVIDERS
+            ):
+                print(
+                    f"Caption-guided sliced transcription via {args.provider} "
+                    f"({len(line_specs)} lines)...",
+                    file=sys.stderr,
+                )
+                transcript = transcribe_external_sliced(args, line_specs)
+            else:
+                transcript = transcribe_external(args)
         except Exception as err:
             import traceback
 
@@ -1403,56 +1710,64 @@ def main() -> int:
 
     runtime_device = resolve_device(args.device)
 
-    line_specs: list[dict] = []
-    if args.lyrics_lines_file and args.lyrics_lines_file.exists():
-        parsed = json.loads(args.lyrics_lines_file.read_text(encoding="utf-8"))
-        if isinstance(parsed, list):
-            line_specs = parsed
-
     segments_out: list[dict] = []
     detected_language = language_code
     aligned_tokens: list[AlignedToken] = []
     line_timings: list[dict] = []
 
+    # We intentionally never push a "full-text" segment into segments_out: the
+    # Rust side would then build a single caption line of all the ASR text at
+    # 0-200ms, overwriting the multi-line YouTube captions. Leaving segments empty
+    # makes asr_caption_lines fall through to word-chunked captions with real timing.
     alignment_source = "none"
     try:
-        if align_text:
-            # Primary path: ASR with the known lyrics as `context` bias.
-            # The model transcribes what it actually hears (biased toward the lyrics)
-            # and the FA pass times the transcript - giving accurate word-level
-            # timestamps spread across the song's true sung timeline. The CCL→ASR
-            # word mapping is handled in Rust via fuzzy DP (align_lyrics_to_timed_words),
-            # which tolerates the small text differences from ASR mis-recognitions.
+        if align_text and line_specs and has_slice_windows:
+            # Primary path: caption-guided sliced forced alignment. Each line's
+            # audio window (from the YouTube caption alignment) is sliced out and
+            # its clean lyric text is force-aligned within it, so the aligner only
+            # ever sees the region a line is actually sung in. Timestamps are
+            # shifted back to global time inside align_lyrics_sliced.
+            print(
+                f"Caption-guided sliced forced alignment ({len(line_specs)} lines)...",
+                file=sys.stderr,
+            )
+            aligner = load_forced_aligner(args.aligner_model, runtime_device)
+            try:
+                aligned_tokens, line_timings = align_lyrics_sliced(
+                    aligner,
+                    args.audio,
+                    line_specs,
+                    align_language,
+                )
+            finally:
+                _release_model(aligner)
+            if aligned_tokens:
+                alignment_source = "lyrics-sliced"
+            else:
+                print(
+                    "Sliced FA produced no tokens; falling back to ASR + context",
+                    file=sys.stderr,
+                )
+                aligned_tokens, detected_language = run_asr_with_context(
+                    args, runtime_device, align_text, align_language, language_code
+                )
+                if aligned_tokens:
+                    alignment_source = "asr-context"
+        elif align_text:
+            # Whole-song ASR biased by the known lyrics (no slice windows given).
             print(
                 f"Transcribing with ASR + lyrics context ({len(align_text)} chars)...",
                 file=sys.stderr,
             )
-            result = transcribe_with_asr_model(
-                args.model,
-                args.aligner_model,
-                args.audio,
-                align_language,
-                runtime_device,
-                context=align_text,
+            aligned_tokens, detected_language = run_asr_with_context(
+                args, runtime_device, align_text, align_language, language_code
             )
-            if result is not None:
-                detected_language = getattr(result, "language", None) or language_code
-                # We intentionally do NOT push a "full-text" segment into segments_out:
-                # the Rust side would then build a single caption_line of all the ASR text
-                # at 0-200ms, overwriting the multi-line YouTube captions. Letting
-                # segments stay empty makes asr_caption_lines fall through to word-chunked
-                # captions, which carry real timing.
-                stamps = getattr(result, "time_stamps", None)
-                if stamps is not None:
-                    aligned_tokens = forced_items_to_tokens(stamps)
-                    aligned_tokens = filter_hallucinated_tokens(aligned_tokens, align_text)
-                    aligned_tokens = repair_zero_word_timestamps(aligned_tokens)
-                if aligned_tokens:
-                    alignment_source = "asr-context"
-                    print(
-                        f"ASR+context produced {len(aligned_tokens)} timestamped tokens",
-                        file=sys.stderr,
-                    )
+            if aligned_tokens:
+                alignment_source = "asr-context"
+                print(
+                    f"ASR+context produced {len(aligned_tokens)} timestamped tokens",
+                    file=sys.stderr,
+                )
 
             # Fallback to chunked forced alignment if ASR-with-context yielded nothing
             # (e.g. the model OOM'd or the audio was unrecognisable).
@@ -1462,36 +1777,24 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 aligner = load_forced_aligner(args.aligner_model, runtime_device)
-                aligned_tokens, line_timings = align_lyrics_chunked(
-                    aligner,
-                    args.audio,
-                    line_specs,
-                    align_language,
-                )
+                try:
+                    aligned_tokens, line_timings = align_lyrics_chunked(
+                        aligner,
+                        args.audio,
+                        line_specs,
+                        align_language,
+                    )
+                finally:
+                    _release_model(aligner)
                 if aligned_tokens:
                     alignment_source = "lyrics-chunked"
         else:
             # No known lyrics — pure ASR transcription.
-            result = transcribe_with_asr_model(
-                args.model,
-                args.aligner_model,
-                args.audio,
-                align_language,
-                runtime_device,
+            aligned_tokens, detected_language = run_asr_with_context(
+                args, runtime_device, "", align_language, language_code
             )
-            if result is not None:
-                detected_language = getattr(result, "language", None) or language_code
-                # We intentionally do NOT push a "full-text" segment into segments_out:
-                # the Rust side would then build a single caption_line of all the ASR text
-                # at 0-200ms, overwriting the multi-line YouTube captions. Letting
-                # segments stay empty makes asr_caption_lines fall through to word-chunked
-                # captions, which carry real timing.
-                stamps = getattr(result, "time_stamps", None)
-                if stamps is not None:
-                    aligned_tokens = forced_items_to_tokens(stamps)
-                    aligned_tokens = repair_zero_word_timestamps(aligned_tokens)
-                if aligned_tokens:
-                    alignment_source = "asr"
+            if aligned_tokens:
+                alignment_source = "asr"
     except Exception as err:
         import traceback
 

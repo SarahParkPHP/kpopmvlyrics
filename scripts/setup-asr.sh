@@ -56,20 +56,31 @@ recreate_venv() {
   clean_python_env "$VENV/bin/python" -m ensurepip --upgrade
 }
 
+install_asr_deps() {
+  clean_python_env "$VENV/bin/pip" install --upgrade pip
+  # Demucs needs torchaudio, but the default (CUDA) torchaudio wheel is built
+  # against a different CUDA than the system PyTorch, so it fails its CUDA-version
+  # check on import. Demucs only uses torchaudio for CPU audio I/O (the model runs
+  # on the GPU through torch), so install the CPU build, which skips that check.
+  # Install it before the requirements so demucs reuses it instead of pulling the
+  # CUDA wheel. torchcodec is torchaudio's encode/decode backend.
+  clean_python_env "$VENV/bin/pip" install --index-url https://download.pytorch.org/whl/cpu torchaudio
+  clean_python_env "$VENV/bin/pip" install torchcodec
+  clean_python_env "$VENV/bin/pip" install -r "$ROOT/requirements-asr.txt"
+}
+
 if [[ ! -x "$VENV/bin/python" ]] || ! venv_python_ok; then
   recreate_venv
 fi
 
-clean_python_env "$VENV/bin/pip" install --upgrade pip
-clean_python_env "$VENV/bin/pip" install -r "$ROOT/requirements-asr.txt"
+install_asr_deps
 
 rm -f "$ROOT/scripts/__pycache__/qwen_asr".*.pyc 2>/dev/null || true
 
 if ! clean_python_env "$VENV/bin/python" -c "import qwen_asr, torch; print(f'qwen-asr ok, CUDA={torch.cuda.is_available()}')"; then
   echo "qwen-asr import failed after install; recreating venv once more..." >&2
   recreate_venv
-  clean_python_env "$VENV/bin/pip" install --upgrade pip
-  clean_python_env "$VENV/bin/pip" install -r "$ROOT/requirements-asr.txt"
+  install_asr_deps
   clean_python_env "$VENV/bin/python" -c "import qwen_asr, torch; print(f'qwen-asr ok, CUDA={torch.cuda.is_available()}')"
 fi
 

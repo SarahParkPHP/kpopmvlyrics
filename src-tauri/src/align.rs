@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use rayon::prelude::*;
-use strsim::jaro_winkler;
+use strsim::{jaro_winkler, normalized_levenshtein, sorensen_dice};
 
 use crate::models::{AlignmentLine, CaptionLine, LyricLine};
 
@@ -459,39 +459,274 @@ pub fn lyric_line_for_forced_alignment(line: &LyricLine, use_original: bool) -> 
     Some(text)
 }
 
-pub fn build_lyrics_forced_alignment_bundle_with_hints(
+/// A buffered audio window for one lyric line, used to slice the audio before
+/// forced alignment so the aligner only ever sees the region a line is sung in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineSliceWindow {
+    pub lyric_index: usize,
+    pub slice_start_ms: i64,
+    pub slice_end_ms: i64,
+    /// True when the line matched a YouTube caption directly; false when the
+    /// window was interpolated from neighbouring matched lines.
+    pub anchored: bool,
+}
+
+/// Buffer (ms) added to each side of a line's caption window before slicing.
+pub fn slice_buffer_ms() -> i64 {
+    std::env::var("KPOPMVLYRICS_ASR_SLICE_BUFFER_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(1500)
+}
+
+/// Derive a per-line audio slice window from the caption baseline alignment.
+///
+/// The baseline (`align_lines` output) already carries an interpolated timing
+/// for every line — matched lines from their caption, unmatched lines from
+/// `interpolate_unsynced_timings` (which fills gaps from neighbours and extends
+/// before the first / after the last matched line). We widen each by a buffer,
+/// using a larger buffer for interpolated lines since their timing is a guess.
+/// Region merging of overlapping windows happens in the Python worker.
+pub fn build_line_slice_windows(
+    lyrics: &[LyricLine],
+    baseline: &[AlignmentLine],
+    duration_ms: i64,
+    buffer_ms: i64,
+) -> Vec<LineSliceWindow> {
+    let by_index: HashMap<usize, &AlignmentLine> =
+        baseline.iter().map(|line| (line.lyric_index, line)).collect();
+    let duration = if duration_ms > 0 { duration_ms } else { i64::MAX };
+    lyrics
+        .iter()
+        .filter_map(|line| {
+            let bl = by_index.get(&line.index)?;
+            if !has_playback_timing(bl) {
+                return None;
+            }
+            let anchored = bl.caption_index.is_some();
+            let buffer = if anchored {
+                buffer_ms
+            } else {
+                buffer_ms.saturating_mul(2)
+            };
+            let start = (bl.start_ms - buffer).max(0);
+            let end = (bl.end_ms + buffer).min(duration);
+            Some(LineSliceWindow {
+                lyric_index: line.index,
+                slice_start_ms: start,
+                slice_end_ms: end.max(start + 200),
+                anchored,
+            })
+        })
+        .collect()
+}
+
+/// Expand standalone numbers and a few symbols into spoken words so the forced
+/// aligner has tokens that match what is actually sung (e.g. "1, 2, 3" →
+/// "원 투 쓰리" in Korean, "one two three" in English). Multi-digit runs are
+/// read digit-by-digit, which matches how counting is sung in pop. Applied only
+/// to the alignment/context text — the stored lyric struct is never modified, so
+/// member/colour binding (keyed by `lyric_index`) is unaffected.
+pub fn expand_numbers_symbols(text: &str, align_language: &str) -> String {
+    let lang = align_language.trim();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let replacement: Option<String> = if ch.is_ascii_digit() {
+            let mut run = String::new();
+            run.push(ch);
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_digit() {
+                    run.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            Some(
+                run.chars()
+                    .map(|digit| digit_word(digit, lang))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        } else {
+            symbol_word(ch, lang).map(str::to_string)
+        };
+
+        match replacement {
+            Some(word) => {
+                if !out.is_empty() && !out.ends_with(char::is_whitespace) {
+                    out.push(' ');
+                }
+                out.push_str(&word);
+                if let Some(&next) = chars.peek() {
+                    if !next.is_whitespace() {
+                        out.push(' ');
+                    }
+                }
+            }
+            None => out.push(ch),
+        }
+    }
+    out
+}
+
+fn digit_word(digit: char, lang: &str) -> &'static str {
+    let index = (digit as u8).wrapping_sub(b'0') as usize;
+    let table: &[&str; 10] = match lang {
+        "Korean" => &[
+            "제로", "원", "투", "쓰리", "포", "파이브", "식스", "세븐", "에잇", "나인",
+        ],
+        "Japanese" => &[
+            "ゼロ", "ワン", "ツー", "スリー", "フォー", "ファイブ", "シックス", "セブン",
+            "エイト", "ナイン",
+        ],
+        _ => &[
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        ],
+    };
+    table.get(index).copied().unwrap_or("")
+}
+
+fn symbol_word(ch: char, lang: &str) -> Option<&'static str> {
+    let korean = lang == "Korean";
+    Some(match ch {
+        '$' => {
+            if korean {
+                "달러"
+            } else {
+                "dollars"
+            }
+        }
+        '%' => {
+            if korean {
+                "퍼센트"
+            } else {
+                "percent"
+            }
+        }
+        '&' => {
+            if korean {
+                "앤"
+            } else {
+                "and"
+            }
+        }
+        '+' => {
+            if korean {
+                "플러스"
+            } else {
+                "plus"
+            }
+        }
+        '@' => {
+            if korean {
+                "앳"
+            } else {
+                "at"
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Build the forced-alignment bundle with number/symbol expansion applied to the
+/// alignment text and a per-line audio slice window attached. This is the
+/// caption-guided entry point used by `align_lyrics_with_progress`; the
+/// `_with_hints` variant remains for the legacy whole-song path.
+pub fn build_lyrics_forced_alignment_bundle_with_slices(
     lyrics: &[LyricLine],
     use_original: bool,
-    hints: &[AlignmentLine],
+    baseline: &[AlignmentLine],
+    align_language: &str,
+    duration_ms: i64,
+    buffer_ms: i64,
 ) -> (String, Vec<crate::asr::ForcedAlignLine>) {
     let hint_by_index: HashMap<usize, &AlignmentLine> =
-        hints.iter().map(|line| (line.lyric_index, line)).collect();
+        baseline.iter().map(|line| (line.lyric_index, line)).collect();
+    let windows = build_line_slice_windows(lyrics, baseline, duration_ms, buffer_ms);
+    let window_by_index: HashMap<usize, &LineSliceWindow> =
+        windows.iter().map(|window| (window.lyric_index, window)).collect();
+
     let mut text = String::new();
     let mut lines = Vec::new();
     for line in lyrics {
-        let Some(line_text) = lyric_line_for_forced_alignment(line, use_original) else {
+        let Some(raw_text) = lyric_line_for_forced_alignment(line, use_original) else {
             continue;
         };
+        let line_text = expand_numbers_symbols(raw_text, align_language);
+        if line_text.trim().is_empty() {
+            continue;
+        }
         if !text.is_empty() {
             text.push(' ');
         }
         let char_start = text.len();
-        text.push_str(line_text);
+        text.push_str(&line_text);
         let (hint_start_ms, hint_end_ms) = hint_by_index
             .get(&line.index)
             .filter(|hint| has_playback_timing(hint))
             .map(|hint| (Some(hint.start_ms), Some(hint.end_ms)))
             .unwrap_or((None, None));
+        let (slice_start_ms, slice_end_ms) = window_by_index
+            .get(&line.index)
+            .map(|window| (Some(window.slice_start_ms), Some(window.slice_end_ms)))
+            .unwrap_or((None, None));
         lines.push(crate::asr::ForcedAlignLine {
             index: line.index,
-            text: line_text.to_string(),
+            text: line_text,
             char_start,
             char_end: text.len(),
             hint_start_ms,
             hint_end_ms,
+            slice_start_ms,
+            slice_end_ms,
         });
     }
     (text, lines)
+}
+
+/// Fuzzy text-agreement between the ASR transcript and the clean lyric text,
+/// blending a Sørensen–Dice bigram score with normalized Levenshtein. Used to
+/// measure "accuracy vs the sourced lyrics".
+pub fn text_agreement_score(asr_text: &str, clean_text: &str) -> f64 {
+    let a = normalize_text(asr_text);
+    let b = normalize_text(clean_text);
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let dice = sorensen_dice(&a, &b);
+    let lev = normalized_levenshtein(&a, &b);
+    ((dice * 0.6) + (lev * 0.4)).clamp(0.0, 1.0)
+}
+
+/// Overall alignment accuracy in 0..1: text agreement (does the ASR output match
+/// the lyrics), coverage (fraction of alignable lines that got real timing), and
+/// timing spread (penalises collapsed/clustered output). Gates the Demucs retry
+/// and the ASR-vs-captions choice.
+pub fn alignment_accuracy(
+    lyrics: &[LyricLine],
+    alignment: &[AlignmentLine],
+    asr_text: &str,
+    clean_text: &str,
+) -> f64 {
+    let alignable = lyrics
+        .iter()
+        .filter(|line| {
+            let text = lyric_alignment_text(line);
+            !text.trim().is_empty() && !looks_like_metadata(&normalize_text(text))
+        })
+        .count();
+    let coverage = if alignable == 0 {
+        0.0
+    } else {
+        let synced = alignment.iter().filter(|line| is_synced_line(line)).count();
+        (synced as f64 / alignable as f64).min(1.0)
+    };
+    let agreement = text_agreement_score(asr_text, clean_text);
+    let spread = forced_line_timing_quality(alignment).clamp(0.0, 1.0);
+    (0.45 * agreement) + (0.35 * coverage) + (0.20 * spread)
 }
 
 /// Reject forced-alignment output that clusters most lines on a few timestamps
@@ -1479,6 +1714,111 @@ mod tests {
             },
         ];
         assert_eq!(forced_line_timing_quality(&lines), 0.0);
+    }
+
+    #[test]
+    fn expands_numbers_per_language() {
+        assert_eq!(expand_numbers_symbols("1 2 3", "English"), "one two three");
+        assert_eq!(expand_numbers_symbols("1 2 3", "Korean"), "원 투 쓰리");
+        // Multi-digit runs are read digit-by-digit.
+        assert_eq!(expand_numbers_symbols("go 123", "English"), "go one two three");
+        // Symbols expand; surrounding text is preserved.
+        assert_eq!(expand_numbers_symbols("$5", "English"), "dollars five");
+        assert_eq!(expand_numbers_symbols("you & me", "English"), "you and me");
+        // Plain text is untouched.
+        assert_eq!(expand_numbers_symbols("hello world", "English"), "hello world");
+    }
+
+    #[test]
+    fn builds_slice_windows_with_buffer_and_anchor_flag() {
+        let lyrics = vec![lyric(0, "first"), lyric(1, "missing"), lyric(2, "last")];
+        let baseline = vec![
+            AlignmentLine {
+                lyric_index: 0,
+                caption_index: Some(0),
+                start_ms: 10_000,
+                end_ms: 11_000,
+                confidence: 0.95,
+                needs_review: false,
+            },
+            AlignmentLine {
+                lyric_index: 1,
+                caption_index: None,
+                start_ms: 11_500,
+                end_ms: 12_500,
+                confidence: 0.0,
+                needs_review: true,
+            },
+            AlignmentLine {
+                lyric_index: 2,
+                caption_index: Some(1),
+                start_ms: 13_000,
+                end_ms: 14_000,
+                confidence: 0.95,
+                needs_review: false,
+            },
+        ];
+        let windows = build_line_slice_windows(&lyrics, &baseline, 60_000, 1000);
+        assert_eq!(windows.len(), 3);
+        // Anchored line: ±buffer.
+        assert_eq!(windows[0].slice_start_ms, 9_000);
+        assert_eq!(windows[0].slice_end_ms, 12_000);
+        assert!(windows[0].anchored);
+        // Interpolated line uses a doubled buffer and is not anchored.
+        assert!(!windows[1].anchored);
+        assert_eq!(windows[1].slice_start_ms, 9_500);
+        assert_eq!(windows[1].slice_end_ms, 14_500);
+    }
+
+    #[test]
+    fn slice_windows_clamp_to_audio_bounds() {
+        let lyrics = vec![lyric(0, "intro")];
+        let baseline = vec![AlignmentLine {
+            lyric_index: 0,
+            caption_index: Some(0),
+            start_ms: 200,
+            end_ms: 800,
+            confidence: 0.95,
+            needs_review: false,
+        }];
+        let windows = build_line_slice_windows(&lyrics, &baseline, 5_000, 1000);
+        assert_eq!(windows[0].slice_start_ms, 0);
+        assert_eq!(windows[0].slice_end_ms, 1_800);
+    }
+
+    #[test]
+    fn text_agreement_rewards_matching_lyrics() {
+        let high = text_agreement_score("shine bright tonight", "shine bright tonight");
+        let low = text_agreement_score("completely different words here", "shine bright tonight");
+        assert!(high > 0.95);
+        assert!(low < high);
+        assert!(low < 0.5);
+    }
+
+    #[test]
+    fn alignment_accuracy_combines_signals() {
+        let lyrics = (0..8)
+            .map(|index| english_lyric(index, "line number here for content"))
+            .collect::<Vec<_>>();
+        let good_alignment = (0..8)
+            .map(|index| AlignmentLine {
+                lyric_index: index,
+                caption_index: Some(index),
+                start_ms: 90_000 + (index as i64 * 2_000),
+                end_ms: 90_000 + (index as i64 * 2_000) + 1_500,
+                confidence: 0.95,
+                needs_review: false,
+            })
+            .collect::<Vec<_>>();
+        let clean = "line number here for content";
+        let good = alignment_accuracy(&lyrics, &good_alignment, clean, clean);
+        let unsynced = lyrics
+            .iter()
+            .map(|line| unsynced_alignment_line(line.index))
+            .collect::<Vec<_>>();
+        let bad = alignment_accuracy(&lyrics, &unsynced, "nothing alike at all", clean);
+        assert!(good > bad);
+        assert!(good > 0.6);
     }
 
     #[test]

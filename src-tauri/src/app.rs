@@ -3,8 +3,7 @@ use std::sync::Mutex;
 
 use crate::align::{
     align_lines, align_lyrics_from_line_timings, align_lyrics_to_forced_words,
-    align_lyrics_to_timed_words, alignment_playback_quality, forced_line_timing_quality,
-    AlignmentInput,
+    align_lyrics_to_timed_words, alignment_accuracy, alignment_playback_quality, AlignmentInput,
 };
 use crate::asr::{
     asr_available, asr_caption_lines, asr_setup_hint, effective_asr_model, forced_align_language,
@@ -14,7 +13,10 @@ use crate::captions::{parse_caption_text, CaptionProvider, YouTubeCaptionProvide
 use crate::db::Repository;
 use crate::log::{progress, verbose, PhaseGuard};
 use crate::lyrics::lyric_language_toggles;
-use crate::lyrics::{ColorCodedLyricsProvider, GeniusProvider, LyricsProvider};
+use crate::lyrics::{
+    ColorCodedHeavenProvider, ColorCodedLyricsProvider, GeniusProvider, LyricsProvider,
+    LYRICS_CONFIDENT_SCORE,
+};
 use crate::members::{KpopFandomProvider, KpoppingProvider, MemberProfileProvider};
 use crate::models::*;
 use crate::video;
@@ -33,6 +35,10 @@ pub struct AppContext {
 
 const ASR_MODEL_SETTING: &str = "whisper_model";
 const ASR_DEMUCS_SETTING: &str = "asr_demucs_enabled";
+/// Below this 0..1 alignment accuracy, a Demucs-enabled run is retried without
+/// Demucs (the source/instrumental separation can hurt some mixes), keeping
+/// whichever attempt scores higher.
+const ACCURACY_RETRY_THRESHOLD: f64 = 0.6;
 const ASR_API_KEY_PREFIX: &str = "asr_api_key_";
 const ASR_BASE_URL_PREFIX: &str = "asr_base_url_";
 
@@ -122,24 +128,56 @@ impl AppContext {
     }
 
     pub fn fetch_lyrics(&self, query: &str) -> Result<SongPackage, String> {
-        let providers: Vec<Box<dyn LyricsProvider>> = vec![
+        // Different color-coded sites cover different songs (and the same query can
+        // produce a confidently-wrong match on one site), so we score every
+        // color-coded result and keep the best instead of taking the first hit.
+        // Genius is a lower-confidence fallback consulted only when no color-coded
+        // source is confident.
+        let color_sites: Vec<Box<dyn LyricsProvider>> = vec![
             Box::new(ColorCodedLyricsProvider::default()),
-            Box::new(GeniusProvider::default()),
+            Box::new(ColorCodedHeavenProvider::default()),
         ];
 
+        let mut best: Option<(f64, SongPackage)> = None;
         let mut last_error = None;
-        for provider in providers {
-            match provider.fetch(query) {
-                Ok(mut package) => {
-                    let mut repo = self.repo.lock().map_err(to_string)?;
-                    repo.upsert_song_package(&mut package).map_err(to_string)?;
-                    return Ok(package);
+
+        for provider in color_sites {
+            match provider.fetch_scored(query) {
+                Ok((score, package)) => {
+                    verbose(format!("fetch_lyrics {} score={score:.3}", package.provider));
+                    consider_lyrics_candidate(&mut best, score, package);
+                    if best
+                        .as_ref()
+                        .map(|(score, _)| *score >= LYRICS_CONFIDENT_SCORE)
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
                 }
                 Err(err) => last_error = Some(err.to_string()),
             }
         }
 
-        Err(last_error.unwrap_or_else(|| "No lyric providers configured".to_string()))
+        let confident = best
+            .as_ref()
+            .map(|(score, _)| *score >= LYRICS_CONFIDENT_SCORE)
+            .unwrap_or(false);
+        if !confident {
+            match GeniusProvider::default().fetch_scored(query) {
+                Ok((score, package)) => {
+                    verbose(format!("fetch_lyrics genius score={score:.3}"));
+                    consider_lyrics_candidate(&mut best, score, package);
+                }
+                Err(err) => last_error = Some(err.to_string()),
+            }
+        }
+
+        let (_, mut package) = best.ok_or_else(|| {
+            last_error.unwrap_or_else(|| "No lyric providers configured".to_string())
+        })?;
+        let mut repo = self.repo.lock().map_err(to_string)?;
+        repo.upsert_song_package(&mut package).map_err(to_string)?;
+        Ok(package)
     }
 
     pub fn import_lyrics(
@@ -320,71 +358,152 @@ impl AppContext {
                 }
                 let primary_align_language = forced_align_language(asr_use_original, asr_language);
                 let (lyrics_text, forced_lines) =
-                    crate::align::build_lyrics_forced_alignment_bundle_with_hints(
+                    crate::align::build_lyrics_forced_alignment_bundle_with_slices(
                         &lyrics,
                         asr_use_original,
                         &best_alignment,
+                        primary_align_language,
+                        // Audio length is unknown here; the Python worker clamps
+                        // slice windows to the real wav length, so leave it open.
+                        0,
+                        crate::align::slice_buffer_ms(),
                     );
-                let transcript = {
+
+                // Score the caption-only baseline on the same 0..1 accuracy scale
+                // (caption text vs lyrics) so ASR can be compared apples-to-apples.
+                let caption_text = best_captions
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let baseline_accuracy =
+                    alignment_accuracy(&lyrics, &best_alignment, &caption_text, &lyrics_text);
+                verbose(format!("align caption baseline accuracy={baseline_accuracy:.3}"));
+
+                // One ASR attempt (download → optional Demucs → Python worker →
+                // map to lyric lines → merge caption fallback → score).
+                let run_attempt = |demucs_enabled: bool| -> Result<AsrOutcome, String> {
                     let _phase = PhaseGuard::begin("align transcribe_video");
-                    transcribe_video(
+                    let transcript = transcribe_video(
                         video_id,
                         asr_language,
                         model_size,
-                        self.asr_demucs_enabled(),
+                        demucs_enabled,
                         Some(&api_key),
                         Some(&base_url),
                         Some(&lyrics_text),
                         Some(&forced_lines),
                         Some(primary_align_language),
                     )
+                    .map_err(|err| format!("ASR failed ({err})"))?;
+                    if transcript.words.is_empty() {
+                        return Err("ASR returned no timed words".into());
+                    }
+                    let captions = asr_caption_lines(video_id, &transcript);
+                    let mut alignment =
+                        alignment_from_transcript(&lyrics, &transcript, asr_use_original);
+                    merge_caption_baseline(&mut alignment, &best_alignment);
+                    let asr_text = transcript
+                        .words
+                        .iter()
+                        .map(|word| word.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let accuracy =
+                        alignment_accuracy(&lyrics, &alignment, &asr_text, &lyrics_text);
+                    verbose(format!(
+                        "align asr attempt demucs={demucs_enabled} words={} accuracy={accuracy:.3} source={:?}",
+                        transcript.words.len(),
+                        transcript.alignment_source,
+                    ));
+                    Ok(AsrOutcome {
+                        backend: transcript
+                            .backend
+                            .clone()
+                            .unwrap_or_else(|| model_size.backend().to_string()),
+                        device: runtime_device_label(&transcript),
+                        words: transcript.words.len(),
+                        accuracy,
+                        alignment,
+                        captions,
+                    })
                 };
-                match transcript {
-                    Ok(transcript) if !transcript.words.is_empty() => {
-                        verbose(format!(
-                            "align asr words={} source={:?} line_timings={}",
-                            transcript.words.len(),
-                            transcript.alignment_source,
-                            transcript.line_timings.len()
-                        ));
-                        let asr_captions = asr_caption_lines(video_id, &transcript);
-                        let mut asr_alignment =
-                            alignment_from_transcript(&lyrics, &transcript, asr_use_original);
-                        merge_caption_baseline(&mut asr_alignment, &best_alignment);
-                        let asr_score = alignment_playback_quality(&asr_alignment);
-                        let timing_quality = forced_line_timing_quality(&asr_alignment);
-                        verbose(format!(
-                            "align asr score={asr_score:.3} timing_quality={timing_quality:.3} caption_score={best_score:.3}"
-                        ));
-                        if timing_quality > 0.0 && asr_score >= best_score {
-                            best_alignment = asr_alignment;
-                            best_captions = asr_captions;
-                            let backend = transcript
-                                .backend
-                                .as_deref()
-                                .unwrap_or(model_size.backend());
-                            summary = format!(
-                                "Aligned with ASR ({}, {} words, {})",
-                                backend,
-                                transcript.words.len(),
-                                runtime_device_label(&transcript)
-                            );
+
+                // Run the configured attempt; if Demucs was on and scored poorly,
+                // retry without Demucs and keep whichever attempt is more accurate.
+                let demucs_first = self.asr_demucs_enabled();
+                let chosen: Option<AsrOutcome> = {
+                    match run_attempt(demucs_first) {
+                        Ok(first) => {
+                            if demucs_first && first.accuracy < ACCURACY_RETRY_THRESHOLD {
+                                verbose(format!(
+                                    "align demucs accuracy {:.3} < {:.2}; retrying without demucs",
+                                    first.accuracy, ACCURACY_RETRY_THRESHOLD
+                                ));
+                                match run_attempt(false) {
+                                    Ok(retry) if retry.accuracy > first.accuracy => {
+                                        verbose(format!(
+                                            "align no-demucs retry won ({:.3} > {:.3})",
+                                            retry.accuracy, first.accuracy
+                                        ));
+                                        Some(retry)
+                                    }
+                                    Ok(retry) => {
+                                        verbose(format!(
+                                            "align kept demucs result ({:.3} >= {:.3})",
+                                            first.accuracy, retry.accuracy
+                                        ));
+                                        Some(first)
+                                    }
+                                    Err(err) => {
+                                        verbose(format!("align no-demucs retry failed: {err}"));
+                                        Some(first)
+                                    }
+                                }
+                            } else {
+                                Some(first)
+                            }
+                        }
+                        Err(err) if demucs_first => {
+                            // The Demucs pass failed outright (e.g. Demucs not
+                            // installed, or stem separation errored). Don't abandon
+                            // ASR — retry once on the original audio.
+                            verbose(format!(
+                                "align demucs attempt failed ({err}); retrying without demucs"
+                            ));
+                            match run_attempt(false) {
+                                Ok(retry) => Some(retry),
+                                Err(retry_err) => {
+                                    summary =
+                                        format!("{retry_err}; kept YouTube caption alignment");
+                                    eprintln!("kpopmvlyrics: {summary}");
+                                    None
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            summary = format!("{err}; kept YouTube caption alignment");
                             eprintln!("kpopmvlyrics: {summary}");
-                        } else {
-                            summary = format!(
-                                "ASR alignment quality={timing_quality:.2} score={asr_score:.2} \
-                                 was not better than captions (score={best_score:.2}); kept caption alignment"
-                            );
-                            eprintln!("kpopmvlyrics: {summary}");
+                            None
                         }
                     }
-                    Ok(_) => {
-                        summary =
-                            "ASR returned no timed words; kept YouTube caption alignment".into();
+                };
+
+                if let Some(outcome) = chosen {
+                    if outcome.accuracy >= baseline_accuracy {
+                        summary = format!(
+                            "Aligned with ASR ({}, {} words, {}, accuracy {:.2})",
+                            outcome.backend, outcome.words, outcome.device, outcome.accuracy,
+                        );
                         eprintln!("kpopmvlyrics: {summary}");
-                    }
-                    Err(err) => {
-                        summary = format!("ASR failed ({err}); kept YouTube caption alignment");
+                        best_alignment = outcome.alignment;
+                        best_captions = outcome.captions;
+                    } else {
+                        summary = format!(
+                            "ASR accuracy {:.2} was not better than captions ({:.2}); \
+                             kept caption alignment",
+                            outcome.accuracy, baseline_accuracy,
+                        );
                         eprintln!("kpopmvlyrics: {summary}");
                     }
                 }
@@ -468,6 +587,32 @@ impl AppContext {
             .map_err(to_string)?;
         Ok(member.clone())
     }
+}
+
+/// Keep `best` set to the highest-scoring lyric candidate seen so far.
+fn consider_lyrics_candidate(
+    best: &mut Option<(f64, SongPackage)>,
+    score: f64,
+    package: SongPackage,
+) {
+    if best
+        .as_ref()
+        .map(|(best_score, _)| score > *best_score)
+        .unwrap_or(true)
+    {
+        *best = Some((score, package));
+    }
+}
+
+/// Result of one ASR alignment attempt, scored so attempts (Demucs vs not) and
+/// the caption baseline can be compared on the same accuracy scale.
+struct AsrOutcome {
+    alignment: Vec<AlignmentLine>,
+    captions: Vec<CaptionLine>,
+    accuracy: f64,
+    words: usize,
+    backend: String,
+    device: &'static str,
 }
 
 /// Fill in caption-based timings for any lyric line that ASR left unsynced.
@@ -591,7 +736,15 @@ pub fn clean_video_title(title: &str) -> String {
         .ok()
         .and_then(|re| re.captures(&cleaned))
     {
-        return format!("{} - {}", &caps[1], &caps[2])
+        // Strip any separator the artist part already ends with so a title like
+        // `Artist - 'Song' M/V` does not become `Artist - - Song`.
+        let artist = caps[1]
+            .trim()
+            .trim_end_matches(|ch: char| {
+                matches!(ch, '-' | '–' | '—' | ':' | '|') || ch.is_whitespace()
+            })
+            .trim();
+        return format!("{} - {}", artist, &caps[2])
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
@@ -706,9 +859,24 @@ fn setting_is_enabled(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_member_profiles, detect_original_language, merge_members, restrict_members_to_lines,
+        apply_member_profiles, clean_video_title, detect_original_language, merge_members,
+        restrict_members_to_lines,
     };
     use crate::models::{LyricLine, MemberProfile};
+
+    #[test]
+    fn clean_video_title_does_not_double_separator_for_quoted_song() {
+        // YouTube title with both an "Artist -" separator and a quoted song must
+        // not become "Artist - - Song" (which broke lyric search).
+        assert_eq!(
+            clean_video_title("MEOVV(미야오) - ‘DDI RO RI’ M/V"),
+            "MEOVV(미야오) - DDI RO RI"
+        );
+        assert_eq!(
+            clean_video_title("NMIXX \"Heavy Serenade\" M/V"),
+            "NMIXX - Heavy Serenade"
+        );
+    }
 
     fn lyric_with_original(text: &str) -> LyricLine {
         LyricLine {
@@ -826,3 +994,5 @@ mod tests {
         );
     }
 }
+
+
