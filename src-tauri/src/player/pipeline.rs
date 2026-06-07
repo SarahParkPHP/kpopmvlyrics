@@ -402,12 +402,8 @@ fn add_to_pipeline(
         .map_err(|err| format!("Failed to add element '{label}': {err}"))
 }
 
-fn seek_flags_for(ms: u64) -> gst::SeekFlags {
-    if ms == 0 {
-        gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE
-    } else {
-        gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT
-    }
+fn seek_flags_for() -> gst::SeekFlags {
+    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE
 }
 
 fn try_pipeline_seek(
@@ -447,7 +443,7 @@ fn perform_seek(pipeline: &gst::Pipeline, ms: u64, resume_playback: bool) -> Res
     // this is normally instant (even at EOS the state is already reached).
     let _ = pipeline.state(Some(gst::ClockTime::from_seconds(2)));
     let position = gst::ClockTime::from_mseconds(ms);
-    let flags = seek_flags_for(ms);
+    let flags = seek_flags_for();
     let adaptive = pipeline.by_name("video-decode").is_some();
 
     // A flushing seek on the whole pipeline is the reliable way to reposition,

@@ -172,7 +172,14 @@ impl VideoOverlay {
 
         {
             let view = Rc::clone(view);
+            let pending_seek_ms = Rc::clone(&self.pending_seek_ms);
+            let seek_adjustment = self.seek_adjustment.clone();
             self.stop_button.connect_clicked(move |_| {
+                pending_seek_ms.set(Some(0));
+                seek_adjustment.set_value(0.0);
+                if let Ok(mut model) = view.model.try_borrow_mut() {
+                    model.begin_seek(0);
+                }
                 spawn_player_work(Rc::clone(&view), |player| {
                     player.pause()?;
                     player.seek(0)
@@ -187,6 +194,9 @@ impl VideoOverlay {
             self.replay_button.connect_clicked(move |_| {
                 pending_seek_ms.set(Some(0));
                 seek_adjustment.set_value(0.0);
+                if let Ok(mut model) = view.model.try_borrow_mut() {
+                    model.begin_seek(0);
+                }
                 spawn_player_work(Rc::clone(&view), |player| player.replay());
             });
         }
@@ -209,6 +219,9 @@ impl VideoOverlay {
                     };
                     let ms = new_value.clamp(0.0, max) as u64;
                     pending_seek_ms.set(Some(ms));
+                    if let Ok(mut model) = view.model.try_borrow_mut() {
+                        model.begin_seek(ms);
+                    }
                     spawn_player_work(Rc::clone(&view), move |player| player.seek(ms));
                     glib::Propagation::Proceed
                 });

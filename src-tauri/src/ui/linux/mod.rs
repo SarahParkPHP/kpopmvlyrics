@@ -179,6 +179,7 @@ struct UiModel {
     error: Option<String>,
     pending_stream: Option<StreamSpec>,
     pending_seek_ms: Option<u64>,
+    active_seek_ms: Option<u64>,
     pending_autoplay: bool,
     open_progress: Option<f64>,
     editor_table_dirty: bool,
@@ -361,6 +362,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         error: None,
         pending_stream: None,
         pending_seek_ms: None,
+        active_seek_ms: None,
         pending_autoplay: false,
         open_progress: None,
         editor_table_dirty: false,
@@ -857,6 +859,19 @@ impl UiModel {
         playing: bool,
         buffering: bool,
     ) {
+        if let Some(target_ms) = self.active_seek_ms {
+            let observed_ms = current_ms.max(0) as u64;
+            self.duration_ms = duration_ms.or(self.duration_ms);
+            if observed_ms.abs_diff(target_ms) > 1_500 {
+                self.message = if buffering {
+                    Some("Buffering video".to_string())
+                } else {
+                    Some("Seeking video".to_string())
+                };
+                return;
+            }
+            self.active_seek_ms = None;
+        }
         self.current_ms = current_ms;
         if duration_ms.is_some() {
             self.duration_ms = duration_ms;
@@ -871,6 +886,13 @@ impl UiModel {
         {
             self.message = Some("Video ready".to_string());
         }
+    }
+
+    fn begin_seek(&mut self, ms: u64) {
+        self.current_ms = ms as i64;
+        self.active_index = active_lyric_index(&self.alignment, ms as i64);
+        self.active_seek_ms = Some(ms);
+        self.message = Some("Seeking video".to_string());
     }
 
     fn set_busy(&mut self, label: Option<&str>) {
@@ -1237,6 +1259,7 @@ fn connect_view_handlers(
                         .map(|line| line.start_ms.max(0) as u64)
                 })
                 .unwrap_or(0);
+            view.refresh_mut(|model| model.begin_seek(start_ms));
             spawn_player_work(view, move |player| {
                 player.seek(start_ms)?;
                 player.play()
@@ -1260,10 +1283,7 @@ fn connect_view_handlers(
                 player.pause()?;
                 player.seek(0)
             });
-            view.refresh_mut(|model| {
-                model.current_ms = 0;
-                model.active_index = 0;
-            });
+            view.refresh_mut(|model| model.begin_seek(0));
         });
     }
 

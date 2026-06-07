@@ -633,7 +633,7 @@ impl Timeline {
         let ms = ms.max(0);
         self.set_playhead(ms);
         if let Ok(mut model) = view.model.try_borrow_mut() {
-            model.current_ms = ms;
+            model.begin_seek(ms as u64);
             model.pending_seek_ms = Some(ms as u64);
         }
         spawn_player_work(Rc::clone(view), move |player| player.seek(ms as u64));
