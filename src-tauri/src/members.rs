@@ -108,13 +108,21 @@ fn encode(query: &str) -> String {
 }
 
 fn kpopping_group_slug(group_name: &str) -> String {
-    let cleaned = group_name
-        .replace("(르세라핌)", "")
-        .replace("르세라핌", "")
-        .trim()
-        .to_string();
-    cleaned
+    // kpopping's group paths are romanized, hyphenated, and ASCII-only. Lyric
+    // titles routinely carry the Korean name (e.g. "MEOVV (미야오)") or
+    // punctuation (e.g. "(G)I-DLE", "fromis_9"), so keep only ASCII
+    // alphanumerics per word and drop any word that empties out. This replaces
+    // an LE SSERAFIM-specific Korean strip that left every other group's
+    // "(한글)" suffix in the slug, yielding a 404 and no member photos.
+    group_name
         .split_whitespace()
+        .filter_map(|word| {
+            let ascii: String = word
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric())
+                .collect();
+            (!ascii.is_empty()).then_some(ascii)
+        })
         .collect::<Vec<_>>()
         .join("-")
         .to_uppercase()
@@ -194,7 +202,18 @@ fn normalize_image_url(src: &str, base_url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_kpopping_members;
+    use super::{extract_kpopping_members, kpopping_group_slug};
+
+    #[test]
+    fn group_slug_strips_korean_and_punctuation() {
+        // colorcodedheaven titles arrive as "NAME (한글)"; the Korean parenthetical
+        // must not leak into the slug or kpopping 404s and no photos are fetched.
+        assert_eq!(kpopping_group_slug("MEOVV (미야오)"), "MEOVV");
+        assert_eq!(kpopping_group_slug("LE SSERAFIM (르세라핌)"), "LE-SSERAFIM");
+        assert_eq!(kpopping_group_slug("(G)I-DLE"), "GIDLE");
+        assert_eq!(kpopping_group_slug("fromis_9"), "FROMIS9");
+        assert_eq!(kpopping_group_slug("NMIXX"), "NMIXX");
+    }
 
     #[test]
     fn parses_kpopping_member_json() {
