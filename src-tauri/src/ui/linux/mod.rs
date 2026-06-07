@@ -583,6 +583,11 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     let editor_build = build_editor_panel();
     let editor_revealer = editor_build.revealer.clone();
+    // The editor panel contains vexpanding scrolled windows, and GtkRevealer
+    // propagates its child's expand flag upward even while collapsed. Without an
+    // explicit vexpand(false) the closed revealer keeps claiming a share of the
+    // top box's spare vertical space, leaving a tall grey band below the lyrics.
+    editor_revealer.set_vexpand(false);
     let settings_revealer = Revealer::new();
     settings_revealer.set_transition_type(RevealerTransitionType::SlideDown);
     settings_revealer.set_reveal_child(false);
