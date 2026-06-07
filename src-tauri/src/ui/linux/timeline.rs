@@ -14,7 +14,7 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use gtk::{
     Box as GtkBox, Button, DrawingArea, Entry, Fixed, GestureClick, GestureDrag, Label,
-    Orientation, Overlay, ScrolledWindow, SpinButton,
+    Orientation, Overlay, ScrolledWindow, SpinButton, ToggleButton,
 };
 
 use crate::models::{AudioSpectrogram, LyricLayer, MemberProfile};
@@ -56,6 +56,9 @@ struct TimelineState {
     playhead_ms: i64,
     spectrogram: Option<AudioSpectrogram>,
     demucs_spectrogram: Option<AudioSpectrogram>,
+    /// When true the timeline auto-scrolls to keep the playhead centered as
+    /// playback advances.
+    sync_scroll: bool,
 }
 
 struct Inspector {
@@ -80,6 +83,7 @@ pub struct Timeline {
     add_adlib: Button,
     zoom_in: Button,
     zoom_out: Button,
+    scroller: ScrolledWindow,
     inspector: Inspector,
     color_provider: Rc<gtk::CssProvider>,
     state: Rc<RefCell<TimelineState>>,
@@ -93,6 +97,7 @@ impl Timeline {
             playhead_ms: 0,
             spectrogram: None,
             demucs_spectrogram: None,
+            sync_scroll: false,
         }));
 
         let root = GtkBox::new(Orientation::Vertical, 6);
@@ -105,8 +110,11 @@ impl Timeline {
         let add_lead = Button::with_label("+ Lead");
         let add_backing = Button::with_label("+ Backing");
         let add_adlib = Button::with_label("+ Adlib");
+        let sync_toggle = ToggleButton::with_label("Sync ▶");
+        sync_toggle.set_tooltip_text(Some("Scroll the timeline to follow playback"));
         toolbar.append(&zoom_out);
         toolbar.append(&zoom_in);
+        toolbar.append(&sync_toggle);
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         toolbar.append(&spacer);
@@ -182,6 +190,14 @@ impl Timeline {
             });
         }
 
+        // The Sync toggle just flips a flag; set_playhead does the scrolling.
+        {
+            let state = Rc::clone(&state);
+            sync_toggle.connect_toggled(move |toggle| {
+                state.borrow_mut().sync_scroll = toggle.is_active();
+            });
+        }
+
         Rc::new(Self {
             root,
             fixed,
@@ -191,6 +207,7 @@ impl Timeline {
             add_adlib,
             zoom_in,
             zoom_out,
+            scroller,
             inspector,
             color_provider: Rc::new(gtk::CssProvider::new()),
             state,
@@ -389,14 +406,33 @@ impl Timeline {
 
     /// Move the playhead (called every position tick); cheap, no relayout.
     pub fn set_playhead(&self, ms: i64) {
-        {
+        let (sync_scroll, px_per_ms) = {
             let mut state = self.state.borrow_mut();
             if state.playhead_ms == ms {
                 return;
             }
             state.playhead_ms = ms;
-        }
+            (state.sync_scroll, state.px_per_ms)
+        };
         self.drawing.queue_draw();
+        if sync_scroll {
+            self.scroll_to_playhead(ms, px_per_ms);
+        }
+    }
+
+    /// Scroll the timeline so the playhead sits near the center of the viewport.
+    fn scroll_to_playhead(&self, ms: i64, px_per_ms: f64) {
+        let adjustment = self.scroller.hadjustment();
+        let page = adjustment.page_size();
+        if page <= 0.0 {
+            return;
+        }
+        let playhead_px = ms.max(0) as f64 * px_per_ms;
+        let max_value = (adjustment.upper() - page).max(adjustment.lower());
+        let target = (playhead_px - page / 2.0).clamp(adjustment.lower(), max_value);
+        if (adjustment.value() - target).abs() > 1.0 {
+            adjustment.set_value(target);
+        }
     }
 
     pub fn set_spectrogram(&self, spectrogram: Option<AudioSpectrogram>) {

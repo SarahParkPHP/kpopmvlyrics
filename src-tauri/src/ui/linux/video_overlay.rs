@@ -23,6 +23,8 @@ pub struct VideoOverlay {
     pub volume_scale: Scale,
     pending_seek_ms: Rc<Cell<Option<u64>>>,
     hide_source: Rc<RefCell<Option<glib::SourceId>>>,
+    /// When pinned (editor mode), the controls stay revealed and never auto-hide.
+    pinned: Rc<Cell<bool>>,
 }
 
 pub fn build_video_overlay(video_widget: &Widget) -> VideoOverlay {
@@ -90,6 +92,7 @@ pub fn build_video_overlay(video_widget: &Widget) -> VideoOverlay {
         volume_scale,
         pending_seek_ms: Rc::new(Cell::new(None)),
         hide_source: Rc::new(RefCell::new(None)),
+        pinned: Rc::new(Cell::new(false)),
     }
 }
 
@@ -112,15 +115,23 @@ impl VideoOverlay {
         let schedule_hide = {
             let controls_revealer = controls_revealer.clone();
             let hide_source = Rc::clone(&hide_source);
+            let pinned = Rc::clone(&self.pinned);
             move || {
+                // Pinned (editor mode): keep the controls/timeline visible.
+                if pinned.get() {
+                    return;
+                }
                 if let Some(source) = hide_source.borrow_mut().take() {
                     source.remove();
                 }
                 let controls_revealer = controls_revealer.clone();
                 let hide_source = Rc::clone(&hide_source);
                 let hide_source_for_timeout = Rc::clone(&hide_source);
+                let pinned = Rc::clone(&pinned);
                 let source = glib::timeout_add_local(Duration::from_millis(2500), move || {
-                    controls_revealer.set_reveal_child(false);
+                    if !pinned.get() {
+                        controls_revealer.set_reveal_child(false);
+                    }
                     hide_source_for_timeout.borrow_mut().take();
                     glib::ControlFlow::Break
                 });
@@ -236,6 +247,19 @@ impl VideoOverlay {
                 }
                 spawn_player_work(Rc::clone(&view), move |player| player.set_volume(level));
             });
+        }
+    }
+
+    /// Pin (or unpin) the controls. While pinned the seek bar/controls stay
+    /// revealed and the auto-hide timer is suppressed — used in editor mode so
+    /// the player timeline is always visible.
+    pub fn set_pinned(&self, pinned: bool) {
+        self.pinned.set(pinned);
+        if pinned {
+            if let Some(source) = self.hide_source.borrow_mut().take() {
+                source.remove();
+            }
+            self.controls_revealer.set_reveal_child(true);
         }
     }
 

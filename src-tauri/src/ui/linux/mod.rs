@@ -17,8 +17,8 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, CssProvider, Entry,
-    EventControllerKey, Frame, Label, Orientation, Paned, Revealer, RevealerTransitionType,
-    ScrolledWindow, Stack, StackSwitcher,
+    EventControllerKey, Frame, Label, Orientation, Paned, ScrolledWindow, SpinButton, Stack,
+    StackSwitcher,
 };
 
 use crate::align::has_playback_timing;
@@ -33,7 +33,7 @@ use crate::player::PlaybackEvents;
 
 use editor::{
     build_editor_panel, connect_editor_handlers, pick_member_image, resolve_video_chain,
-    EditorWidgets, EDITOR_PAGE, PLAYBACK_PAGE,
+    EditorWidgets, EDITOR_PAGE, PLAYBACK_PAGE, SETTINGS_PAGE,
 };
 use lyrics::{compute_lyric_stage_content, lyric_content_key, LyricStage, LyricStageContent};
 use video_overlay::{build_video_overlay, VideoOverlay};
@@ -201,6 +201,8 @@ struct UiModel {
     current_ms: i64,
     duration_ms: Option<u64>,
     volume: f64,
+    /// Playback speed as a multiplier (1.0 = normal). Reset to 1.0 on each load.
+    playback_rate: f64,
     active_index: usize,
     show_original: bool,
     show_romanization: bool,
@@ -333,9 +335,9 @@ pub(super) struct UiView {
     member_box: GtkBox,
     main_stack: Stack,
     quality_combo: IdDropDown,
+    speed_spin: SpinButton,
     asr_model_combo: IdDropDown,
     theme_combo: IdDropDown,
-    settings_revealer: Revealer,
     query_entry: Entry,
     original_toggle: CheckButton,
     roman_toggle: CheckButton,
@@ -349,6 +351,7 @@ pub(super) struct UiView {
     suppress_quality_reload: Rc<Cell<bool>>,
     suppress_asr_model_reload: Rc<Cell<bool>>,
     suppress_theme_reload: Rc<Cell<bool>>,
+    suppress_rate_reload: Rc<Cell<bool>>,
     video_overlay: Rc<VideoOverlay>,
     member_image_cache: Rc<RefCell<HashMap<String, String>>>,
     member_image_pending: Rc<RefCell<HashSet<String>>>,
@@ -392,6 +395,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         current_ms: 0,
         duration_ms: None,
         volume: 1.0,
+        playback_rate: 1.0,
         active_index: 0,
         show_original: true,
         show_romanization: false,
@@ -457,13 +461,25 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     let open_button = Button::with_label("Open");
     let stream_button = Button::with_label("Stream");
-    let settings_button = Button::with_label("Settings");
+
+    // Playback speed selector (percentage), placed between quality and Open.
+    let speed_spin = SpinButton::with_range(25.0, 300.0, 5.0);
+    speed_spin.set_value(100.0);
+    speed_spin.set_climb_rate(5.0);
+    speed_spin.set_tooltip_text(Some("Playback speed (%)"));
+    let speed_box = GtkBox::new(Orientation::Horizontal, 4);
+    let speed_label = Label::new(Some("Speed"));
+    speed_label.add_css_class("toolbar-label");
+    speed_box.append(&speed_label);
+    speed_box.append(&speed_spin);
+    let speed_percent = Label::new(Some("%"));
+    speed_box.append(&speed_percent);
 
     let toolbar = GtkBox::new(Orientation::Horizontal, 6);
     toolbar.append(&url_entry);
     toolbar.append(&quality_combo.widget);
+    toolbar.append(&speed_box);
     toolbar.append(&open_button);
-    toolbar.append(&settings_button);
 
     let member_scroll = ScrolledWindow::new();
     member_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
@@ -645,10 +661,14 @@ fn build_main_window(app: &Application) -> Result<(), String> {
 
     let editor_build = build_editor_panel();
     editor_build.panel.set_vexpand(true);
-    let settings_revealer = Revealer::new();
-    settings_revealer.set_transition_type(RevealerTransitionType::SlideDown);
-    settings_revealer.set_reveal_child(false);
-    settings_revealer.set_child(Some(&settings_panel));
+
+    // Settings is now its own tab; let long content scroll instead of stretching
+    // the pane.
+    let settings_scroll = ScrolledWindow::new();
+    settings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    settings_scroll.set_vexpand(true);
+    settings_panel.set_margin_top(6);
+    settings_scroll.set_child(Some(&settings_panel));
 
     // Playback page: member portraits + language/clock toolbar + lyrics stage.
     let playback_page = GtkBox::new(Orientation::Vertical, 8);
@@ -656,21 +676,24 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     playback_page.append(&stage_toolbar);
     playback_page.append(&lyric_frame);
 
-    // Tabs: "Playback" (above) and "Editor" replace each other in this stack, so
-    // the editor takes over the member/lyrics area instead of stacking below it.
+    // Tabs: "Playback", "Editor" and "Settings" replace each other in this stack,
+    // so each takes over the content area instead of stacking.
     let main_stack = Stack::new();
     main_stack.set_vexpand(true);
+    main_stack.set_margin_start(10);
+    main_stack.set_margin_end(10);
     main_stack.add_titled(&playback_page, Some(PLAYBACK_PAGE), "Playback");
     main_stack.add_titled(&editor_build.panel, Some(EDITOR_PAGE), "Editor");
+    main_stack.add_titled(&settings_scroll, Some(SETTINGS_PAGE), "Settings");
 
     let stack_switcher = StackSwitcher::new();
     stack_switcher.set_stack(Some(&main_stack));
     stack_switcher.set_halign(gtk::Align::Center);
 
+    // Header stays pinned at the very top: the URL bar + controls and the tab
+    // switcher never move when the content/video split is dragged.
     top.append(&toolbar);
     top.append(&stack_switcher);
-    top.append(&main_stack);
-    top.append(&settings_revealer);
 
     let video_box = player.borrow().video_widget().clone();
     video_box.set_vexpand(true);
@@ -681,11 +704,17 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     video_overlay.overlay.set_vexpand(true);
     video_pane.append(&video_overlay.overlay);
 
-    paned.set_start_child(Some(&top));
+    // The resizable split sits below the pinned header: content (tabs) on top,
+    // video on the bottom.
+    paned.set_start_child(Some(&main_stack));
     paned.set_end_child(Some(&video_pane));
     paned.set_position(420);
+    paned.set_vexpand(true);
 
-    window.set_child(Some(&paned));
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    root.append(&top);
+    root.append(&paned);
+    window.set_child(Some(&root));
 
     let (work_tx, work_rx) = std::sync::mpsc::channel::<BackgroundUpdate>();
     let (member_image_tx, member_image_rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
@@ -705,11 +734,11 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         member_box: member_box.clone(),
         main_stack: main_stack.clone(),
         quality_combo: quality_combo.clone(),
+        speed_spin: speed_spin.clone(),
         asr_model_combo: asr_model_combo.clone(),
         theme_combo: theme_combo.clone(),
         // NB: IdDropDown::clone copies the same underlying StringList + ids so
         // updates from anywhere reflect everywhere - it's a cheap Rc-style clone.
-        settings_revealer: settings_revealer.clone(),
         query_entry: query_entry.clone(),
         original_toggle: original_toggle.clone(),
         roman_toggle: roman_toggle.clone(),
@@ -726,6 +755,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         suppress_quality_reload: Rc::new(Cell::new(false)),
         suppress_asr_model_reload: Rc::new(Cell::new(false)),
         suppress_theme_reload: Rc::new(Cell::new(false)),
+        suppress_rate_reload: Rc::new(Cell::new(false)),
         video_overlay: Rc::clone(&video_overlay),
         member_image_cache: Rc::new(RefCell::new(HashMap::new())),
         member_image_pending: Rc::new(RefCell::new(HashSet::new())),
@@ -886,7 +916,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
         &asr_base_url_entry,
         &open_button,
         &stream_button,
-        &settings_button,
+        &speed_spin,
         &original_toggle,
         &roman_toggle,
         &english_toggle,
@@ -995,6 +1025,7 @@ impl UiView {
         self.sync_language_toggles(&model);
         self.sync_asr_model_combo(&model);
         self.sync_theme_combo(&model);
+        self.sync_speed_spin(&model);
         render_status(&self.status_label, &model);
         self.schedule_lyric_build(&model);
         drop(model);
@@ -1050,6 +1081,18 @@ impl UiView {
         }
         if self.english_toggle.is_active() != model.show_english {
             self.english_toggle.set_active(model.show_english);
+        }
+    }
+
+    fn sync_speed_spin(&self, model: &UiModel) {
+        if self.suppress_rate_reload.get() {
+            return;
+        }
+        let target = model.playback_rate * 100.0;
+        if (self.speed_spin.value() - target).abs() > 0.5 {
+            self.suppress_rate_reload.set(true);
+            self.speed_spin.set_value(target);
+            self.suppress_rate_reload.set(false);
         }
     }
 
@@ -1136,7 +1179,7 @@ fn connect_view_handlers(
     asr_base_url_entry: &Entry,
     open_button: &Button,
     stream_button: &Button,
-    settings_button: &Button,
+    speed_spin: &SpinButton,
     original_toggle: &CheckButton,
     roman_toggle: &CheckButton,
     english_toggle: &CheckButton,
@@ -1167,6 +1210,7 @@ fn connect_view_handlers(
                 model.pending_spectrogram_video_id = None;
                 model.timeline_demucs_spectrogram = None;
                 model.pending_demucs_spectrogram_video_id = None;
+                model.playback_rate = 1.0;
             });
             let view = Rc::clone(&view);
             spawn_open_work(work_tx.clone(), open_progress_tx.clone(), view);
@@ -1308,9 +1352,16 @@ fn connect_view_handlers(
 
     {
         let view = Rc::clone(view);
-        settings_button.connect_clicked(move |_| {
-            let revealed = view.settings_revealer.reveals_child();
-            view.settings_revealer.set_reveal_child(!revealed);
+        let suppress = Rc::clone(&view.suppress_rate_reload);
+        speed_spin.connect_value_changed(move |spin| {
+            if suppress.get() {
+                return;
+            }
+            let rate = (spin.value() / 100.0).clamp(0.1, 4.0);
+            if let Ok(mut model) = view.model.try_borrow_mut() {
+                model.playback_rate = rate;
+            }
+            spawn_player_work(Rc::clone(&view), move |player| player.set_rate(rate));
         });
     }
 

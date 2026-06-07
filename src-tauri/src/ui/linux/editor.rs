@@ -153,11 +153,14 @@ pub fn connect_editor_handlers(
     build.widgets.timeline.connect(view);
     build.widgets.timeline.connect_seek(view);
 
-    // Lay out the timeline whenever the Editor tab becomes visible.
+    // Lay out the timeline whenever the Editor tab becomes visible, and pin the
+    // video controls/timeline so they stay visible while editing.
     {
         let view = Rc::clone(view);
         main_stack.connect_visible_child_notify(move |stack| {
-            if stack.visible_child_name().as_deref() == Some(EDITOR_PAGE) {
+            let editor = stack.visible_child_name().as_deref() == Some(EDITOR_PAGE);
+            view.video_overlay.set_pinned(editor);
+            if editor {
                 view.render_editor_table();
             } else {
                 *view.editor.render_key.borrow_mut() = String::new();
@@ -317,6 +320,8 @@ pub fn connect_editor_handlers(
 pub const EDITOR_PAGE: &str = "editor";
 /// Stack page name for the playback tab (member photos + lyrics).
 pub const PLAYBACK_PAGE: &str = "playback";
+/// Stack page name for the settings tab.
+pub const SETTINGS_PAGE: &str = "settings";
 
 impl UiView {
     /// Whether the Editor tab is currently the visible stack page.
@@ -554,6 +559,7 @@ pub fn resolve_video_chain(
         model.pending_spectrogram_video_id = None;
         model.timeline_demucs_spectrogram = None;
         model.pending_demucs_spectrogram_video_id = None;
+        model.playback_rate = 1.0;
         model.pending_stream = Some(stream_spec);
         model.editor_table_dirty = true;
         if let Some(summary) = align_summary {
@@ -715,6 +721,7 @@ fn import_json_with_dialog(
                         model.pending_spectrogram_video_id = None;
                         model.timeline_demucs_spectrogram = None;
                         model.pending_demucs_spectrogram_video_id = None;
+                        model.playback_rate = 1.0;
                         model.player_loaded = false;
                         model.current_ms = 0;
                         model.active_index = 0;

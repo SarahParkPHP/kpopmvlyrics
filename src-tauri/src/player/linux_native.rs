@@ -62,6 +62,10 @@ impl NativeLinuxPlayer {
         self.engine.set_volume(level)
     }
 
+    pub fn set_rate(&mut self, rate: f64) -> Result<(), String> {
+        self.engine.set_rate(rate)
+    }
+
     pub fn seek(&mut self, ms: u64) -> Result<(), String> {
         self.engine.seek(ms)
     }

@@ -30,6 +30,9 @@ pub struct PlaybackEngine {
     suppress_errors: Rc<Cell<bool>>,
     last_error: Arc<Mutex<Option<String>>>,
     shared: Arc<Mutex<PlaybackSnapshot>>,
+    /// Current playback rate (1.0 = normal). Preserved across seeks so scrubbing
+    /// doesn't silently reset the speed back to normal.
+    rate: f64,
 }
 
 #[derive(Default, Clone)]
@@ -53,6 +56,7 @@ impl PlaybackEngine {
             suppress_errors: Rc::new(Cell::new(false)),
             last_error: Arc::new(Mutex::new(None)),
             shared: Arc::new(Mutex::new(PlaybackSnapshot::default())),
+            rate: 1.0,
         }
     }
 
@@ -62,6 +66,9 @@ impl PlaybackEngine {
 
     pub fn load(&mut self, spec: StreamSpec, video_sink: gst::Element) -> Result<(), String> {
         ensure_gstreamer()?;
+
+        // A fresh pipeline always starts at normal speed.
+        self.rate = 1.0;
 
         let pipeline = match spec {
             StreamSpec::Progressive { uri } => build_progressive_pipeline(&uri, video_sink)?,
@@ -163,7 +170,7 @@ impl PlaybackEngine {
         };
 
         let was_playing = self.playing;
-        perform_seek(pipeline, ms, was_playing).map_err(|err| err.to_string())?;
+        perform_seek(pipeline, ms, was_playing, self.rate).map_err(|err| err.to_string())?;
 
         if was_playing {
             self.playing = true;
@@ -180,7 +187,7 @@ impl PlaybackEngine {
             return Err("No video loaded".into());
         };
 
-        perform_seek(pipeline, 0, true).map_err(|err| err.to_string())?;
+        perform_seek(pipeline, 0, true, self.rate).map_err(|err| err.to_string())?;
 
         if let Ok(mut snapshot) = self.shared.lock() {
             snapshot.position_ms = 0;
@@ -189,6 +196,22 @@ impl PlaybackEngine {
         self.playing = true;
         self.sync_snapshot(true, false);
         Ok(())
+    }
+
+    /// Set the playback speed (1.0 = normal). Applied by re-seeking to the
+    /// current position with the new rate; the rate then sticks across later
+    /// seeks because [`seek`](Self::seek) reuses `self.rate`.
+    pub fn set_rate(&mut self, rate: f64) -> Result<(), String> {
+        let rate = rate.clamp(0.1, 4.0);
+        self.rate = rate;
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return Ok(());
+        };
+        let position_ms = pipeline
+            .query_position::<gst::ClockTime>()
+            .map(|time| time.mseconds())
+            .unwrap_or_else(|| self.snapshot().ms);
+        perform_seek(pipeline, position_ms, self.playing, rate).map_err(|err| err.to_string())
     }
 
     pub fn set_volume(&mut self, level: f64) -> Result<(), String> {
@@ -406,18 +429,25 @@ fn seek_flags_for() -> gst::SeekFlags {
     gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE
 }
 
+fn is_normal_rate(rate: f64) -> bool {
+    (rate - 1.0).abs() < f64::EPSILON
+}
+
 fn try_pipeline_seek(
     pipeline: &gst::Pipeline,
     position: gst::ClockTime,
     flags: gst::SeekFlags,
+    rate: f64,
 ) -> bool {
-    if pipeline.seek_simple(flags, position).is_ok() {
+    // seek_simple always plays at rate 1.0, so only use it at normal speed;
+    // otherwise a full rate-carrying seek is required.
+    if is_normal_rate(rate) && pipeline.seek_simple(flags, position).is_ok() {
         return true;
     }
 
     if pipeline
         .seek(
-            1.0,
+            rate,
             flags,
             gst::SeekType::Set,
             position,
@@ -430,7 +460,20 @@ fn try_pipeline_seek(
     }
 
     if let Some(playbin) = pipeline.by_name("playbin") {
-        if playbin.seek_simple(flags, position).is_ok() {
+        if is_normal_rate(rate) && playbin.seek_simple(flags, position).is_ok() {
+            return true;
+        }
+        if playbin
+            .seek(
+                rate,
+                flags,
+                gst::SeekType::Set,
+                position,
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+            )
+            .is_ok()
+        {
             return true;
         }
     }
@@ -438,7 +481,12 @@ fn try_pipeline_seek(
     false
 }
 
-fn perform_seek(pipeline: &gst::Pipeline, ms: u64, resume_playback: bool) -> Result<(), String> {
+fn perform_seek(
+    pipeline: &gst::Pipeline,
+    ms: u64,
+    resume_playback: bool,
+    rate: f64,
+) -> Result<(), String> {
     // Make sure the pipeline has settled into at least PAUSED before seeking;
     // this is normally instant (even at EOS the state is already reached).
     let _ = pipeline.state(Some(gst::ClockTime::from_seconds(2)));
@@ -452,10 +500,10 @@ fn perform_seek(pipeline: &gst::Pipeline, ms: u64, resume_playback: bool) -> Res
     // in sync and play at the correct rate. Seeking the decodebin branches
     // individually skips that coordination, so use it only as a fallback when
     // the pipeline-level seek is refused.
-    let ok = if try_pipeline_seek(pipeline, position, flags) {
+    let ok = if try_pipeline_seek(pipeline, position, flags, rate) {
         true
     } else if adaptive {
-        seek_adaptive_branches(pipeline, position, flags)
+        seek_adaptive_branches(pipeline, position, flags, rate)
     } else {
         false
     };
@@ -477,9 +525,10 @@ fn seek_adaptive_branches(
     pipeline: &gst::Pipeline,
     position: gst::ClockTime,
     flags: gst::SeekFlags,
+    rate: f64,
 ) -> bool {
     let seek_event = gst::event::Seek::new(
-        1.0,
+        rate,
         flags,
         gst::SeekType::Set,
         position,
