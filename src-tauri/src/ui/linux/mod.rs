@@ -2,6 +2,7 @@
 
 mod editor;
 mod lyrics;
+mod metadata;
 mod timeline;
 mod video_overlay;
 
@@ -35,6 +36,7 @@ use editor::{
     build_editor_panel, connect_editor_handlers, pick_member_image, resolve_video_chain,
     EditorWidgets, EDITOR_PAGE, PLAYBACK_PAGE, SETTINGS_PAGE,
 };
+use metadata::{MetadataPanel, METADATA_PAGE};
 use lyrics::{compute_lyric_stage_content, lyric_content_key, LyricStage, LyricStageContent};
 use video_overlay::{build_video_overlay, VideoOverlay};
 
@@ -343,6 +345,7 @@ pub(super) struct UiView {
     roman_toggle: CheckButton,
     english_toggle: CheckButton,
     editor: EditorWidgets,
+    metadata: Rc<MetadataPanel>,
     lyric_stage: Rc<RefCell<LyricStage>>,
     member_stage: Rc<RefCell<MemberStage>>,
     member_render_key: Rc<RefCell<String>>,
@@ -662,6 +665,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     let editor_build = build_editor_panel();
     editor_build.panel.set_vexpand(true);
 
+    let metadata_panel = MetadataPanel::new();
+
     // Settings is now its own tab; let long content scroll instead of stretching
     // the pane.
     let settings_scroll = ScrolledWindow::new();
@@ -684,6 +689,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     main_stack.set_margin_end(10);
     main_stack.add_titled(&playback_page, Some(PLAYBACK_PAGE), "Playback");
     main_stack.add_titled(&editor_build.panel, Some(EDITOR_PAGE), "Editor");
+    main_stack.add_titled(&metadata_panel.root, Some(METADATA_PAGE), "Metadata");
     main_stack.add_titled(&settings_scroll, Some(SETTINGS_PAGE), "Settings");
 
     let stack_switcher = StackSwitcher::new();
@@ -747,6 +753,7 @@ fn build_main_window(app: &Application) -> Result<(), String> {
             timeline: Rc::clone(&editor_build.widgets.timeline),
             render_key: Rc::new(RefCell::new(String::new())),
         },
+        metadata: Rc::clone(&metadata_panel),
         lyric_stage: Rc::new(RefCell::new(LyricStage::new())),
         member_stage: Rc::new(RefCell::new(MemberStage::new())),
         member_render_key: Rc::new(RefCell::new(String::new())),
@@ -930,6 +937,8 @@ fn build_main_window(app: &Application) -> Result<(), String> {
     );
 
     video_overlay.connect_handlers(&view);
+
+    metadata_panel.connect(&view, &window, work_tx.clone());
 
     connect_editor_handlers(&view, &window, work_tx, &editor_build, &main_stack);
 
@@ -1659,9 +1668,26 @@ fn spawn_member_profiles_in_background(
     std::thread::spawn(move || {
         let result = (|| {
             let profiles = snapshot.ctx.search_member_profiles(&group)?;
+            crate::log::verbose(format!(
+                "members fetched group={group:?} profiles={} with_images={}",
+                profiles.len(),
+                profiles
+                    .iter()
+                    .filter(|profile| profile.image_url.is_some())
+                    .count(),
+            ));
             Ok(Box::new(move |model: &mut UiModel| {
                 if let Some(song) = &mut model.song {
                     song.members = apply_member_profiles(&song.members, &profiles, &song.lines);
+                    crate::log::verbose(format!(
+                        "members applied count={} with_images={}",
+                        song.members.len(),
+                        song.members
+                            .iter()
+                            .filter(|member| member.image_url.is_some()
+                                || member.local_image_path.is_some())
+                            .count(),
+                    ));
                     model.editor_table_dirty = true;
                 }
             }) as Box<dyn FnOnce(&mut UiModel) + Send>)
@@ -2169,15 +2195,43 @@ fn cache_member_image_from_url(url: &str) -> Option<String> {
         }
     }
 
-    let response = Client::builder()
-        .user_agent("kpopmvlyrics/0.1")
+    // Use a browser-like User-Agent and a Referer: image CDNs (kpopping's
+    // included) increasingly reject hotlinked requests that lack them, which
+    // shows up as member cards with blank portraits.
+    let client = match Client::builder()
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/124.0 Safari/537.36",
+        )
         .build()
-        .ok()?
+    {
+        Ok(client) => client,
+        Err(err) => {
+            crate::log::verbose(format!("member image client build failed: {err}"));
+            return None;
+        }
+    };
+    let response = match client
         .get(url)
+        .header(reqwest::header::REFERER, "https://kpopping.com/")
         .send()
-        .ok()?;
+    {
+        Ok(response) => response,
+        Err(err) => {
+            crate::log::verbose(format!("member image fetch failed url={url} err={err}"));
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        crate::log::verbose(format!(
+            "member image fetch status={} url={url}",
+            response.status()
+        ));
+        return None;
+    }
     let bytes = response.bytes().ok()?;
     if bytes.is_empty() {
+        crate::log::verbose(format!("member image empty body url={url}"));
         return None;
     }
 

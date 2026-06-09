@@ -180,6 +180,7 @@ pub fn parse_manual_lyrics(raw_text: &str, title: &str, artist: &str) -> Result<
             artist: artist.trim().to_string(),
             group_name: Some(artist.trim().to_string()),
             source_url: None,
+            ..Default::default()
         },
         members: members_from_lines(&lines),
         lines,
@@ -224,6 +225,7 @@ pub fn parse_colorcodedlyrics_html_with_provider(
             artist: artist.clone(),
             group_name: Some(artist),
             source_url,
+            ..Default::default()
         },
         members: members_for_lines(&lines, &color_members),
         lines,
@@ -257,6 +259,7 @@ pub fn parse_genius_html(html: &str, source_url: Option<String>) -> Result<SongP
             artist: artist.clone(),
             group_name: Some(artist),
             source_url,
+            ..Default::default()
         },
         members: members_from_lines(&lines),
         lines,

@@ -2,6 +2,7 @@ use anyhow::Result;
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 
+use crate::log::verbose;
 use crate::models::MemberProfile;
 use crate::process_util::http_client;
 
@@ -25,13 +26,31 @@ impl MemberProfileProvider for KpoppingProvider {
     fn search(&self, group_name: &str) -> Result<Vec<MemberProfile>> {
         let group_slug = kpopping_group_slug(group_name);
         let profile_url = format!("https://kpopping.com/profiles/group/{group_slug}");
-        let html = self.client.get(profile_url).send()?.text()?;
-        let profiles = extract_kpopping_members(&html);
+        verbose(format!(
+            "kpopping fetch group={group_name:?} slug={group_slug} url={profile_url}"
+        ));
+        let response = self.client.get(&profile_url).send()?;
+        let status = response.status();
+        let html = response.text()?;
+        let mut profiles = extract_kpopping_members(&html);
+        verbose(format!(
+            "kpopping status={status} html_bytes={} json_members={}",
+            html.len(),
+            profiles.len()
+        ));
         if profiles.is_empty() {
-            Ok(extract_profiles(&html, "kpopping", "https://kpopping.com"))
-        } else {
-            Ok(profiles)
+            profiles = extract_profiles(&html, "kpopping", "https://kpopping.com");
+            verbose(format!("kpopping html-fallback members={}", profiles.len()));
         }
+        let with_images = profiles
+            .iter()
+            .filter(|profile| profile.image_url.is_some())
+            .count();
+        verbose(format!(
+            "kpopping returning members={} with_images={with_images}",
+            profiles.len()
+        ));
+        Ok(profiles)
     }
 }
 
@@ -129,43 +148,57 @@ fn kpopping_group_slug(group_name: &str) -> String {
 }
 
 fn extract_kpopping_members(html: &str) -> Vec<MemberProfile> {
-    let member_re = regex::Regex::new(
-        r#"\{\\"id\\":\\"[^"]+\\",\\"name\\":\\"([^"\\]+)\\".*?\\"position\\":\\"([^"\\]*)\\".*?\\"image\\":\\"(https:[^"\\]+)\\""#,
-    )
-    .expect("valid regex");
+    // kpopping embeds an idol roster as JSON, sometimes escaped inside a JS
+    // string (\"name\":...) and sometimes raw ("name":...). Rather than depend
+    // on a fixed key order (the old regex required id→name→position→image and
+    // silently produced zero members the moment kpopping reordered keys), scan
+    // each flat object and pull name/image/position independently, tolerating
+    // both quote styles and escaped slashes in URLs.
+    let object_re = regex::Regex::new(r#"\{[^{}]*\}"#).expect("valid regex");
+    let name_re =
+        regex::Regex::new(r#"\\?"name\\?"\s*:\s*\\?"([^"\\]+)\\?""#).expect("valid regex");
+    let image_re = regex::Regex::new(r#"\\?"image\\?"\s*:\s*\\?"(https?:(?:[^"\\]+|\\/)+)\\?""#)
+        .expect("valid regex");
+    let position_re =
+        regex::Regex::new(r#"\\?"position\\?"\s*:\s*\\?"([^"\\]*)\\?""#).expect("valid regex");
     let palette = [
         "#e84855", "#2f80ed", "#27ae60", "#f2994a", "#9b51e0", "#00a6a6",
     ];
     let mut profiles = Vec::new();
-    for captures in member_re.captures_iter(html) {
-        let name = captures
-            .get(1)
+    for object in object_re.find_iter(html) {
+        let chunk = object.as_str();
+        let Some(name) = name_re
+            .captures(chunk)
+            .and_then(|caps| caps.get(1))
             .map(|value| value.as_str())
-            .unwrap_or_default();
-        let real_name = captures
-            .get(2)
+        else {
+            continue;
+        };
+        let Some(image) = image_re
+            .captures(chunk)
+            .and_then(|caps| caps.get(1))
             .map(|value| value.as_str())
-            .unwrap_or_default();
-        let image = captures
-            .get(3)
-            .map(|value| value.as_str())
-            .unwrap_or_default();
-        if name.is_empty()
-            || image.is_empty()
-            || profiles
-                .iter()
-                .any(|profile: &MemberProfile| profile.stage_name.eq_ignore_ascii_case(name))
+        else {
+            continue;
+        };
+        let stage_name = short_stage_name(name);
+        if stage_name.is_empty()
+            || profiles.iter().any(|profile: &MemberProfile| {
+                profile.stage_name.eq_ignore_ascii_case(&stage_name)
+            })
         {
             continue;
         }
+        let real_name = position_re
+            .captures(chunk)
+            .and_then(|caps| caps.get(1))
+            .map(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
         profiles.push(MemberProfile {
             id: None,
-            stage_name: short_stage_name(name),
-            real_name: if real_name.is_empty() {
-                None
-            } else {
-                Some(real_name.to_string())
-            },
+            stage_name,
+            real_name,
             color: palette[profiles.len() % palette.len()].to_string(),
             image_url: Some(image.replace("\\/", "/")),
             local_image_path: None,
@@ -223,6 +256,33 @@ mod tests {
         assert_eq!(
             members[0].image_url.as_deref(),
             Some("https://cdn.example/idols/Kim-Chaewon/profile.jpg?v=1")
+        );
+    }
+
+    #[test]
+    fn parses_kpopping_member_json_with_reordered_keys() {
+        // image before name, and no position key — the old order-locked regex
+        // produced zero members for layouts like this.
+        let html = r#"[{\"image\":\"https://cdn.example/a/profile.jpg\",\"slug\":\"a\",\"name\":\"Yunjin\"}]"#;
+        let members = extract_kpopping_members(html);
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].stage_name, "Yunjin");
+        assert_eq!(
+            members[0].image_url.as_deref(),
+            Some("https://cdn.example/a/profile.jpg")
+        );
+    }
+
+    #[test]
+    fn parses_kpopping_member_raw_json_with_escaped_slashes() {
+        // Unescaped (raw) JSON, with escaped forward slashes in the URL.
+        let html = r#"{"members":[{"name":"Sakura","position":"","image":"https:\/\/cdn.example\/idols\/Sakura.jpg"}]}"#;
+        let members = extract_kpopping_members(html);
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].stage_name, "Sakura");
+        assert_eq!(
+            members[0].image_url.as_deref(),
+            Some("https://cdn.example/idols/Sakura.jpg")
         );
     }
 }

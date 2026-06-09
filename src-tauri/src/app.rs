@@ -584,6 +584,25 @@ impl AppContext {
         repo.upsert_song_package(package).map_err(to_string)
     }
 
+    /// Persist edited song metadata: the song row (agency, copyright, release
+    /// date, languages, featured artists, …) plus member profile overrides so
+    /// name/color/image edits stick past the default merge logic.
+    pub fn save_song_metadata(&self, package: &mut SongPackage) -> Result<(), String> {
+        let mut repo = self.repo.lock().map_err(to_string)?;
+        repo.upsert_song_package(package).map_err(to_string)?;
+        if let Some(group) = package
+            .song
+            .group_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+        {
+            for member in &package.members {
+                repo.save_member_override(&group, member).map_err(to_string)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn search_member_profiles(&self, group_name: &str) -> Result<Vec<MemberProfile>, String> {
         let providers: Vec<Box<dyn MemberProfileProvider>> = vec![
             Box::new(KpoppingProvider::default()),

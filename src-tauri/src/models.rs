@@ -59,7 +59,7 @@ pub struct SongPackage {
     pub provider: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Song {
     pub id: Option<i64>,
@@ -67,6 +67,21 @@ pub struct Song {
     pub artist: String,
     pub group_name: Option<String>,
     pub source_url: Option<String>,
+    #[serde(default)]
+    pub agency: Option<String>,
+    #[serde(default)]
+    pub copyright: Option<String>,
+    /// Release date as a free-form/ISO string (e.g. "2024-11-01").
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub primary_language: Option<String>,
+    #[serde(default)]
+    pub secondary_languages: Vec<String>,
+    /// Featured/guest artists for this song. Same shape as members so they can
+    /// carry a name, image and color, but kept separate from group members.
+    #[serde(default)]
+    pub featured_artists: Vec<MemberProfile>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

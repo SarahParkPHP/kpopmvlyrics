@@ -72,6 +72,13 @@ pub fn invoke(ctx: &AppContext, command: &str, args_json: &str) -> Result<String
             let alignment: Vec<AlignmentLine> = from_arg(&args, "alignment")?;
             to_json(crate::export::build_export_json(&metadata, &song, &alignment))
         }
+        // Returns the TTML/IMSC1 document text directly (not JSON-wrapped).
+        "build_ttml" => {
+            let metadata: VideoMetadata = from_arg(&args, "metadata")?;
+            let song: SongPackage = from_arg(&args, "songPackage")?;
+            let alignment: Vec<AlignmentLine> = from_arg(&args, "alignment")?;
+            Ok(crate::export::build_ttml(&metadata, &song, &alignment))
+        }
         other => Err(format!("unknown command '{other}'")),
     }
 }

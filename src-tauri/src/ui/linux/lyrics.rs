@@ -509,6 +509,7 @@ mod tests {
                 artist: "Stray Kids".into(),
                 group_name: Some("Stray Kids".into()),
                 source_url: None,
+                ..Default::default()
             },
             members: vec![profile("Hyunjin", "#bb71ff")],
             lines: vec![LyricLine {
@@ -573,6 +574,7 @@ mod tests {
                 artist: "Stray Kids".into(),
                 group_name: Some("Stray Kids".into()),
                 source_url: None,
+                ..Default::default()
             },
             members: vec![profile("Hyunjin", "#bb71ff")],
             lines: vec![LyricLine {

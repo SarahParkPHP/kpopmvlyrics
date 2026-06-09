@@ -39,6 +39,7 @@ pub struct EditorBuild {
     pub save_button: Button,
     pub import_json_button: Button,
     pub export_json_button: Button,
+    pub export_ttml_button: Button,
 }
 
 pub fn build_editor_panel() -> EditorBuild {
@@ -54,6 +55,7 @@ pub fn build_editor_panel() -> EditorBuild {
     let save_button = Button::with_label("Save Alignment");
     let import_json_button = Button::with_label("Import JSON");
     let export_json_button = Button::with_label("Export JSON");
+    let export_ttml_button = Button::with_label("Export TTML");
     import_actions.append(&import_lyrics_button);
     import_actions.append(&import_captions_button);
     import_actions.append(&shift_back_button);
@@ -61,6 +63,7 @@ pub fn build_editor_panel() -> EditorBuild {
     import_actions.append(&save_button);
     import_actions.append(&import_json_button);
     import_actions.append(&export_json_button);
+    import_actions.append(&export_ttml_button);
     panel.append(&import_actions);
 
     let timeline = Timeline::new();
@@ -79,6 +82,7 @@ pub fn build_editor_panel() -> EditorBuild {
         save_button,
         import_json_button,
         export_json_button,
+        export_ttml_button,
     }
 }
 
@@ -153,17 +157,23 @@ pub fn connect_editor_handlers(
     build.widgets.timeline.connect(view);
     build.widgets.timeline.connect_seek(view);
 
-    // Lay out the timeline whenever the Editor tab becomes visible, and pin the
-    // video controls/timeline so they stay visible while editing.
+    // Lay out the timeline whenever the Editor tab becomes visible, pin the
+    // video controls/timeline while editing, and (re)load the Metadata form when
+    // its tab opens.
     {
         let view = Rc::clone(view);
+        let window = window.clone();
         main_stack.connect_visible_child_notify(move |stack| {
-            let editor = stack.visible_child_name().as_deref() == Some(EDITOR_PAGE);
+            let page = stack.visible_child_name();
+            let editor = page.as_deref() == Some(EDITOR_PAGE);
             view.video_overlay.set_pinned(editor);
             if editor {
                 view.render_editor_table();
             } else {
                 *view.editor.render_key.borrow_mut() = String::new();
+            }
+            if page.as_deref() == Some(super::metadata::METADATA_PAGE) {
+                view.metadata.populate(&view, &window);
             }
         });
     }
@@ -312,6 +322,28 @@ pub fn connect_editor_handlers(
                 return;
             };
             export_json_with_dialog(&window, Rc::clone(&view), metadata, song, alignment);
+        });
+    }
+
+    {
+        let view = Rc::clone(view);
+        let window = window.clone();
+        build.export_ttml_button.connect_clicked(move |_| {
+            let snapshot = {
+                let model = view.model.borrow();
+                model
+                    .metadata
+                    .clone()
+                    .zip(model.song.clone())
+                    .map(|(metadata, song)| (metadata, song, model.alignment.clone()))
+            };
+            let Some((metadata, song, alignment)) = snapshot else {
+                view.refresh_mut(|model| {
+                    model.error = Some("Load lyrics and resolve a video first".to_string());
+                });
+                return;
+            };
+            export_ttml_with_dialog(&window, Rc::clone(&view), metadata, song, alignment);
         });
     }
 }
@@ -769,7 +801,7 @@ fn export_json_with_dialog(
         .title("Export JSON")
         .accept_label("_Export")
         .modal(true)
-        .initial_name(export_filename(&song, &metadata).as_str())
+        .initial_name(export_filename(&song, &metadata, "json").as_str())
         .build();
 
     dialog.save(
@@ -815,6 +847,54 @@ fn build_json_export(
     alignment: &[AlignmentLine],
 ) -> serde_json::Value {
     crate::export::build_export_json(metadata, song, alignment)
+}
+
+fn export_ttml_with_dialog(
+    window: &ApplicationWindow,
+    view: Rc<UiView>,
+    metadata: VideoMetadata,
+    song: SongPackage,
+    alignment: Vec<AlignmentLine>,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Export TTML")
+        .accept_label("_Export")
+        .modal(true)
+        .initial_name(export_filename(&song, &metadata, "ttml").as_str())
+        .build();
+
+    dialog.save(
+        Some(window),
+        None::<&gio::Cancellable>,
+        move |result| match result {
+            Ok(file) => {
+                let Some(path) = file.path() else {
+                    view.refresh_mut(|model| {
+                        model.error = Some("Could not determine export path".to_string());
+                    });
+                    return;
+                };
+                let ttml = crate::export::build_ttml(&metadata, &song, &alignment);
+                let write_result = fs::write(&path, ttml).map_err(|err| err.to_string());
+                view.refresh_mut(|model| match write_result {
+                    Ok(()) => {
+                        model.message = Some(format!("TTML exported to {}", path.display()));
+                        model.error = None;
+                    }
+                    Err(err) => {
+                        model.error = Some(format!("TTML export failed: {err}"));
+                    }
+                });
+            }
+            Err(err) => {
+                if !err.matches(gtk::DialogError::Dismissed) {
+                    view.refresh_mut(|model| {
+                        model.error = Some(format!("TTML export failed: {err}"));
+                    });
+                }
+            }
+        },
+    );
 }
 
 #[derive(Deserialize)]
@@ -958,6 +1038,7 @@ fn parse_json_import(
                 artist: artist.clone(),
                 group_name: Some(artist),
                 source_url: None,
+                ..Default::default()
             },
             lines,
             members,
@@ -967,9 +1048,9 @@ fn parse_json_import(
     ))
 }
 
-fn export_filename(song: &SongPackage, metadata: &VideoMetadata) -> String {
+fn export_filename(song: &SongPackage, metadata: &VideoMetadata, extension: &str) -> String {
     format!(
-        "{}-{}-{}.json",
+        "{}-{}-{}.{extension}",
         safe_filename(&song.song.artist),
         safe_filename(&song.song.title),
         safe_filename(&metadata.video_id)
@@ -1020,6 +1101,7 @@ mod export_tests {
                 artist: "Group".into(),
                 group_name: Some("Group".into()),
                 source_url: None,
+                ..Default::default()
             },
             provider: "fixture".into(),
             members: vec![MemberProfile {

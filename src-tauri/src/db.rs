@@ -100,19 +100,34 @@ impl Repository {
         ensure_column(&self.conn, "lyric_lines", "segments", "TEXT")?;
         ensure_column(&self.conn, "lyric_lines", "includes_all", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&self.conn, "lyric_lines", "layer", "TEXT NOT NULL DEFAULT 'lead'")?;
+        // Editable song metadata. secondary_languages / featured_artists are JSON.
+        ensure_column(&self.conn, "songs", "agency", "TEXT")?;
+        ensure_column(&self.conn, "songs", "copyright", "TEXT")?;
+        ensure_column(&self.conn, "songs", "release_date", "TEXT")?;
+        ensure_column(&self.conn, "songs", "primary_language", "TEXT")?;
+        ensure_column(&self.conn, "songs", "secondary_languages", "TEXT")?;
+        ensure_column(&self.conn, "songs", "featured_artists", "TEXT")?;
         Ok(())
     }
 
     pub fn upsert_song_package(&mut self, package: &mut SongPackage) -> Result<()> {
         let tx = self.conn.transaction()?;
+        let secondary_languages = serde_json::to_string(&package.song.secondary_languages)?;
+        let featured_artists = serde_json::to_string(&package.song.featured_artists)?;
         tx.execute(
             r#"
-            INSERT INTO songs (title, artist, group_name, source_url, provider, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+            INSERT INTO songs (title, artist, group_name, source_url, provider, agency, copyright, release_date, primary_language, secondary_languages, featured_artists, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, CURRENT_TIMESTAMP)
             ON CONFLICT(title, artist) DO UPDATE SET
                 group_name=excluded.group_name,
                 source_url=excluded.source_url,
                 provider=excluded.provider,
+                agency=excluded.agency,
+                copyright=excluded.copyright,
+                release_date=excluded.release_date,
+                primary_language=excluded.primary_language,
+                secondary_languages=excluded.secondary_languages,
+                featured_artists=excluded.featured_artists,
                 updated_at=CURRENT_TIMESTAMP
             "#,
             params![
@@ -120,7 +135,13 @@ impl Repository {
                 package.song.artist,
                 package.song.group_name,
                 package.song.source_url,
-                package.provider
+                package.provider,
+                package.song.agency,
+                package.song.copyright,
+                package.song.release_date,
+                package.song.primary_language,
+                secondary_languages,
+                featured_artists,
             ],
         )?;
         let song_id: i64 = tx.query_row(
